@@ -12,12 +12,12 @@ class ReliableWebsocket:
 
     async def recv(self):
         try:
-            await self.delegate.recv()
+            return await self.delegate.recv()
         except Exception as e:
             logging.info(f"reconnecting {self.id()}")
             await self.delegate.close()
             await self.delegate.connect()
-            return self.delegate.recv()
+            return await self.delegate.recv()
 
     def id(self) -> str:
         return f"{id(self.delegate) & 0xFFFFFF:06x}"
