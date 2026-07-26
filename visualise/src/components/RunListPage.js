@@ -1,6 +1,7 @@
-import React, {useEffect, useState} from 'react';
+import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {Link} from 'react-router-dom';
-import {Anchor, Center, Container, Loader, Paper, Stack, Table, Text, Title, Tooltip} from '@mantine/core';
+import {ActionIcon, Anchor, Center, Container, Loader, Paper, Stack, Table, Text, Title, Tooltip} from '@mantine/core';
+import {IconTrash} from '@tabler/icons-react';
 import {loadRun} from '../utils/runLoader';
 import {fmtDate, fmtNum, fmtPct, paramsLines, paramsValues} from '../utils/format';
 
@@ -8,9 +9,32 @@ import {fmtDate, fmtNum, fmtPct, paramsLines, paramsValues} from '../utils/forma
  * root(`/`) 목록 페이지: backtestFiles 각각의 run JSON에서 metadata+summary만 읽어
  * (series shard는 로드하지 않음) PnL/MDD 등을 요약 테이블로 보여준다.
  */
-const RunListPage = ({backtestFiles}) => {
+const RunListPage = ({backtestFiles, onDeleteRun}) => {
   const [rows, setRows] = useState([]);
   const [loadingRows, setLoadingRows] = useState(true);
+  const [deletingNames, setDeletingNames] = useState(new Set());
+  const deletingRef = useRef(new Set());
+
+  const handleDelete = useCallback(async (name) => {
+    if (deletingRef.current.has(name)) return;
+    if (!window.confirm(`"${name}" run 을 삭제하시겠습니까? 파일이 영구적으로 삭제되며 되돌릴 수 없습니다.`)) return;
+
+    deletingRef.current.add(name);
+    setDeletingNames(prev => new Set(prev).add(name));
+    try {
+      await onDeleteRun(name);
+    } catch (error) {
+      console.error(`Error deleting run ${name}:`, error);
+      alert(`삭제 중 오류가 발생했습니다: ${error.message}`);
+    } finally {
+      deletingRef.current.delete(name);
+      setDeletingNames(prev => {
+        const next = new Set(prev);
+        next.delete(name);
+        return next;
+      });
+    }
+  }, [onDeleteRun]);
 
   useEffect(() => {
     let cancelled = false;
@@ -74,6 +98,7 @@ const RunListPage = ({backtestFiles}) => {
                 <Table.Th>Max DD</Table.Th>
                 <Table.Th>Win Rate</Table.Th>
                 <Table.Th>Sharpe</Table.Th>
+                <Table.Th/>
               </Table.Tr>
             </Table.Thead>
             <Table.Tbody>
@@ -81,7 +106,7 @@ const RunListPage = ({backtestFiles}) => {
                 if (error || !metadata) {
                   return (
                     <Table.Tr key={file.name}>
-                      <Table.Td colSpan={7}>
+                      <Table.Td colSpan={8}>
                         <Text size="sm" c="red.4">{file.name} — 로드 실패</Text>
                       </Table.Td>
                     </Table.Tr>
@@ -129,6 +154,19 @@ const RunListPage = ({backtestFiles}) => {
                       {summary.win_trades ?? '-'}/{summary.total_trades ?? '-'} ({fmtPct(summary.win_rate)})
                     </Table.Td>
                     <Table.Td>{fmtNum(summary.sharpe)}</Table.Td>
+                    <Table.Td>
+                      <ActionIcon
+                        variant="subtle"
+                        color="red"
+                        size="sm"
+                        aria-label={`${file.name} 삭제`}
+                        loading={deletingNames.has(file.name)}
+                        disabled={deletingNames.has(file.name)}
+                        onClick={() => handleDelete(file.name)}
+                      >
+                        <IconTrash size={16}/>
+                      </ActionIcon>
+                    </Table.Td>
                   </Table.Tr>
                 );
               })}

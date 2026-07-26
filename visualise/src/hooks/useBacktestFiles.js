@@ -1,6 +1,6 @@
 import {useCallback, useEffect, useState} from 'react';
 import {restoreFilesFromDirectory, selectDirectoryAndGetFiles} from '../utils/fileAccess';
-import {filterRunFiles} from '../utils/runLoader';
+import {deleteRun as deleteRunFiles, filterRunFiles} from '../utils/runLoader';
 
 /**
  * asset 디렉토리 선택/복원과 run 파일 목록(backtest/*.json, series 제외)을 관리하는 훅.
@@ -44,5 +44,15 @@ export const useBacktestFiles = () => {
     }
   }, []);
 
-  return {loading, directorySelected, backtestFiles, selectDirectory};
+  const removeRun = useCallback(async (fileName) => {
+    const {deleted, failed} = await deleteRunFiles(fileName);
+    if (deleted.includes(fileName)) {
+      setBacktestFiles(prev => prev.filter(f => f.name !== fileName));
+    }
+    if (failed.length > 0) {
+      throw new Error(`Failed to delete ${failed.length} file(s): ${failed.map(f => f.name).join(', ')}`);
+    }
+  }, []);
+
+  return {loading, directorySelected, backtestFiles, selectDirectory, removeRun};
 };

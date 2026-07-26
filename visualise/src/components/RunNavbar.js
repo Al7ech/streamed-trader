@@ -1,12 +1,19 @@
 import React from 'react';
-import {AppShell, NavLink, ScrollArea, Text, Tooltip} from '@mantine/core';
-import {IconArrowLeft, IconFileAnalytics} from '@tabler/icons-react';
+import {ActionIcon, AppShell, NavLink, ScrollArea, Text, Tooltip} from '@mantine/core';
+import {IconArrowLeft, IconFileAnalytics, IconTrash} from '@tabler/icons-react';
 
 /**
  * /run/:fileName 좌측 내비게이션: run 목록으로 돌아가기 + backtest run 파일 전환.
  * (구 FileExplorer(react-pro-sidebar) 대체 — 접힘/펼침은 AppShell navbar collapse가 담당)
  */
-const RunNavbar = ({backtestFiles, selectedBacktestFile, onBacktestFileSelect, onBackToList}) => (
+const RunNavbar = ({
+  backtestFiles,
+  selectedBacktestFile,
+  onBacktestFileSelect,
+  onBackToList,
+  onDeleteRun,
+  deletingFileNames,
+}) => (
   <>
     <AppShell.Section>
       <NavLink
@@ -29,6 +36,22 @@ const RunNavbar = ({backtestFiles, selectedBacktestFile, onBacktestFileSelect, o
               active={selectedBacktestFile === file.name}
               label={<Text size="sm" truncate="end">{file.name}</Text>}
               leftSection={<IconFileAnalytics size={16}/>}
+              rightSection={
+                <ActionIcon
+                  variant="subtle"
+                  color="red"
+                  size="sm"
+                  aria-label={`${file.name} 삭제`}
+                  loading={deletingFileNames.has(file.name)}
+                  disabled={deletingFileNames.has(file.name)}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onDeleteRun(file.name);
+                  }}
+                >
+                  <IconTrash size={14}/>
+                </ActionIcon>
+              }
               onClick={() => onBacktestFileSelect(file.name)}
             />
           </Tooltip>

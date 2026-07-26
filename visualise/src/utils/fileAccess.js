@@ -74,6 +74,56 @@ export const fetchFileText = async (fileName) => {
 };
 
 /* ------------------------------------------------------------------ */
+/* 파일 삭제 (FileSystemFileHandle.remove(), Chrome 108+ — 이 앱은 이미     */
+/* showDirectoryPicker() 에 의존하므로 Chromium 전용 제약이 새로 생기지 않음)  */
+/* ------------------------------------------------------------------ */
+
+export const deleteFiles = async (fileNames) => {
+  const directoryHandle = await getStoredDirectoryHandle();
+  if (!directoryHandle) {
+    throw new Error('No directory handle found. Please select directory first.');
+  }
+
+  const permission = await directoryHandle.queryPermission({mode: 'readwrite'});
+  if (permission !== 'granted') {
+    const requested = await directoryHandle.requestPermission({mode: 'readwrite'});
+    if (requested !== 'granted') {
+      throw new Error('Permission denied to delete files (readwrite)');
+    }
+  }
+
+  const fileHandles = getStoredFileHandles();
+  const deleted = [];
+  const failed = [];
+
+  for (const name of fileNames) {
+    const handle = fileHandles.find(h => h.name === name);
+    if (!handle) {
+      failed.push({name, error: new Error(`File not found in cache: ${name}`)});
+      continue;
+    }
+    try {
+      await handle.remove();
+      deleted.push(name);
+    } catch (error) {
+      if (error?.name === 'NotFoundError') {
+        deleted.push(name); // 이미 지워짐 — 재시도에 대해 idempotent
+      } else {
+        console.error(`Error deleting file ${name}:`, error);
+        failed.push({name, error});
+      }
+    }
+  }
+
+  if (deleted.length > 0) {
+    const deletedSet = new Set(deleted);
+    storeFileHandles(fileHandles.filter(h => !deletedSet.has(h.name)));
+  }
+
+  return {deleted, failed};
+};
+
+/* ------------------------------------------------------------------ */
 /* IndexedDB / 메모리 핸들 저장                                          */
 /* ------------------------------------------------------------------ */
 

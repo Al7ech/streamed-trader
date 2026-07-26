@@ -8,7 +8,7 @@ import {useBacktestFiles} from './hooks/useBacktestFiles';
 import {theme} from './theme';
 
 function App() {
-  const {loading, directorySelected, backtestFiles, selectDirectory} = useBacktestFiles();
+  const {loading, directorySelected, backtestFiles, selectDirectory, removeRun} = useBacktestFiles();
 
   let content;
   if (loading) {
@@ -46,8 +46,8 @@ function App() {
   } else {
     content = (
       <Routes>
-        <Route path="/" element={<RunListPage backtestFiles={backtestFiles}/>}/>
-        <Route path="/run/:fileName" element={<RunDetailPage backtestFiles={backtestFiles}/>}/>
+        <Route path="/" element={<RunListPage backtestFiles={backtestFiles} onDeleteRun={removeRun}/>}/>
+        <Route path="/run/:fileName" element={<RunDetailPage backtestFiles={backtestFiles} onDeleteRun={removeRun}/>}/>
       </Routes>
     );
   }

@@ -18,10 +18,13 @@ import {isCoarse, toSeconds} from '../utils/aggregate';
  * 타임프레임에 맞춰 lazy 로드한다 — 초기/타임프레임 전환 시 최신 스팬(showLatest),
  * 이후 차트 이동(클릭/드래그/패닝) 시 해당 구간(showRange)만 그때그때.
  */
-const RunDetailPage = ({backtestFiles}) => {
+const RunDetailPage = ({backtestFiles, onDeleteRun}) => {
   const {fileName: encodedFileName} = useParams();
   const fileName = decodeURIComponent(encodedFileName);
   const navigate = useNavigate();
+
+  const [deletingNames, setDeletingNames] = useState(new Set());
+  const deletingRef = useRef(new Set());
 
   const [metadata, setMetadata] = useState(null);
   const [summary, setSummary] = useState(null);
@@ -30,6 +33,7 @@ const RunDetailPage = ({backtestFiles}) => {
   const [indicatorGroups, setIndicatorGroups] = useState({});
   const [tradeData, setTradeData] = useState([]);
   const [equityData, setEquityData] = useState(null); // 전체 구간 다운샘플 equity — 타임라인 sparkline 용
+  const [baseAssetData, setBaseAssetData] = useState(null); // 같은 시각에 정렬된 기초자산 buy & hold 곡선
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [fullRange, setFullRange] = useState(null); // 전체 백테스트 시간 구간(초) — 타임라인 셀렉터용
   const [activeTab, setActiveTab] = useState('visualise'); // 'visualise'(차트) | 'trades'(equity+월별 통계)
@@ -83,11 +87,12 @@ const RunDetailPage = ({backtestFiles}) => {
 
     const load = async () => {
       try {
-        const {metadata, summary, equity, trades, series} = await loadRun(fileName);
+        const {metadata, summary, equity, baseAsset, trades, series} = await loadRun(fileName);
         if (cancelled) return;
         setMetadata(metadata);
         setSummary(summary);
         setEquityData(equity);
+        setBaseAssetData(baseAsset);
         setTradeData(trades);
 
         const loader = new SeriesLoader(series);
@@ -105,6 +110,7 @@ const RunDetailPage = ({backtestFiles}) => {
         setMetadata(null);
         setSummary(null);
         setEquityData(null);
+        setBaseAssetData(null);
         setTradeData([]);
         setCandleData([]);
         setIndicatorData({});
@@ -135,6 +141,28 @@ const RunDetailPage = ({backtestFiles}) => {
   const handleBacktestFileSelect = useCallback((selectedFileName) => {
     navigate(`/run/${encodeURIComponent(selectedFileName)}`);
   }, [navigate]);
+
+  const handleDeleteRun = useCallback(async (targetFileName) => {
+    if (deletingRef.current.has(targetFileName)) return;
+    if (!window.confirm(`"${targetFileName}" run 을 삭제하시겠습니까? 파일이 영구적으로 삭제되며 되돌릴 수 없습니다.`)) return;
+
+    deletingRef.current.add(targetFileName);
+    setDeletingNames(prev => new Set(prev).add(targetFileName));
+    try {
+      await onDeleteRun(targetFileName);
+      if (targetFileName === fileName) navigate('/');
+    } catch (error) {
+      console.error(`Error deleting run ${targetFileName}:`, error);
+      alert(`삭제 중 오류가 발생했습니다: ${error.message}`);
+    } finally {
+      deletingRef.current.delete(targetFileName);
+      setDeletingNames(prev => {
+        const next = new Set(prev);
+        next.delete(targetFileName);
+        return next;
+      });
+    }
+  }, [onDeleteRun, fileName, navigate]);
 
   return (
     <AppShell
@@ -171,6 +199,8 @@ const RunDetailPage = ({backtestFiles}) => {
           selectedBacktestFile={fileName}
           onBacktestFileSelect={handleBacktestFileSelect}
           onBackToList={() => navigate('/')}
+          onDeleteRun={handleDeleteRun}
+          deletingFileNames={deletingNames}
         />
       </AppShell.Navbar>
 
@@ -203,7 +233,12 @@ const RunDetailPage = ({backtestFiles}) => {
 
           <Tabs.Panel value="trades" style={{flex: 1, minHeight: 0}}>
             {tradesVisited && (
-              <StatsTab equityData={equityData} tradeData={tradeData} summary={summary}/>
+              <StatsTab
+                equityData={equityData}
+                baseAssetData={baseAssetData}
+                tradeData={tradeData}
+                summary={summary}
+              />
             )}
           </Tabs.Panel>
         </Tabs>
