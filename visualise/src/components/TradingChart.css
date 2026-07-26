@@ -1,0 +1,53 @@
+/* lightweight-charts 캔버스 영역 — 나머지 UI 스타일은 Mantine 컴포넌트가 담당한다. */
+.chart-container {
+  width: 100%;
+  height: 100%;
+  min-height: 300px;
+  /* GPU 가속 */
+  transform: translateZ(0);
+  will-change: transform;
+}
+
+/* 타임프레임 SegmentedControl 을 차트 좌상단 오버레이로 */
+.timeframe-overlay {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 5;
+  opacity: 0.92;
+}
+
+/* 차트/거래패널 분할 드래그 핸들 — 좌우로 끌어 두 영역의 폭 비율을 조절한다 */
+.split-handle {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+  z-index: 5;
+}
+
+.split-handle--vertical {
+  width: 12px;
+  cursor: col-resize;
+}
+
+.split-handle--vertical::after {
+  content: '';
+  width: 4px;
+  height: 48px;
+  border-radius: 2px;
+  background: var(--mantine-color-dark-4);
+  transition: background 0.15s ease;
+}
+
+.split-handle:hover::after,
+.split-handle:active::after {
+  background: var(--mantine-color-blue-5);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chart-container {
+    will-change: auto;
+  }
+}

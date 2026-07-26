@@ -1,0 +1,39 @@
+import math
+from datetime import datetime, timezone
+
+
+def ms_timestamp_to_datetime(timestamp: int):
+    return datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
+
+
+def generate_dict_string(d: dict) -> str:
+    return "[" + ",".join(f"{k}={v.get_latest()}" for k, v in d.items()) + "]"
+
+
+def trunc_by_sign(x: float, n: int) -> float:
+    factor = 10 ** n
+    if x >= 0:
+        return math.floor(x * factor) / factor  # 양수 → 내림
+    else:
+        return math.ceil(x * factor) / factor  # 음수 → 올림
+
+
+_suffix_map = {
+    'm': 1,
+    'h': 60,
+    'd': 1440,
+    'w': 10080,
+    'M': 43200
+}
+
+
+def interval_to_minutes(interval: str) -> int:
+    """Convert interval string to minutes."""
+    return int(interval[:-1]) * _suffix_map[interval[-1]]
+
+
+def ensure_utc(dt: datetime) -> datetime:
+    """Ensure datetime is UTC timezone-aware."""
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.astimezone(timezone.utc)

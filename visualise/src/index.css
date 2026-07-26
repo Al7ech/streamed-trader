@@ -1,0 +1,4 @@
+/* Mantine(styles.css)이 body 배경/폰트를 관리한다. 여기는 전역 보정만 남긴다. */
+* {
+  box-sizing: border-box;
+}

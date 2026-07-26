@@ -1,0 +1,10 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+asset/
+.env
+node_modules/
+visualise/node_modules/
+visualise/build/
+.idea/

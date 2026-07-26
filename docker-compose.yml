@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  trader:
+    build: .
+    container_name: streamed-trader
+    restart: always
+    env_file:
+      - .env
+    logging:
+      driver: "local"
+      options:
+        max-size: "100m"      # 로그 파일 1개 최대 크기
+        max-file: "500"       # 최대 5개 파일 유지 (이후 오래된 로그 삭제)
+        compress: "true"      # 롤링된 로그 자동 압축 (.gz)
