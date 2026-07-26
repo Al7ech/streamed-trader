@@ -124,6 +124,35 @@ export const deleteFiles = async (fileNames) => {
 };
 
 /* ------------------------------------------------------------------ */
+/* 파일 쓰기 (FileSystemFileHandle.createWritable(), 전체 내용 덮어쓰기)      */
+/* ------------------------------------------------------------------ */
+
+export const writeFileText = async (fileName, text) => {
+  const directoryHandle = await getStoredDirectoryHandle();
+  if (!directoryHandle) {
+    throw new Error('No directory handle found. Please select directory first.');
+  }
+
+  const permission = await directoryHandle.queryPermission({mode: 'readwrite'});
+  if (permission !== 'granted') {
+    const requested = await directoryHandle.requestPermission({mode: 'readwrite'});
+    if (requested !== 'granted') {
+      throw new Error('Permission denied to write file (readwrite)');
+    }
+  }
+
+  const fileHandles = getStoredFileHandles();
+  const fileHandle = fileHandles.find(h => h.name === fileName);
+  if (!fileHandle) {
+    throw new Error(`File not found in cache: ${fileName}`);
+  }
+
+  const writable = await fileHandle.createWritable();
+  await writable.write(text);
+  await writable.close();
+};
+
+/* ------------------------------------------------------------------ */
 /* IndexedDB / 메모리 핸들 저장                                          */
 /* ------------------------------------------------------------------ */
 

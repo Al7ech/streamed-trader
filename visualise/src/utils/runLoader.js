@@ -4,7 +4,7 @@
 // 여기서는 가벼운 run JSON 파싱과 run 파일 목록 필터링만 담당한다.
 
 import {toSeconds} from './aggregate';
-import {deleteFiles, fetchFileText} from './fileAccess';
+import {deleteFiles, fetchFileText, writeFileText} from './fileAccess';
 
 /**
  * run 파일(사이드바에 나열)만 골라낸다: backtest/ 아래의 .json 중 .series.json 이 아닌 것.
@@ -82,4 +82,26 @@ export const deleteRun = async (fileName) => {
     console.warn(`Could not read shard list for ${fileName}, deleting run file only:`, error);
   }
   return deleteFiles([...shardFiles, fileName]);
+};
+
+/**
+ * run JSON의 metadata.label만 수정한다 — summary/trades/series 등 나머지 필드는 원본 그대로
+ * 보존. trim한 결과가 빈 문자열이면 label 키 자체를 지운다(백엔드가 label 미지정 시 키를 아예
+ * 쓰지 않는 것과 동일하게).
+ * @returns {Promise<string>} 정규화된(trim된) label — 호출 측이 재조회 없이 state를 갱신할 수 있게.
+ */
+export const updateRunLabel = async (fileName, label) => {
+  const text = await fetchFileText(fileName);
+  const doc = JSON.parse(text);
+  const trimmed = (label || '').trim();
+
+  if (!doc.metadata) doc.metadata = {};
+  if (trimmed) {
+    doc.metadata.label = trimmed;
+  } else {
+    delete doc.metadata.label;
+  }
+
+  await writeFileText(fileName, JSON.stringify(doc));
+  return trimmed;
 };

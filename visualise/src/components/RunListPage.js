@@ -1,8 +1,22 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {Link} from 'react-router-dom';
-import {ActionIcon, Anchor, Center, Container, Loader, Paper, Stack, Table, Text, Title, Tooltip} from '@mantine/core';
-import {IconTrash} from '@tabler/icons-react';
-import {loadRun} from '../utils/runLoader';
+import {
+  ActionIcon,
+  Anchor,
+  Center,
+  Container,
+  Group,
+  Loader,
+  Paper,
+  Stack,
+  Table,
+  Text,
+  TextInput,
+  Title,
+  Tooltip,
+} from '@mantine/core';
+import {IconCheck, IconPencil, IconTrash, IconX} from '@tabler/icons-react';
+import {loadRun, updateRunLabel} from '../utils/runLoader';
 import {fmtDate, fmtNum, fmtPct, paramsLines, paramsValues} from '../utils/format';
 
 /**
@@ -14,6 +28,46 @@ const RunListPage = ({backtestFiles, onDeleteRun}) => {
   const [loadingRows, setLoadingRows] = useState(true);
   const [deletingNames, setDeletingNames] = useState(new Set());
   const deletingRef = useRef(new Set());
+  const [editingName, setEditingName] = useState(null); // 편집 중인 fileName, or null — 한 번에 한 행만
+  const [editingValue, setEditingValue] = useState('');
+  const [savingNames, setSavingNames] = useState(new Set());
+  const savingRef = useRef(new Set());
+
+  const startEditing = useCallback((name, currentLabel) => {
+    setEditingName(name);
+    setEditingValue(currentLabel || '');
+  }, []);
+
+  const cancelEditing = useCallback(() => {
+    setEditingName(null);
+    setEditingValue('');
+  }, []);
+
+  const handleSaveLabel = useCallback(async (name) => {
+    if (savingRef.current.has(name)) return;
+    savingRef.current.add(name);
+    setSavingNames(prev => new Set(prev).add(name));
+    try {
+      const normalized = await updateRunLabel(name, editingValue);
+      setRows(prev => prev.map(row =>
+        row.file.name === name
+          ? {...row, metadata: {...row.metadata, label: normalized || undefined}}
+          : row
+      ));
+      setEditingName(null);
+      setEditingValue('');
+    } catch (error) {
+      console.error(`Error updating label for ${name}:`, error);
+      alert(`label 저장 중 오류가 발생했습니다: ${error.message}`);
+    } finally {
+      savingRef.current.delete(name);
+      setSavingNames(prev => {
+        const next = new Set(prev);
+        next.delete(name);
+        return next;
+      });
+    }
+  }, [editingValue]);
 
   const handleDelete = useCallback(async (name) => {
     if (deletingRef.current.has(name)) return;
@@ -120,13 +174,62 @@ const RunListPage = ({backtestFiles, onDeleteRun}) => {
                 return (
                   <Table.Tr key={file.name}>
                     <Table.Td>
-                      <Anchor component={Link} to={`/run/${encodeURIComponent(file.name)}`} size="sm" fw={600}>
-                        {metadata.label || metadata.streamer || file.name}
-                      </Anchor>
-                      {metadata.label && metadata.streamer && (
+                      {editingName === file.name ? (
+                        <Group gap={4} wrap="nowrap">
+                          <TextInput
+                            size="xs"
+                            autoFocus
+                            value={editingValue}
+                            onChange={(e) => setEditingValue(e.currentTarget.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') handleSaveLabel(file.name);
+                              if (e.key === 'Escape') cancelEditing();
+                            }}
+                            disabled={savingNames.has(file.name)}
+                            style={{maxWidth: 220}}
+                          />
+                          <ActionIcon
+                            variant="subtle"
+                            color="green"
+                            size="sm"
+                            aria-label="저장"
+                            loading={savingNames.has(file.name)}
+                            disabled={savingNames.has(file.name)}
+                            onClick={() => handleSaveLabel(file.name)}
+                          >
+                            <IconCheck size={16}/>
+                          </ActionIcon>
+                          <ActionIcon
+                            variant="subtle"
+                            color="gray"
+                            size="sm"
+                            aria-label="취소"
+                            disabled={savingNames.has(file.name)}
+                            onClick={cancelEditing}
+                          >
+                            <IconX size={16}/>
+                          </ActionIcon>
+                        </Group>
+                      ) : (
+                        <Group gap={4} wrap="nowrap">
+                          <Anchor component={Link} to={`/run/${encodeURIComponent(file.name)}`} size="sm" fw={600}>
+                            {metadata.label || metadata.streamer || file.name}
+                          </Anchor>
+                          <ActionIcon
+                            variant="subtle"
+                            color="gray"
+                            size="xs"
+                            aria-label={`${file.name} label 수정`}
+                            onClick={() => startEditing(file.name, metadata.label)}
+                          >
+                            <IconPencil size={14}/>
+                          </ActionIcon>
+                        </Group>
+                      )}
+                      {editingName !== file.name && metadata.label && metadata.streamer && (
                         <Text size="xs" c="dimmed">{metadata.streamer}</Text>
                       )}
-                      {params && (
+                      {editingName !== file.name && params && (
                         <Tooltip
                           label={<span style={{whiteSpace: 'pre-line'}}>{paramsLines(metadata.params)}</span>}
                           multiline
@@ -161,7 +264,7 @@ const RunListPage = ({backtestFiles, onDeleteRun}) => {
                         size="sm"
                         aria-label={`${file.name} 삭제`}
                         loading={deletingNames.has(file.name)}
-                        disabled={deletingNames.has(file.name)}
+                        disabled={deletingNames.has(file.name) || editingName === file.name}
                         onClick={() => handleDelete(file.name)}
                       >
                         <IconTrash size={16}/>
