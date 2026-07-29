@@ -36,7 +36,7 @@ class ADXIndicator(BaseIndicator):
         self._ndm_s: Optional[float] = None
         self._adx: Optional[float] = None
 
-        self._adx_values = deque()
+        self._adx_values = self._new_history()
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
         h, l, c = candle.high, candle.low, candle.close
@@ -84,7 +84,4 @@ class ADXIndicator(BaseIndicator):
         self._adx_values.append(self._adx)
 
     def get_index(self, idx: int) -> Optional[float]:
-        try:
-            return self._adx_values[idx]
-        except IndexError:
-            return None
+        return self._read(self._adx_values, idx)

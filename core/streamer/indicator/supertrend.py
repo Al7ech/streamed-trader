@@ -32,8 +32,8 @@ class SupertrendIndicator(BaseIndicator):
         self._final_lb: Optional[float] = None
         self._trend = 1
 
-        self._lines = deque()
-        self._directions = deque()
+        self._lines = self._new_history()
+        self._directions = self._new_history()
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
         if self._prev_close is None:
@@ -81,13 +81,7 @@ class SupertrendIndicator(BaseIndicator):
         self._directions.append(trend)
 
     def get_index(self, idx: int) -> Optional[float]:
-        try:
-            return self._lines[idx]
-        except IndexError:
-            return None
+        return self._read(self._lines, idx)
 
     def get_direction(self, idx: int = -1) -> Optional[int]:
-        try:
-            return self._directions[idx]
-        except IndexError:
-            return None
+        return self._read(self._directions, idx)

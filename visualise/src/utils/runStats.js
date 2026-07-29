@@ -122,3 +122,22 @@ export const computeDrawdownSeries = (equity) => {
     return {time: p.time, value: peak > 0 ? p.value / peak - 1 : 0};
   });
 };
+
+/**
+ * 기초자산(buy & hold) 대비 누적 초과 성과: equity/baseAsset − 1.
+ * 0 위면 그냥 들고 있는 것보다 앞서는 중, 아래면 뒤처지는 중이다.
+ *
+ * 두 곡선은 백엔드에서 같은 stride 로 다운샘플되어 타임스탬프가 인덱스별로 일치한다 —
+ * 그래도 길이/시각을 확인하고 어긋나면 보간 없이 [] 를 돌려 조용히 비활성화한다.
+ */
+export const computeRelativeStrengthSeries = (equity, baseAsset) => {
+  if (!Array.isArray(equity) || !Array.isArray(baseAsset)) return [];
+  if (equity.length === 0 || equity.length !== baseAsset.length) return [];
+  const out = [];
+  for (let i = 0; i < equity.length; i += 1) {
+    const base = baseAsset[i];
+    if (base.time !== equity[i].time || !(base.value > 0)) return [];
+    out.push({time: equity[i].time, value: equity[i].value / base.value - 1});
+  }
+  return out;
+};

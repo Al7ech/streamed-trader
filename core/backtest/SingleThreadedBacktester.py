@@ -1,4 +1,5 @@
 import copy
+import logging
 import os
 import sys
 from datetime import datetime, timezone
@@ -6,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
+from core.backtest.metrics import build_buy_and_hold_curve
 from core.backtest.report import Report
 from core.backtest.result_writer import ShardWriter, write_run_json
 from core.backtest.status import Status
@@ -15,13 +17,30 @@ from core.streamer import BaseStreamer
 from core.streamer import Candle
 
 
+DEFAULT_FEE_RATIO = 0.0004
+
+
 class SingleThreadedBacktester:
-    def __init__(self, streamer: BaseStreamer, candles: List[Candle], fee_ratio: float = 0.0004,
-                 result_path: str = "asset/"):
+    def __init__(self, streamer: BaseStreamer, candles: List[Candle],
+                 fee_ratio: Optional[float] = None, result_path: str = "asset/"):
+        """:param fee_ratio: 실제로 부과할 수수료율. None이면 **스트리머의 값을 따라간다**.
+
+        스트리머는 자기 ``fee_ratio``로 사이징하고 백테스터는 자기 값으로 과금하므로, 둘이
+        어긋나면 실효 레버리지가 의도와 달라진다. 예전 기본값(고정 0.0004)은 ``FastBacktester(
+        streamer, candles)``처럼 인자 없이 부를 때 그 불일치를 조용히 만들 수 있었다.
+        """
         self.streamer = streamer
         self.candles = candles
         self.status = Status(margin=100000.0)
-        self.fee_ratio = fee_ratio
+        streamer_fee = getattr(streamer, "fee_ratio", None)
+        if fee_ratio is None:
+            self.fee_ratio = streamer_fee if streamer_fee is not None else DEFAULT_FEE_RATIO
+        else:
+            self.fee_ratio = fee_ratio
+            if streamer_fee is not None and streamer_fee != fee_ratio:
+                logging.getLogger(__name__).warning(
+                    "수수료율 불일치: 백테스터 %s vs 스트리머 %s — 스트리머는 자기 값으로 "
+                    "사이징하므로 실효 레버리지가 의도와 달라진다", fee_ratio, streamer_fee)
         self.result_path = result_path
 
     def run(self, start_time: Optional[int] = None, end_time: Optional[int] = None,
@@ -37,6 +56,7 @@ class SingleThreadedBacktester:
         trades: List[Trade] = []
         max_leverage = 0.0
         equity_curve: List[Tuple[int, float]] = []
+        closes: List[float] = []  # buy & hold 기준선을 만들기 위한 종가 (equity_curve 와 같은 길이)
 
         indicator_names = list(self.streamer.indicators.keys())
         column_groups = {name: self.streamer.indicators[name].scale_group for name in indicator_names}
@@ -72,13 +92,16 @@ class SingleThreadedBacktester:
 
             self.status.update_unrealised_pnl(candle.close)
             equity_curve.append((candle.end_time, self.status.total_margin()))
+            closes.append(candle.close)
 
             # opt-in indicators ingest this candle before the decision sees them
             for indicator in before_indicators:
                 indicator.update(candle, self.status)
 
-            # force liquidation
-            if self.status.margin <= self.status.unrealised_pnl:
+            # 강제청산: 시가평가 자본(margin + 미실현손익)이 0 이하로 떨어지면 파산이다.
+            # flat일 때도 이 줄을 타는데, 그때는 미실현이 0이라 조건이 margin <= 0 과 같고
+            # Action(-0) = Action(0) 이므로 "파산 후에는 스트리머를 부르지 않는다"가 된다.
+            if self.status.total_margin() <= 0.0:
                 action = Action(-self.status.position)
             else:
                 action = self.streamer.update_candle(candle, self.status)
@@ -113,7 +136,9 @@ class SingleThreadedBacktester:
                     leverage=leverage,
                 ))
 
-        report = Report(trades, max_leverage, self.status, equity_curve)
+        benchmark_curve = build_buy_and_hold_curve([t for t, _ in equity_curve], closes,
+                                                   init_margin)
+        report = Report(trades, max_leverage, self.status, equity_curve, benchmark_curve)
 
         if write_output:
             shards = shard_writer.close() if shard_writer is not None else []

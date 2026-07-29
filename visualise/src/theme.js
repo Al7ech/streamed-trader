@@ -19,6 +19,10 @@ export const INDICATOR_COLORS = [
 // INDICATOR_COLORS[0] 과 같은 파랑 계열이지만, 지표 순환 팔레트와 별개로 "자산" 의미로 고정한다.
 export const EQUITY_COLOR = '#4dabf7';
 
+// 기초자산 단순 보유(buy & hold) 비교선 — equity(파랑)/평균 성장 기준선(무채색)/drawdown(빨강)과
+// 한 pane 안에서 구분되어야 해서 검증된 팔레트의 노랑을 고정 배정한다.
+export const BASE_ASSET_COLOR = INDICATOR_COLORS[1];
+
 // 캔들 색 — 채도/명도를 낮춘 중간톤으로, 마커·연결선(TRADE_COLORS)이 앞에 서게 한다.
 export const CANDLE_COLORS = {
   up: '#2c7a6f',

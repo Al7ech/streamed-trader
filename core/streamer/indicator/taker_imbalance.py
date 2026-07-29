@@ -26,7 +26,7 @@ class TakerImbalanceIndicator(BaseIndicator):
         self._vol_sum = 0.0
         self._missing = deque(maxlen=window)
         self._missing_count = 0
-        self._values = deque()
+        self._values = self._new_history()
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
         if len(self._buy) == self.window:
@@ -50,7 +50,4 @@ class TakerImbalanceIndicator(BaseIndicator):
         self._values.append((2.0 * self._buy_sum - self._vol_sum) / self._vol_sum)
 
     def get_index(self, idx: int) -> Optional[float]:
-        try:
-            return self._values[idx]
-        except IndexError:
-            return None
+        return self._read(self._values, idx)

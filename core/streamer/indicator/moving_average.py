@@ -10,10 +10,12 @@ from core.streamer.indicator.base_indicator import VectorizedIndicator
 
 
 class MovingAverage(VectorizedIndicator):
-    def __init__(self, window: int):
-        super().__init__(window)
+    def __init__(self, window: int, history_size: Optional[int] = None):
+        # MovingAverage(1)을 종가 시계열로 재사용하는 전략(MomentumTimeExitStreamer)이 있어
+        # 조회 깊이가 파라미터로 정해진다. 그래서 이 지표만 history_size를 열어 둔다.
+        super().__init__(window, history_size=history_size)
         self.values = deque(maxlen=window)
-        self.ma_values = deque()
+        self.ma_values = self._new_history()
         self._sum = 0
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
@@ -32,10 +34,7 @@ class MovingAverage(VectorizedIndicator):
         self.ma_values.append(ma)
 
     def get_index(self, idx: int) -> Optional[float]:
-        try:
-            return self.ma_values[idx]
-        except IndexError:
-            return None
+        return self._read(self.ma_values, idx)
 
     def get_latest(self) -> Optional[float]:
         return self.get_index(-1)

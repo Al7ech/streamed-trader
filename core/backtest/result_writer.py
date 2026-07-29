@@ -24,7 +24,9 @@ import numpy as np
 from core.backtest.metrics import compute_max_drawdown, compute_sharpe
 from core.backtest.report import Report
 
-SCHEMA_VERSION = 1
+# 2: added the top-level "benchmark" block (buy & hold curve) + summary.benchmark_profit_pct.
+# Purely additive — the frontend hides the related UI when they are missing, so v1 runs still load.
+SCHEMA_VERSION = 2
 
 # Columns whose empty/warm-up value should be stored as JSON null.
 _OHLC_KEYS = ("open", "high", "low", "close")
@@ -180,15 +182,26 @@ def _downsample_equity(equity_curve: Sequence, max_points: int = 2000) -> Option
 
 
 def build_summary(report: Report, init_margin: float) -> Dict:
-    """Compute the summary block from the in-memory Report (reuses metrics.py)."""
+    """Compute the summary block from the in-memory Report (reuses metrics.py).
+
+    ``report.benchmark_curve`` (buy & hold) adds ``benchmark_profit_pct`` — same unit as
+    ``profit_pct`` (percent, x100), None when the run has no benchmark so the frontend can tell
+    "no data" from "0%".
+    """
     wins = sum(1 for t in report.trades if t.wnl > 0)
     losses = sum(1 for t in report.trades if t.wnl < 0)
     total = wins + losses
     final_margin = report.status.total_margin()
+    benchmark_profit_pct = (
+        (report.benchmark_curve[-1][1] / init_margin - 1) * 100
+        if report.benchmark_curve and init_margin
+        else None
+    )
     return {
         "max_leverage": report.max_leverage,
         "final_margin": final_margin,
         "profit_pct": (final_margin / init_margin - 1) * 100 if init_margin else 0.0,
+        "benchmark_profit_pct": benchmark_profit_pct,
         "win_trades": wins,
         "lose_trades": losses,
         "total_trades": total,
@@ -201,7 +214,12 @@ def build_summary(report: Report, init_margin: float) -> Dict:
 def write_run_json(dir_path: str, run_id: str, report: Report, metadata: Dict,
                    shards: List[Dict], columns: List[str], column_groups: Dict[str, str],
                    has_ohlc: bool, interval_ms: int, init_margin: float) -> str:
-    """Assemble and write the run JSON. Returns the written file path."""
+    """Assemble and write the run JSON. Returns the written file path.
+
+    ``report.benchmark_curve`` (buy & hold of the traded symbol, same length and timestamps as
+    ``report.equity_curve``) is written as a sibling ``benchmark`` block so the frontend can
+    overlay it on the equity chart without loading the heavy series shards.
+    """
     trades = [
         {
             "timestamp": t.timestamp,
@@ -220,6 +238,9 @@ def write_run_json(dir_path: str, run_id: str, report: Report, metadata: Dict,
         "metadata": metadata,
         "summary": build_summary(report, init_margin),
         "equity": _downsample_equity(report.equity_curve),
+        # same downsampler on an equal-length curve -> identical stride, so benchmark.time is
+        # element-wise identical to equity.time and the frontend can pair them by index
+        "benchmark": _downsample_equity(report.benchmark_curve),
         "trades": trades,
         "series": {
             "columns": columns,

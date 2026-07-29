@@ -121,7 +121,8 @@ when the process is launched with cwd = `core/`.
    `BaseStreamer`, updating a `Status` (margin/position/avg_price/unrealised_pnl/leverage) and
    (when `metadata` is passed to `run()`) writing a run JSON plus month-bucketed columnar series
    shards into `asset/backtest/` (`result_writer.py`). It also force-liquidates a position when
-   `margin <= unrealised_pnl`.
+   mark-to-market equity (`margin + unrealised_pnl`, i.e. `Status.total_margin()`) falls to zero
+   or below.
 
    `backtest/FastBacktester.py` is the drop-in fast version the entry scripts use: it precomputes
    every `VectorizedIndicator` as a numpy array (swapped in as a cursor-backed `ArrayIndicator`
@@ -134,13 +135,23 @@ when the process is launched with cwd = `core/`.
 
 ### Backtest output format (`core/backtest/result_writer.py`)
 
-`SCHEMA_VERSION = 1`. A run with `metadata` produces:
+`SCHEMA_VERSION = 2` (v2 added the `benchmark` block and `summary.benchmark_profit_pct`; both are
+purely additive and the frontend hides the related UI when they are missing, so v1 runs still
+load). A run with `metadata` produces:
 
 - `asset/backtest/<run_id>.json` — `metadata`, `summary` (max leverage, final margin, profit %,
-  win/lose counts, win rate, `sharpe`, `max_drawdown` — computed by `backtest/metrics.py`;
-  `compute_sharpe` resamples to daily before annualising because per-candle returns are mostly
-  zero-noise), a downsampled `equity` block (≤2000 points for the timeline sparkline), the full
-  `trades` list, and a `series` index describing the shards.
+  buy & hold profit %, win/lose counts, win rate, `sharpe`, `max_drawdown` — computed by
+  `backtest/metrics.py`; `compute_sharpe` resamples to daily before annualising because
+  per-candle returns are mostly zero-noise), a downsampled `equity` block (≤2000 points for the
+  timeline sparkline), a `benchmark` block downsampled the same way, the full `trades` list, and a
+  `series` index describing the shards.
+
+  `benchmark` is the buy & hold curve of the traded symbol (`init_margin * close_i / close_0`,
+  built by `metrics.build_buy_and_hold_curve` and carried on `Report.benchmark_curve`). It has the
+  same length as the equity curve, so `_downsample_equity` picks the same stride and
+  `benchmark.time` is element-wise identical to `equity.time` — the frontend pairs them by index
+  with no interpolation. Because it is in the run JSON rather than the shards, the Trades tab can
+  overlay it and derive the relative-strength curve without loading any per-month shard.
 - `asset/backtest/<run_id>.<YYYY-MM>.series.json` — one shard per month with per-candle OHLC and
   indicator values, **columnar** (parallel arrays) so column keys aren't repeated per candle.
   `SingleThreadedBacktester` streams these out through `ShardWriter` (only the current month is in

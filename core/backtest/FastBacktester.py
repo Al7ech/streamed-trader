@@ -8,6 +8,7 @@ import numpy as np
 from tqdm import tqdm
 
 from core.backtest.SingleThreadedBacktester import SingleThreadedBacktester
+from core.backtest.metrics import build_buy_and_hold_curve
 from core.backtest.report import Report
 from core.backtest.result_writer import write_run_json, write_series_shards
 from core.backtest.status import Status
@@ -26,12 +27,13 @@ class ArrayIndicator(BaseIndicator):
     a flagged one is advanced to i+1 first so ``get_latest()`` includes it. Either way this
     matches what a loop-updated indicator on the same side of ``decide_action`` would return.
 
-    Known deviation: reads older than ``window`` return real values where a Donchian deque
-    would raise IndexError -> None; no current streamer reads further back than -2.
+    ``history_size`` is mirrored from the original indicator so a read deeper than the loop
+    path retains raises ``IndexError`` here too, instead of quietly returning a value the loop
+    path could not have produced.
     """
 
-    def __init__(self, seq: np.ndarray, window: int):
-        super().__init__(window)
+    def __init__(self, seq: np.ndarray, window: int, history_size: int):
+        super().__init__(window, history_size=history_size)
         self.seq = seq
         self.cursor = 0
 
@@ -39,6 +41,10 @@ class ArrayIndicator(BaseIndicator):
         self.cursor += 1
 
     def get_index(self, idx: int) -> Optional[float]:
+        if idx < -self.history_size:
+            raise IndexError(
+                f"ArrayIndicator.get_index({idx}): 보관 이력 {self.history_size}개를 넘는 "
+                f"조회다. 지표 생성자에 history_size를 키워 넘겨라.")
         i = self.cursor + idx  # idx is negative (-1 = latest)
         if i < 0:
             return None
@@ -97,7 +103,7 @@ class FastBacktester(SingleThreadedBacktester):
             if isinstance(indicator, VectorizedIndicator):
                 seq = indicator.precompute_series(open_arr, high_arr, low_arr, close_arr, volume_arr)
                 precomputed[name] = seq
-                shim = ArrayIndicator(seq, indicator.window)
+                shim = ArrayIndicator(seq, indicator.window, indicator.history_size)
                 shim.updates_before_decide = indicator.updates_before_decide
                 run_indicators[name] = shim
             else:
@@ -142,12 +148,14 @@ class FastBacktester(SingleThreadedBacktester):
 
                 if status.position != 0.0:
                     status.unrealised_pnl = status.position * (price - status.avg_price)
-                    if status.margin <= status.unrealised_pnl:  # force liquidation
+                    # 강제청산: 시가평가 자본이 0 이하 = 파산 (reference와 같은 조건)
+                    if status.margin + status.unrealised_pnl <= 0.0:
                         action = Action(-status.position)
                     else:
                         action = decide(candle, status)
                 else:
                     status.unrealised_pnl = 0.0
+                    # 미실현이 0이라 reference의 total_margin() <= 0 과 같은 조건이다
                     if status.margin <= 0.0:  # bankrupt & flat: reference skips the streamer too
                         action = Action(0)
                     else:
@@ -185,7 +193,8 @@ class FastBacktester(SingleThreadedBacktester):
             self.streamer.indicators = original_indicators
 
         equity_curve = self._build_equity_curve(end_times, close_arr, trade_marks, init_margin)
-        report = Report(trades, max_leverage, self.status, equity_curve)
+        benchmark_curve = build_buy_and_hold_curve(end_times, close_arr, init_margin)
+        report = Report(trades, max_leverage, self.status, equity_curve, benchmark_curve)
 
         if write_output:
             backtest_dir = self._prepare_backtest_dir()

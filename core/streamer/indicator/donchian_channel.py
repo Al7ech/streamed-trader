@@ -13,7 +13,7 @@ class MinDonchianIndicator(VectorizedIndicator):
     def __init__(self, window: int):
         super().__init__(window)
         self.min_deque = deque(maxlen=window)
-        self.values = deque(maxlen=window)
+        self.values = self._new_history()
         self.cnt = 0
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
@@ -35,10 +35,7 @@ class MinDonchianIndicator(VectorizedIndicator):
         self.values.append(v if self.window <= idx else None)
 
     def get_index(self, idx: int) -> Optional[float]:
-        try:
-            return self.values[idx]
-        except IndexError:
-            return None
+        return self._read(self.values, idx)
 
     def get_latest(self) -> Optional[float]:
         return self.get_index(-1)
@@ -52,7 +49,7 @@ class MaxDonchianIndicator(VectorizedIndicator):
     def __init__(self, window: int):
         super().__init__(window)
         self.max_deque = deque(maxlen=window)
-        self.values = deque(maxlen=window)
+        self.values = self._new_history()
         self.cnt = 0
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
@@ -74,10 +71,7 @@ class MaxDonchianIndicator(VectorizedIndicator):
         self.values.append(v if self.window <= idx else None)
 
     def get_index(self, idx: int) -> Optional[float]:
-        try:
-            return self.values[idx]
-        except IndexError:
-            return None
+        return self._read(self.values, idx)
 
     def get_latest(self) -> Optional[float]:
         return self.get_index(-1)

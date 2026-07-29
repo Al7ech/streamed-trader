@@ -19,7 +19,7 @@ class RollingStd(VectorizedIndicator):
     def __init__(self, window: int):
         super().__init__(window)
         self.values = deque(maxlen=window)
-        self.std_values = deque()
+        self.std_values = self._new_history()
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
         self.values.append(candle.close)
@@ -31,10 +31,7 @@ class RollingStd(VectorizedIndicator):
         self.std_values.append(float(np.std(self.values, ddof=1)))
 
     def get_index(self, idx: int) -> Optional[float]:
-        try:
-            return self.std_values[idx]
-        except IndexError:
-            return None
+        return self._read(self.std_values, idx)
 
     def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
                           close: np.ndarray, volume: np.ndarray) -> np.ndarray:

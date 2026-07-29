@@ -29,7 +29,10 @@ class MomentumTimeExitStreamer(BaseStreamer):
                  fee_ratio: float = 0.0004,
                  use_stop: bool = True):
         super().__init__({
-            "close_hist": MovingAverage(1),
+            # get_index(-mom_lookback)로 읽으므로 조회 깊이가 파라미터에 걸린다.
+            # 기본 이력(BaseIndicator.history_size)을 넘는 lookback을 줘도 깨지지 않게 맞춰 둔다.
+            "close_hist": MovingAverage(
+                1, history_size=max(MovingAverage.history_size, mom_lookback + 2)),
         })
         self.symbol = symbol
         self.mom_lookback = mom_lookback

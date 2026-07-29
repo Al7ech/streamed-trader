@@ -17,10 +17,12 @@ class ATRIndicator(VectorizedIndicator):
 
     scale_group = "atr"
 
-    def __init__(self, window: int):
-        super().__init__(window)
+    def __init__(self, window: int, history_size: Optional[int] = None):
+        # ATR 기울기를 보는 전략(RyulStreamer_edit2)이 get_index(-1-lookback)으로 읽어
+        # 조회 깊이가 파라미터에 걸린다. 그래서 이 지표도 history_size를 열어 둔다.
+        super().__init__(window, history_size=history_size)
         self._tr_values = deque(maxlen=window)
-        self._atr_values = deque()
+        self._atr_values = self._new_history()
         self._sum = 0.0
         self._prev_close: Optional[float] = None
 
@@ -45,10 +47,7 @@ class ATRIndicator(VectorizedIndicator):
         self._atr_values.append(self._sum / self.window)
 
     def get_index(self, idx: int) -> Optional[float]:
-        try:
-            return self._atr_values[idx]
-        except IndexError:
-            return None
+        return self._read(self._atr_values, idx)
 
     def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
                           close: np.ndarray, volume: np.ndarray) -> np.ndarray:
