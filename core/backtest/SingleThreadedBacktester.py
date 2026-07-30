@@ -157,53 +157,11 @@ class SingleThreadedBacktester:
 
     def _trade(self, action: Action, price: float) -> Tuple[float, float]:
         """
+        체결 회계는 ``Status.apply_fill``에 있다 — 라이브 트레이더의 dry-run 경로가 같은
+        코드를 쓰기 위해서다.
+
         :param action:
         :param price:
         :return: tuple of wnl, fee
         """
-        s = self.status
-        qty = action.quantity
-        wnl = 0
-        fee = price * abs(action.quantity) * self.fee_ratio
-        # 신규 진입 (롱/숏 방향 동일하게 처리)
-        if s.position == 0.0:
-            s.avg_price = price
-            s.position = qty
-
-        # 같은 방향 추가 진입 (롱/숏)
-        elif (s.position > 0 and qty > 0) or (s.position < 0 and qty < 0):
-            total_cost = abs(s.avg_price * s.position) + abs(price * qty)
-            total_pos = s.position + qty
-            s.avg_price = total_cost / abs(total_pos)
-            s.position = total_pos
-            # base_margin, unrealised_pnl는 변동 없음
-
-        # 반대 방향 청산(부분/전부)
-        else:
-            if abs(qty) > abs(s.position):
-                # 방향 전환: 기존 포지션 청산 후 신규 진입
-                open_qty = qty + s.position
-
-                wnl = s.unrealised_pnl
-                # PNL/margin 계산 (전부 청산)
-                s.avg_price = price
-                s.margin += s.unrealised_pnl
-                s.unrealised_pnl = 0.0
-                s.position = open_qty
-            else:
-                # 부분 청산
-                closed_qty = qty
-                realised_pnl = s.unrealised_pnl * (-closed_qty / s.position)
-
-                wnl = realised_pnl
-                # avg_price는 변동 없음
-                s.margin += realised_pnl
-                s.unrealised_pnl -= realised_pnl
-                s.position += closed_qty
-
-        if s.position == 0.0:
-            s.avg_price = 0.0
-
-        s.margin -= fee
-
-        return wnl, fee
+        return self.status.apply_fill(action.quantity, price, self.fee_ratio)
