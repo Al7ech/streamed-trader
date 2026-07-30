@@ -244,15 +244,12 @@ class BinanceVisionFetcher(BinanceCandleFetcher):
                         volume=float(row[5]),
                         start_time=open_time,
                         end_time=close_time + 1,
-                        trade_count=int(row[8]) if len(row) > 9 else None,
+                        trade_count=int(row[8]) if len(row) > 8 else None,
                         taker_buy_volume=float(row[9]) if len(row) > 9 else None
                     ))
         return candles
 
     def _rest_range(self, symbol: str, start_date: datetime, end_date: datetime,
                     interval: str) -> List[Candle]:
-        try:
-            return super().get_candles(symbol, start_date, end_date, interval)
-        except IndexError:
-            # base class는 결과가 비어 있으면 unique_candles[0]에서 IndexError를 낸다
-            return []
+        # REST 경로는 이제 결과가 비면 빈 리스트를 돌려준다 (예전엔 IndexError를 냈다).
+        return super().get_candles(symbol, start_date, end_date, interval)

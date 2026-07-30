@@ -33,7 +33,12 @@ def interval_to_minutes(interval: str) -> int:
 
 
 def ensure_utc(dt: datetime) -> datetime:
-    """Ensure datetime is UTC timezone-aware."""
+    """Ensure datetime is UTC timezone-aware.
+
+    naive datetime은 **UTC로 해석한다**. 예전에는 ``dt.astimezone()``으로 로컬 타임존을
+    가정해서, ``datetime(2024, 1, 1)`` 같은 흔한 인자가 머신의 UTC 오프셋만큼 밀린 구간을
+    의미했다 (KST에서는 2023-12-31T15:00Z). 월 청크 경계까지 함께 밀렸다.
+    """
     if dt.tzinfo is None:
-        dt = dt.astimezone()
+        return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)

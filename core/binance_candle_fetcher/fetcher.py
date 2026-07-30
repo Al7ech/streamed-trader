@@ -104,7 +104,7 @@ class BinanceCandleFetcher(BaseCandleFetcher):
                             volume=float(k[5]),
                             start_time=int(k[0]),
                             end_time=int(k[6]) + 1,
-                            trade_count=int(k[8]) if len(k) > 9 else None,
+                            trade_count=int(k[8]) if len(k) > 8 else None,
                             taker_buy_volume=float(k[9]) if len(k) > 9 else None
                         )
                         all_candles.append(candle)
@@ -112,11 +112,16 @@ class BinanceCandleFetcher(BaseCandleFetcher):
                     pbar.set_postfix(candles=len(klines), total_candles=len(all_candles))
 
                 except Exception as e:
+                    # 여기서 삼키면 안 된다. 잘린 결과는 상위(_save_month_chunks)에서 **완전한
+                    # 불변 월 청크**로 캐시되고, 완전성 경고는 90% 미만에서만 뜨므로 44,640캔들
+                    # 월에 1500캔들짜리 구멍이 영구히 묻힌다.
                     pbar.set_postfix(error=str(e)[:50])
-                    # Continue with other chunks even if one fails
-                    continue
-
-                pbar.update(1)
+                    self.logger.error(
+                        f"chunk fetch failed ({chunk_start_naive} ~ {chunk_end_naive}, "
+                        f"{symbol} {interval}): {e}")
+                    raise
+                finally:
+                    pbar.update(1)
 
         # Sort candles by start_time to ensure chronological order
         all_candles.sort(key=lambda c: c.start_time)
@@ -128,6 +133,13 @@ class BinanceCandleFetcher(BaseCandleFetcher):
             if candle.start_time not in seen_times:
                 unique_candles.append(candle)
                 seen_times.add(candle.start_time)
+
+        if not unique_candles:
+            # 상장 이전 구간 등 결과가 비는 경우가 실제로 있다. 예전에는 아래 [0] 인덱싱에서
+            # IndexError가 나 캐시 페치 전체가 중단됐다.
+            self.logger.info(
+                f"fetched 0 candles: {start_date} ~ {end_date}, interval: {interval}")
+            return []
 
         s = ms_timestamp_to_datetime(unique_candles[0].start_time)
         e = ms_timestamp_to_datetime(unique_candles[-1].end_time)

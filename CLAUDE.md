@@ -142,7 +142,11 @@ load). A run with `metadata` produces:
 - `asset/backtest/<run_id>.json` — `metadata`, `summary` (max leverage, final margin, profit %,
   buy & hold profit %, win/lose counts, win rate, `sharpe`, `max_drawdown` — computed by
   `backtest/metrics.py`; `compute_sharpe` resamples to daily before annualising because
-  per-candle returns are mostly zero-noise), a downsampled `equity` block (≤2000 points for the
+  per-candle returns are mostly zero-noise, and `result_writer._sharpe_sampling` derives the
+  stride/annualisation from `interval_ms` so the resample is genuinely daily at any candle size.
+  Win/lose counts only include **realising** fills — those whose signed quantity opposes the
+  pre-trade position — and compare `wnl - fee`, so a close whose realised PnL is eaten by the
+  fee counts as a loss), a downsampled `equity` block (≤2000 points for the
   timeline sparkline), a `benchmark` block downsampled the same way, the full `trades` list, and a
   `series` index describing the shards.
 
@@ -237,9 +241,13 @@ gives it its own.
 
 `Status` is the single shared representation of account state (`avg_price`, `margin`,
 `unrealised_pnl`, `position`, `leverage`) used by *both* the backtester and the live
-`BinanceTrader` — the same averaging/PNL math (`SingleThreadedBacktester._trade`) models
-opening, pyramiding (same-direction add), partial close, full close, and direction-flip. A `Trade`
-is an immutable record of one fill plus a deep-copied pre-trade `Status`; `Report` bundles all
+`BinanceTrader`. `Status.apply_fill(quantity, price, fee_ratio)` holds the one copy of the
+averaging/PNL math and models opening, pyramiding (same-direction add), partial close, full close,
+and direction-flip; `SingleThreadedBacktester._trade` is a thin wrapper over it (inherited
+unchanged by `FastBacktester`), and `BinanceTrader`'s dry-run path calls it directly, so dry-run
+equity tracks a backtest of the same candles exactly. A `Trade`
+is an immutable record of one fill plus a deep-copied pre-trade `Status`; its `wnl` is realised
+PnL **before** the fee, which is carried separately in `fee`. `Report` bundles all
 `Trade`s with `max_leverage`, the final `Status` and the equity curve.
 
 ### Live trading (`core/trader/`)
@@ -250,13 +258,23 @@ is an immutable record of one fill plus a deep-copied pre-trade `Status`; `Repor
   delegate). On each *closed* kline it builds a `Candle`, calls the streamer, updates indicators,
   and fires registered action/error callbacks (`add_action_callback`/`add_error_callback`).
   `_prefeed_indicators()` backfills each indicator's window with historical candles (via
-  `BinanceCandleFetcher`) before going live, asserting the fetched range exactly matches what's
-  expected.
-  - In `dry_run` mode: margin starts at a fixed synthetic `1e6`, no user-data socket is opened, no
-    orders are sent, and position/avg_price are updated locally from the `Action` instead of from
-    exchange fills (there's a `TODO` noting this should really replay through the backtester).
-  - In live mode: `Status` is hydrated from `futures_account()` at startup and then kept in sync by
-    `ACCOUNT_UPDATE`/`ORDER_TRADE_UPDATE` events off the user-data stream.
+  `BinanceCandleFetcher`, off the event loop through `asyncio.to_thread`) before going live,
+  asserting the fetched range exactly matches what's expected. The range is floored to the
+  **interval** boundary, not the minute, so the assertion holds for every interval and not just
+  `1m`.
+  - `start()` builds the `BinanceSocketManager` first, prefeeds *before* opening any socket (so the
+    user-data queue can't overflow during a long backfill), sets `is_running = True` *before*
+    spawning listener tasks (they loop on that flag), and **re-raises** on failure — a trader that
+    could not start must not look like one that did. Listener tasks are kept in `self._tasks` so
+    asyncio can't garbage-collect them mid-flight.
+  - In `dry_run` mode: margin starts at a fixed synthetic `1e6`, no user-data socket is opened and
+    no orders are sent; fills are applied locally through `Status.apply_fill` with the streamer's
+    `fee_ratio`, which is the same accounting the backtester runs.
+  - In live mode: `Status` is hydrated from `futures_account()` at startup (from `walletBalance`,
+    not `marginBalance` — the latter already includes unrealised PnL, which `total_margin()` adds
+    again) and then kept in sync by `ACCOUNT_UPDATE`/`ORDER_TRADE_UPDATE` events off the user-data
+    stream. `ACCOUNT_UPDATE` carries **only changed** balances/positions, so the handler leaves
+    `Status` untouched when our margin asset or symbol is absent rather than zeroing it.
 - `BinanceExecutor` submits orders to a `ThreadPoolExecutor` (GIL-free from the asyncio loop) with
   exponential-backoff retries, returning a `concurrent.futures.Future[OrderResult]`; callers (e.g.
   `BinanceTrader._on_action`) block on `future.result(timeout=...)` from within an async callback.
