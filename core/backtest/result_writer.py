@@ -17,7 +17,7 @@ candle — this keeps them smaller than the old per-row CSV and faster to parse.
 import json
 import os
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -75,10 +75,7 @@ class ShardWriter:
             self._ohlc["low"].append(candle.low)
             self._ohlc["close"].append(candle.close)
         for name in self.indicator_names:
-            v = indicator_values.get(name)
-            # Donchian/MA indicators return a falsy value before their window is warmed up;
-            # store null so the frontend can skip those points (matches the old CSV blanks).
-            self._ind[name].append(v if v else None)
+            self._ind[name].append(_clean_value(indicator_values.get(name)))
 
     def _flush(self) -> None:
         if not self._time:
@@ -103,11 +100,22 @@ class ShardWriter:
         return self.shards
 
 
+def _clean_value(v) -> Optional[float]:
+    """Falsy/NaN -> null.
+
+    Donchian/MA 류 지표는 워밍업 동안 falsy를 반환하고, 벡터화 경로는 NaN을 반환한다. 둘 다
+    null로 눕혀야 프론트가 그 지점을 건너뛴다. NaN 검사(``v == v``)가 특히 중요한데,
+    ``bool(float('nan'))``은 True라 그냥 두면 ``json.dump``가 bare ``NaN`` 토큰을 뱉고
+    ``JSON.parse``가 그 샤드 전체를 거부한다.
+    """
+    return v if v and v == v else None
+
+
 def _clean_column(values: Sequence) -> List[Optional[float]]:
     """Falsy/NaN -> null, matching ShardWriter.add (warm-up blanks skipped by the frontend)."""
     if isinstance(values, np.ndarray):
         values = values.tolist()
-    return [v if v and v == v else None for v in values]
+    return [_clean_value(v) for v in values]
 
 
 def write_series_shards(dir_path: str, run_id: str, times: Sequence[int],
@@ -181,15 +189,41 @@ def _downsample_equity(equity_curve: Sequence, max_points: int = 2000) -> Option
     }
 
 
-def build_summary(report: Report, init_margin: float) -> Dict:
+_MS_PER_DAY = 86_400_000
+
+
+def _sharpe_sampling(interval_ms: int) -> Tuple[int, float]:
+    """캔들 간격에서 Sharpe의 (리샘플 stride, 연간 기간 수)를 구한다.
+
+    예전에는 stride가 1440으로 고정이라 **1분봉에서만** 일간 리샘플이었다. 1시간봉에서는
+    1440캔들이 60일인데도 365 periods/yr로 연율화해 Sharpe가 약 7.7배 과대했고, 일봉에서는
+    표본이 2개로 줄어 8년 미만 런의 Sharpe가 조용히 0.0이 됐다.
+
+    간격이 하루보다 짧으면 하루 단위로 묶고, 하루 이상이면 캔들 자체가 표본이 된다.
+    """
+    if interval_ms <= 0:
+        return 24 * 60, 365.0
+    sample_every = max(1, round(_MS_PER_DAY / interval_ms))
+    periods_per_year = 365.0 * _MS_PER_DAY / (sample_every * interval_ms)
+    return sample_every, periods_per_year
+
+
+def build_summary(report: Report, init_margin: float, interval_ms: int = 0) -> Dict:
     """Compute the summary block from the in-memory Report (reuses metrics.py).
 
     ``report.benchmark_curve`` (buy & hold) adds ``benchmark_profit_pct`` — same unit as
     ``profit_pct`` (percent, x100), None when the run has no benchmark so the frontend can tell
     "no data" from "0%".
+
+    ``interval_ms``는 Sharpe의 리샘플 간격을 캔들 간격에 맞추는 데 쓴다. 0이면 예전 기본값
+    (1분봉 가정)으로 되돌아간다.
     """
-    wins = sum(1 for t in report.trades if t.wnl > 0)
-    losses = sum(1 for t in report.trades if t.wnl < 0)
+    # 승패는 **실현이 일어난 체결**만 센다. 순수 진입은 wnl=0인데 수수료는 붙으므로 그냥
+    # (wnl - fee)로 재면 진입이 전부 패배로 집계된다. 거래 전 스냅샷의 포지션과 체결 수량의
+    # 부호가 반대면 축소 또는 방향 전환 = 실현이 발생한 체결이다.
+    closes = [t for t in report.trades if t.status.position * t.quantity < 0]
+    wins = sum(1 for t in closes if t.wnl - t.fee > 0)
+    losses = sum(1 for t in closes if t.wnl - t.fee < 0)
     total = wins + losses
     final_margin = report.status.total_margin()
     benchmark_profit_pct = (
@@ -206,7 +240,7 @@ def build_summary(report: Report, init_margin: float) -> Dict:
         "lose_trades": losses,
         "total_trades": total,
         "win_rate": (wins / total) if total else 0.0,
-        "sharpe": compute_sharpe(report.equity_curve),
+        "sharpe": compute_sharpe(report.equity_curve, *_sharpe_sampling(interval_ms)),
         "max_drawdown": compute_max_drawdown(report.equity_curve),
     }
 
@@ -236,7 +270,7 @@ def write_run_json(dir_path: str, run_id: str, report: Report, metadata: Dict,
     doc = {
         "schema_version": SCHEMA_VERSION,
         "metadata": metadata,
-        "summary": build_summary(report, init_margin),
+        "summary": build_summary(report, init_margin, interval_ms),
         "equity": _downsample_equity(report.equity_curve),
         # same downsampler on an equal-length curve -> identical stride, so benchmark.time is
         # element-wise identical to equity.time and the frontend can pair them by index

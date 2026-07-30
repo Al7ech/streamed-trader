@@ -41,6 +41,11 @@ class ArrayIndicator(BaseIndicator):
         self.cursor += 1
 
     def get_index(self, idx: int) -> Optional[float]:
+        if idx >= 0:
+            # 여기서 막지 않으면 seq[cursor] = 아직 반영되지 않은 캔들의 값이 나온다 (룩어헤드).
+            raise IndexError(
+                f"ArrayIndicator.get_index({idx}): 인덱스는 음수여야 한다 "
+                f"(-1 = 최신, -2 = 직전).")
         if idx < -self.history_size:
             raise IndexError(
                 f"ArrayIndicator.get_index({idx}): 보관 이력 {self.history_size}개를 넘는 "
@@ -76,6 +81,11 @@ class FastBacktester(SingleThreadedBacktester):
         streamer_name = type(self.streamer).__name__
         run_id = f"{streamer_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         init_margin = self.status.total_margin()
+        # 첫 거래 이전 구간의 자본을 되살리려면 진입 시점의 실제 상태가 필요하다.
+        # init_margin(= margin + 미실현)과 달리 이건 세 성분을 따로 들고 있어야 한다.
+        entry_margin = self.status.margin
+        entry_position = self.status.position
+        entry_avg_price = self.status.avg_price
         interval_ms = (self.candles[1].start_time - self.candles[0].start_time
                        if len(self.candles) >= 2 else 0)
 
@@ -139,6 +149,13 @@ class FastBacktester(SingleThreadedBacktester):
                                             file=sys.stdout)):
                 price = candle.close
 
+                # 시가평가를 먼저 한다. before-indicator가 reference/라이브와 **같은** 거래 전
+                # 스냅샷을 보게 하려면 이 순서여야 한다 (SingleThreadedBacktester는
+                # update_unrealised_pnl 뒤에 before-indicator를 돌린다). 예전에는 반대라서
+                # status를 읽는 before-indicator가 직전 캔들 종가 기준 미실현을 봤다.
+                status.unrealised_pnl = (status.position * (price - status.avg_price)
+                                         if status.position != 0.0 else 0.0)
+
                 # opt-in indicators ingest this candle before the decision sees them
                 cursor = i + 1
                 for shim in shims_before:
@@ -146,20 +163,13 @@ class FastBacktester(SingleThreadedBacktester):
                 for indicator in live_before:
                     indicator.update(candle, status)
 
-                if status.position != 0.0:
-                    status.unrealised_pnl = status.position * (price - status.avg_price)
-                    # 강제청산: 시가평가 자본이 0 이하 = 파산 (reference와 같은 조건)
-                    if status.margin + status.unrealised_pnl <= 0.0:
-                        action = Action(-status.position)
-                    else:
-                        action = decide(candle, status)
+                # 강제청산: 시가평가 자본이 0 이하 = 파산 (reference와 같은 조건).
+                # flat이면 미실현이 0이라 margin <= 0 과 같고 Action(-0) == Action(0) 이므로
+                # "파산 후에는 스트리머를 부르지 않는다"가 된다 — reference와 동일하다.
+                if status.margin + status.unrealised_pnl <= 0.0:
+                    action = Action(-status.position)
                 else:
-                    status.unrealised_pnl = 0.0
-                    # 미실현이 0이라 reference의 total_margin() <= 0 과 같은 조건이다
-                    if status.margin <= 0.0:  # bankrupt & flat: reference skips the streamer too
-                        action = Action(0)
-                    else:
-                        action = decide(candle, status)
+                    action = decide(candle, status)
 
                 if collect_live_series:
                     # collected between the two update groups, so each value is the one
@@ -192,7 +202,8 @@ class FastBacktester(SingleThreadedBacktester):
         finally:
             self.streamer.indicators = original_indicators
 
-        equity_curve = self._build_equity_curve(end_times, close_arr, trade_marks, init_margin)
+        equity_curve = self._build_equity_curve(end_times, close_arr, trade_marks,
+                                                entry_margin, entry_position, entry_avg_price)
         benchmark_curve = build_buy_and_hold_curve(end_times, close_arr, init_margin)
         report = Report(trades, max_leverage, self.status, equity_curve, benchmark_curve)
 
@@ -231,20 +242,25 @@ class FastBacktester(SingleThreadedBacktester):
     @staticmethod
     def _build_equity_curve(end_times: np.ndarray, close_arr: np.ndarray,
                             trade_marks: List[Tuple[int, float, float, float]],
-                            init_margin: float) -> List[Tuple[int, float]]:
+                            entry_margin: float, entry_position: float,
+                            entry_avg_price: float) -> List[Tuple[int, float]]:
         """Rebuild the per-candle equity curve vectorized.
 
         Between trades margin/position/avg_price are constant, so each segment is just
         ``margin + position * (close - avg_price)``. The reference records equity *before*
         the trade at a trade candle, so the state from trade k applies to candles
         (idx_k, idx_{k+1}].
+
+        첫 거래 이전 구간은 **진입 시점의 실제 상태**로 시드한다. flat이라고 가정하면
+        ``run()``을 같은 인스턴스로 두 번 부르거나 포지션을 들고 시작할 때 그 구간이 상수로
+        찍히고, 거기서 파생되는 max_drawdown/sharpe/balance 컬럼까지 함께 틀어진다.
         """
         n = len(end_times)
         if n == 0:
             return []
         equity = np.empty(n, dtype=np.float64)
         seg_start = 0
-        margin, position, avg_price = init_margin, 0.0, 0.0
+        margin, position, avg_price = entry_margin, entry_position, entry_avg_price
         for idx, m, p, a in trade_marks:
             seg_end = idx + 1
             if position != 0.0:

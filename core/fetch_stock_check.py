@@ -113,7 +113,8 @@ def main():
     backtester = FastBacktester(streamer, candles)
     init_margin = backtester.status.total_margin()
     report = backtester.run()
-    final = report.trades[-1].status.total_margin() if report.trades else init_margin
+    # Trade.status는 거래 전 스냅샷이므로 최종 상태를 쓴다 (마지막 거래 손익/수수료 포함)
+    final = report.status.total_margin()
     print(f"[6] FastBacktester OK — {len(report.trades)} trades, "
           f"max leverage {report.max_leverage}, "
           f"수익률 {(final / init_margin - 1) * 100:+.2f}% "

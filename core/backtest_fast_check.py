@@ -55,6 +55,114 @@ class LoopOnlyIndicator(BaseIndicator):
         return self._inner.get_latest()
 
 
+class EquityIndicator(BaseIndicator):
+    """매 캔들의 거래 전 시가평가 자본을 기록하는 status 의존 지표 (검사용).
+
+    ``status``를 읽으므로 벡터화가 불가능하고 항상 루프 경로에 남는다. ``updates_before_decide``
+    를 켜면 "before 그룹은 시가평가 **후**의 status를 봐야 한다"는 규약을 직접 찌른다 —
+    예전 FastBacktester는 시가평가보다 먼저 before 지표를 돌려서, 이 지표가 직전 캔들 종가
+    기준 자본을 봤다.
+    """
+
+    scale_group = "balance"
+
+    def __init__(self):
+        super().__init__(1)
+        self.values = self._new_history()
+
+    def update(self, candle: Candle, status: Optional[Status] = None) -> None:
+        # 라이브 프리피드는 status=None으로 부른다 — 워밍업으로 취급한다.
+        if status is None:
+            return
+        self.values.append(status.total_margin())
+
+    def get_index(self, idx: int) -> Optional[float]:
+        return self._read(self.values, idx)
+
+    def get_latest(self) -> Optional[float]:
+        return self._read(self.values, -1)
+
+
+class EquityGatedKeltner(KeltnerStreamer):
+    """Keltner에 "자본이 직전 대비 줄면 즉시 청산" 규칙을 얹은 픽스처.
+
+    청산 판단이 EquityIndicator의 값에 직접 걸리므로, before 그룹이 보는 status가 한 캔들
+    어긋나면 청산 시점이 달라지고 체결 목록이 갈린다.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        equity = EquityIndicator()
+        equity.updates_before_decide = True
+        self.indicators["EQ"] = equity
+
+    def decide_action(self, candle: Candle, status: Status) -> Action:
+        if status.position != 0.0:
+            now = self.indicators["EQ"].get_index(-1)
+            prev = self.indicators["EQ"].get_index(-2)
+            if now is not None and prev is not None and now < prev:
+                return Action(-status.position)
+        return super().decide_action(candle, status)
+
+
+def check_nonflat_start(candles) -> bool:
+    """포지션을 들고 시작해도 두 백테스터의 자본 곡선이 일치하는지.
+
+    FastBacktester는 자본 곡선을 사후에 재구성하는데, 예전에는 첫 거래 이전 구간을 flat이라
+    가정해 상수로 채웠다. reference는 매 캔들 실시간 계산이라 옳고, 이 곡선에서 파생되는
+    max_drawdown/sharpe/balance 컬럼까지 함께 틀어졌다.
+    """
+    sub = candles[:20_000]
+    entry_price = sub[0].close
+
+    def seed(bt):
+        bt.status = Status(avg_price=entry_price, margin=100_000.0, position=10.0)
+        return bt
+
+    ref_bt = seed(SingleThreadedBacktester(KeltnerStreamer(symbol="X", window=600), sub))
+    ref_report = ref_bt.run()
+    fast_bt = seed(FastBacktester(KeltnerStreamer(symbol="X", window=600), sub))
+    fast_report = fast_bt.run()
+
+    ok = compare_reports("non-flat start", ref_report, ref_bt.status.total_margin(),
+                         fast_report, fast_bt.status.total_margin())
+
+    # 첫 거래 이전 구간이 실제로 존재하고 상수가 아닌지 — 아니면 검사가 무의미하다
+    first_trade_idx = next((i for i, (ts, _) in enumerate(ref_report.equity_curve)
+                            if ref_report.trades and ts >= ref_report.trades[0].timestamp), 0)
+    head = [eq for _, eq in ref_report.equity_curve[:first_trade_idx]]
+    if len(head) < 2 or len(set(head)) < 2:
+        print(f"  [non-flat start] FAIL: 첫 거래 이전 구간이 {len(head)}점/상수 — 경로를 못 밟았다")
+        ok = False
+
+    print(f"[non-flat start] {'OK' if ok else 'MISMATCH'} — trades={len(ref_report.trades)}, "
+          f"첫 거래 이전 {len(head)}개 캔들의 자본이 종가를 따라 변한다")
+    return ok
+
+
+def check_empty_range(candles) -> bool:
+    """데이터 범위 밖을 지정해 0개로 잘렸을 때 양쪽이 똑같이 빈 Report를 내는지.
+
+    예전에는 ATRIndicator.precompute_series가 빈 배열에서 IndexError를 냈다.
+    """
+    far_future = candles[-1].end_time + 10 ** 12
+    ok = True
+    reports = {}
+    for name, cls in (("ref", SingleThreadedBacktester), ("fast", FastBacktester)):
+        bt = cls(KeltnerStreamer(symbol="X", window=600), candles)
+        try:
+            reports[name] = bt.run(start_time=far_future, end_time=far_future + 1000)
+        except Exception as e:
+            print(f"  [empty range] FAIL: {name}가 {type(e).__name__}: {e}")
+            ok = False
+    if ok and not all(not r.trades and not r.equity_curve for r in reports.values()):
+        print(f"  [empty range] FAIL: 빈 Report가 아니다 — "
+              f"{ {k: (len(r.trades), len(r.equity_curve)) for k, r in reports.items()} }")
+        ok = False
+    print(f"[empty range] {'OK' if ok else 'MISMATCH'} — 양쪽 모두 빈 Report")
+    return ok
+
+
 class BlowUpStreamer(BaseStreamer):
     """파산하도록 과레버리지로 한 방 잡고 버티는 픽스처 (전략이 아니라 검사용).
 
@@ -243,6 +351,10 @@ if __name__ == "__main__":
         "KeltnerStreamer (mixed: ATR loop-only)": make_mixed,
         "KeltnerStreamer (all updates_before_decide)": make_before,
         "KeltnerStreamer (split: MA after / ATR loop-only before)": make_split,
+        # status를 읽는 before 지표 — before 그룹이 시가평가 전/후 어느 status를 보는지 검사한다.
+        # 위 케이스들은 ATR/MA만 써서 status를 아예 읽지 않으므로 이 규약을 못 잡는다.
+        "EquityGatedKeltner (status-aware before indicator)":
+            lambda: EquityGatedKeltner(symbol=symbol, **keltner_params),
     }
 
     all_ok = True
@@ -266,6 +378,8 @@ if __name__ == "__main__":
     # 정상 케이스가 밟지 않는 두 경로를 따로 검사한다
     all_ok &= check_forced_liquidation(candles)
     all_ok &= check_history_bound(candles)
+    all_ok &= check_nonflat_start(candles)
+    all_ok &= check_empty_range(candles)
 
     print("PARITY:", "ALL OK" if all_ok else "FAILED")
     sys.exit(0 if all_ok else 1)

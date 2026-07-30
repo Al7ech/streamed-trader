@@ -53,6 +53,10 @@ class ATRIndicator(VectorizedIndicator):
                           close: np.ndarray, volume: np.ndarray) -> np.ndarray:
         # pandas' rolling mean sums in a different order than the incremental `_sum` above,
         # so values can differ from the loop path by ~1e-13 relative (rounding only).
+        if len(close) == 0:
+            # 빈 슬라이스에서 아래 [0] 인덱싱이 IndexError를 낸다. reference는 빈 Report를
+            # 정상 반환하므로 여기서도 조용히 비워서 동작을 맞춘다.
+            return np.empty(0, dtype=np.float64)
         prev_close = np.empty_like(close)
         prev_close[0] = np.nan
         prev_close[1:] = close[:-1]

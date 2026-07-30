@@ -62,15 +62,30 @@ class BaseIndicator(ABC):
         return deque(maxlen=self.history_size)
 
     def _read(self, values, idx: int) -> Optional[float]:
-        """출력 시계열 조회의 공통 규약. 워밍업은 None, 이력 경계 밖은 IndexError."""
+        """출력 시계열 조회의 공통 규약. 워밍업은 None, 이력 경계 밖은 IndexError.
+
+        인덱스는 **음수만** 받는다. 음수가 아니면 루프 경로는 ``values[0]`` = 가장 오래된
+        보관값을, ``FastBacktester``의 ``ArrayIndicator``는 ``seq[cursor]`` = 아직 반영되지
+        않은 캔들의 값(= 룩어헤드)을 주므로 둘이 아예 다른 뜻이 된다.
+
+        NaN은 ``None``으로 정규화한다. ``precompute_series``는 값이 없는 구간을 NaN으로
+        표현하고 ``ArrayIndicator``가 그걸 ``None``으로 바꾸는데, 루프 경로가 raw NaN을
+        내보내면 두 경로가 갈린다 — 게다가 ``x is None`` / ``x <= 0`` 류의 가드가 NaN을
+        전부 통과시켜 조용히 전략 로직을 오염시킨다.
+        """
+        if idx >= 0:
+            raise IndexError(
+                f"{type(self).__name__}.get_index({idx}): 인덱스는 음수여야 한다 "
+                f"(-1 = 최신, -2 = 직전).")
         if idx < -self.history_size:
             raise IndexError(
                 f"{type(self).__name__}.get_index({idx}): 보관 이력 {self.history_size}개를 "
                 f"넘는 조회다. 생성자에 history_size를 키워 넘겨라.")
         try:
-            return values[idx]
+            v = values[idx]
         except IndexError:
             return None
+        return None if v is not None and v != v else v
 
     @abstractmethod
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:

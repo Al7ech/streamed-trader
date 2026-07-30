@@ -17,6 +17,10 @@ class RollingStd(VectorizedIndicator):
     scale_group = "std"
 
     def __init__(self, window: int):
+        if window < 2:
+            # 표본 1개짜리 ddof=1 표준편차는 NaN이다. 조용히 NaN을 흘리면
+            # `std is None or std <= 0` 류의 가드를 전부 통과해 사이징/스탑까지 오염된다.
+            raise ValueError(f"RollingStd(window={window}): 표본표준편차는 window >= 2 가 필요하다.")
         super().__init__(window)
         self.values = deque(maxlen=window)
         self.std_values = self._new_history()

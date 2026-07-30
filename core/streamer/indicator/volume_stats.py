@@ -49,6 +49,10 @@ class VolumeRollingStd(VectorizedIndicator):
     scale_group = "volume"
 
     def __init__(self, window: int):
+        if window < 2:
+            # RollingStd와 같은 이유 — 표본 1개의 ddof=1 표준편차는 NaN이다.
+            raise ValueError(
+                f"VolumeRollingStd(window={window}): 표본표준편차는 window >= 2 가 필요하다.")
         super().__init__(window)
         self.values = deque(maxlen=window)
         self.std_values = self._new_history()

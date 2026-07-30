@@ -28,6 +28,10 @@ class MomentumTimeExitStreamer(BaseStreamer):
                  max_loss: float = 0.08,
                  fee_ratio: float = 0.0004,
                  use_stop: bool = True):
+        if mom_lookback < 1:
+            # 0이면 get_index(-0) == get_index(0) 이 되어 "가장 오래된 값"(루프) 또는
+            # "아직 반영 안 된 캔들의 값"(FastBacktester, = 룩어헤드)을 읽게 된다.
+            raise ValueError(f"MomentumTimeExitStreamer(mom_lookback={mom_lookback}): 1 이상이어야 한다.")
         super().__init__({
             # get_index(-mom_lookback)로 읽으므로 조회 깊이가 파라미터에 걸린다.
             # 기본 이력(BaseIndicator.history_size)을 넘는 lookback을 줘도 깨지지 않게 맞춰 둔다.
