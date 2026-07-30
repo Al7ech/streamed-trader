@@ -65,10 +65,12 @@ async def main():
         print("Starting BinanceTrader...")
         await trader.start()
 
-        # Keep running
+        # Keep running. is_running을 봐야 리스너가 치명적 오류로 stop()을 부른 뒤 프로세스가
+        # 빠져나온다 (docker의 restart: always가 재기동할 수 있게).
         print("Trader is running. Press Ctrl+C to stop.")
-        while True:
+        while trader.is_running:
             await asyncio.sleep(1)
+        print("Trader is no longer running.")
 
     except KeyboardInterrupt:
         print("\nStopping trader...")

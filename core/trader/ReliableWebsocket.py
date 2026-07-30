@@ -14,7 +14,7 @@ class ReliableWebsocket:
         try:
             return await self.delegate.recv()
         except Exception as e:
-            logging.info(f"reconnecting {self.id()}")
+            self.logger.warning(f"reconnecting {self.id()}: {e!r}")
             await self.delegate.close()
             await self.delegate.connect()
             return await self.delegate.recv()

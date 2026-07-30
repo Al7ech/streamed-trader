@@ -175,6 +175,7 @@ class BinanceExecutor:
         """
         start_time = time.time()
         self.total_orders += 1
+        result: Optional[OrderResult] = None
 
         for attempt in range(self.max_retries + 1):
             try:
@@ -202,12 +203,15 @@ class BinanceExecutor:
                 self.logger.info(f"Retrying order in {delay} seconds...")
                 time.sleep(delay)
 
-        # All retries failed
+        # All retries failed.
+        # 마지막 시도의 실제 오류(바이낸스 코드/메시지)를 함께 싣는다 — 예전엔 덮어써서
+        # 영구 거부된 주문의 원인이 어디에도 남지 않았다.
         execution_time = time.time() - start_time
         self.failed_orders += 1
+        last_error = getattr(result, "error", None) if result is not None else None
         final_result = OrderResult(
             success=False,
-            error=f"Order failed after {self.max_retries + 1} attempts",
+            error=f"Order failed after {self.max_retries + 1} attempts: {last_error}",
             execution_time=execution_time
         )
 
