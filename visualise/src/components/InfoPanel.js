@@ -33,6 +33,13 @@ const InfoPanel = ({metadata, summary}) => {
             </Text>
           </Tooltip>
         )}
+        {/* 라이브/드라이런 run 은 백테스트와 같은 포맷이라 겉보기로는 구분되지 않는다.
+            실거래 결과를 백테스트로 착각하는 게 제일 위험하므로 눈에 띄게 표시한다. */}
+        {md.mode && (
+          <Badge variant="filled" color={md.mode === 'live' ? 'red' : 'orange'} radius="sm">
+            {md.mode === 'live' ? 'LIVE' : 'DRY RUN'}
+          </Badge>
+        )}
         <Badge variant="filled" radius="sm">{md.streamer || 'Streamer'}</Badge>
         <Badge variant="light" color="gray" radius="sm">{md.symbol} · {md.interval}</Badge>
         <Badge variant="light" color="gray" radius="sm">

@@ -6,15 +6,20 @@
 import {toSeconds} from './aggregate';
 import {deleteFiles, fetchFileText, writeFileText} from './fileAccess';
 
+// run 파일이 들어 있는 디렉토리들. live/ 는 라이브·드라이런 트레이더가 남기는 것으로,
+// 백테스트와 **완전히 같은 포맷**이라 아래 파싱 경로를 그대로 탄다 (metadata.mode 로 구분).
+const RUN_DIRS = ['backtest/', 'live/'];
+
 /**
- * run 파일(사이드바에 나열)만 골라낸다: backtest/ 아래의 .json 중 .series.json 이 아닌 것.
+ * run 파일(사이드바에 나열)만 골라낸다: backtest/ 또는 live/ 아래의 .json 중
+ * .series.json 이 아닌 것.
  */
 export const filterRunFiles = (files) => {
   return files
     .filter(file => {
       const pathLower = (file.path || file.name).toLowerCase();
       const nameLower = file.name.toLowerCase();
-      return pathLower.includes('backtest/') && !nameLower.endsWith('.series.json');
+      return RUN_DIRS.some(dir => pathLower.includes(dir)) && !nameLower.endsWith('.series.json');
     })
     .sort((a, b) => b.name.localeCompare(a.name)); // 최근 run 이 위로
 };

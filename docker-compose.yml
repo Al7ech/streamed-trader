@@ -7,6 +7,14 @@ services:
     restart: always
     env_file:
       - .env
+    volumes:
+      # 라이브 실행 결과(asset/live/)와 캔들 캐시를 호스트에 남긴다. 이게 없으면
+      # `docker compose up --build`로 컨테이너를 다시 만들 때 런이 통째로 사라진다
+      # (.dockerignore가 asset/을 제외하므로 이미지 안에도 없다).
+      - ./asset:/app/asset
+    # 컨테이너가 root로 돌면 호스트에 root 소유 파일이 생겨서, visualiser가 라벨을 고치거나
+    # 런을 지울 때(readwrite 권한 필요) 실패한다.
+    user: "${UID:-1000}:${GID:-1000}"
     logging:
       driver: "local"
       options:

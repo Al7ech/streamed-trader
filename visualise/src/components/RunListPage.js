@@ -3,6 +3,7 @@ import {Link} from 'react-router-dom';
 import {
   ActionIcon,
   Anchor,
+  Badge,
   Center,
   Container,
   Group,
@@ -212,6 +213,17 @@ const RunListPage = ({backtestFiles, onDeleteRun}) => {
                         </Group>
                       ) : (
                         <Group gap={4} wrap="nowrap">
+                          {/* 목록에서도 라이브 run 을 백테스트와 구분할 수 있어야 한다 */}
+                          {metadata.mode && (
+                            <Badge
+                              variant="filled"
+                              color={metadata.mode === 'live' ? 'red' : 'orange'}
+                              radius="sm"
+                              size="xs"
+                            >
+                              {metadata.mode === 'live' ? 'LIVE' : 'DRY'}
+                            </Badge>
+                          )}
                           <Anchor component={Link} to={`/run/${encodeURIComponent(file.name)}`} size="sm" fw={600}>
                             {metadata.label || metadata.streamer || file.name}
                           </Anchor>

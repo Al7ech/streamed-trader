@@ -21,6 +21,23 @@ Asyncio trader that:
   then updates the indicators with that same pre-trade `Status`, then executes the action — the
   same ordering the backtester uses, so live and backtest see identical indicator state.
 - Fires registered callbacks (`add_action_callback` / `add_error_callback`).
+- With `record=True`, hands every closed candle and every fill to a `LiveRecorder`.
+
+### `live_recorder.py`
+
+Persists the session to `<result_path>/live/` in **exactly** the format the backtester writes to
+`asset/backtest/`, so a live run and a backtest of the same strategy can be loaded side by side in
+`visualise/`. Reuses `ShardWriter` / `write_run_json` / `build_summary` unchanged.
+
+- `run_id` is fixed (`<live|dry>_<Streamer>_<SYMBOL>_<INTERVAL>`), so a restart resumes the same run
+  rather than starting a new file. State is replayed from the shards on startup.
+- Changing strategy params or indicator columns forks a new run instead of appending mismatched
+  data to the old shards.
+- Writes are atomic (`boltons.fileutils.atomic_save`); the run JSON is rewritten every candle and
+  the month shard every `shard_flush_every` candles, on every trade, and on `stop()`.
+
+See the "Live run output" section of the repo-root `CLAUDE.md` for the recording seams and the list
+of reasons live numbers legitimately diverge from a backtest.
 
 ### `BinanceExecutor.py`
 
@@ -44,19 +61,20 @@ by closing and reconnecting the delegate.
 | Margin | synthetic `1e6` at startup | hydrated from `futures_account()` |
 | User-data socket | not opened | opened; `ACCOUNT_UPDATE` / `ORDER_TRADE_UPDATE` keep `Status` in sync |
 | Orders | none sent | submitted through `BinanceExecutor` |
-| Position / avg price | updated locally from the `Action` | updated from exchange fills |
+| Position / avg price | updated through `Status.apply_fill` (the backtester's accounting) | updated from exchange fills |
+| Recorded trades | local fill at `candle.close` | real exchange fill (`ap` / `z` / `rp` / `n`) |
+| Recorded run id | `dry_<Streamer>_<SYMBOL>_<INTERVAL>` | `live_<Streamer>_<SYMBOL>_<INTERVAL>` |
 
 ## Usage
 
-Run from `core/` as the working directory — modules import their siblings as top-level packages
-(`from trader.BinanceTrader import BinanceTrader`), which only resolves when `core/` is on
-`sys.path`.
+`core` is an installed package, so run from anywhere in the repo with `uv run` and import via the
+full `core.*` path.
 
 ```python
 import asyncio
 
-from streamer.keltner_streamer import KeltnerStreamer
-from trader.BinanceTrader import BinanceTrader
+from core.streamer.keltner_streamer import KeltnerStreamer
+from core.trader.BinanceTrader import BinanceTrader
 
 streamer = KeltnerStreamer("ETHUSDT", window=20 * 60, m_entry=2.0, m_exit=0.0, max_loss=0.08)
 
@@ -68,6 +86,7 @@ trader = BinanceTrader(
     streamer=streamer,
     dry_run=True,     # no orders are sent
     testnet=False,
+    record=True,      # writes asset/live/dry_KeltnerStreamer_ETHUSDT_1m.json
 )
 
 
@@ -94,7 +113,10 @@ one directly if you want to place orders outside the trader's loop.
 ## Constructor parameters
 
 **`BinanceTrader`** — `api_key`, `api_secret`, `symbol`, `interval`, `streamer`,
-`dry_run` (default `False`), `testnet` (default `True`).
+`dry_run` (default `False`), `testnet` (default `True`), `fee_ratio` (default: the streamer's),
+`record` (default `False`), `result_path` (`"asset/"`), `run_id` (default: derived and stable
+across restarts), `run_metadata` (extra keys for the run JSON, e.g. `{"params": {...}}`),
+`shard_flush_every` (`60`).
 
 **`BinanceExecutor`** — `api_key`, `api_secret`, `testnet` (default `True`),
 `max_workers` (`4`), `max_retries` (`2`), `base_retry_delay` (`0.1` s).

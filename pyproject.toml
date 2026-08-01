@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Binance Futures algorithmic trading system: candle fetching, backtesting, and live trading engine."
 requires-python = ">=3.13"
 dependencies = [
+    "boltons",
     "numpy",
     "pandas",
     "pandas_market_calendars",

@@ -135,9 +135,11 @@ when the process is launched with cwd = `core/`.
 
 ### Backtest output format (`core/backtest/result_writer.py`)
 
-`SCHEMA_VERSION = 2` (v2 added the `benchmark` block and `summary.benchmark_profit_pct`; both are
-purely additive and the frontend hides the related UI when they are missing, so v1 runs still
-load). A run with `metadata` produces:
+`SCHEMA_VERSION = 3` (v2 added the `benchmark` block and `summary.benchmark_profit_pct`; v3 added
+`trades[].position`, the pre-trade signed position, which lets a resumed live run rebuild the
+win/lose classification `build_summary` derives from `Trade.status.position`). All additions are
+purely additive — the frontend hides UI for missing blocks and picks named trade keys — so older
+runs still load. A run with `metadata` produces:
 
 - `asset/backtest/<run_id>.json` — `metadata`, `summary` (max leverage, final margin, profit %,
   buy & hold profit %, win/lose counts, win rate, `sharpe`, `max_drawdown` — computed by
@@ -165,6 +167,63 @@ load). A run with `metadata` produces:
 `run_id` is `<StreamerClassName>_<YYYYmmdd_HHMMSS>`. `series.column_groups` carries each
 indicator's `scale_group`, which decides whether the frontend overlays it on the price pane or
 gives it its own.
+
+All writes go through `result_writer._write_json`, which wraps `boltons.fileutils.atomic_save`
+(part file → fsync → atomic rename). Nothing ever observes a half-written run JSON or shard, which
+matters most for the live recorder below — it rewrites the same files continuously — but also means
+an interrupted backtest leaves no corrupt output. The part file is `<dest>.part`, deliberately not
+ending in `.json`, because the frontend's directory scanner collects every `*.json` it finds.
+
+### Live run output (`core/trader/live_recorder.py`)
+
+`LiveRecorder` writes live and dry-run sessions to `asset/live/` in **exactly** the format above,
+so the visualiser loads both from one directory list (`filterRunFiles` accepts `backtest/` and
+`live/`) and `metadata.mode` (`"live"`/`"dry"`) drives a LIVE/DRY badge. It reuses `ShardWriter`,
+`write_run_json`, `build_summary` and `metrics.py` unchanged; the only backtester-side change was
+splitting `ShardWriter._flush` into `checkpoint()` (write the current month, keep the buffer) and
+buffer reset, since a live process rewrites one month's shard for weeks.
+
+- **`run_id` is stable across restarts**: `<live|dry>_<Streamer>_<SYMBOL>_<INTERVAL>` (override with
+  `LIVE_RUN_ID`). Docker's `restart: always` means the process dies often, and a fresh file per
+  start would fragment the equity curve into unusable pieces. On startup the recorder reloads its
+  own run JSON and shards and continues appending — `equity_curve`/`closes` are replayed from the
+  shards' `balance`/`ohlc.close` columns, never from the run JSON's `equity` block (that one is
+  downsampled to ≤2000 points and would decay a little more on every restart). `init_margin` also
+  comes from the saved metadata, not the current wallet, or `profit_pct` would reset each restart.
+- **Config changes fork a new run.** If `series.columns`, `params`, `symbol`, `interval` or
+  `streamer` differ from the saved run, the recorder logs an ERROR and starts
+  `<run_id>_<timestamp>` rather than appending mismatched columns into the old shards.
+- **`metadata.last_status`** carries the account state at the last flush, and on resume
+  `BinanceTrader._restore_dry_run_status` applies it **in dry-run only**. Dry-run margin is
+  synthetic (`1e6`) and would otherwise reset on every process start while the equity curve
+  continues, putting a jump back to the initial value at each restart — which would make a resumed
+  dry-run curve useless for the backtest comparison this all exists for. Live never uses it:
+  `futures_account()` and `ACCOUNT_UPDATE` are the truth there.
+- **Recording points mirror the backtester exactly.** `record_candle` is called between the two
+  indicator-update groups in `_process_kline_message` — the same seam `ShardWriter.add` occupies in
+  `SingleThreadedBacktester.run` — so every plotted column is the value the decision actually saw.
+  Moving it after the `after_indicators` loop would shift every default indicator one candle
+  relative to a backtest, breaking the one comparison this feature exists for.
+- **Fills.** Dry-run records the local `Status.apply_fill` result at `candle.close`, so a dry run
+  and a backtest of the same candles produce identical trades. Live records **real exchange fills**
+  from `ORDER_TRADE_UPDATE`, aggregated per order id into one `Trade` (`price` = `ap`,
+  `quantity` = signed `z`, `wnl` = Σ`rp`, `fee` = Σ`n`) and emitted on a terminal order state —
+  `CANCELED`/`EXPIRED` with `z > 0` included, since those are real fills. The pre-trade `Status`
+  snapshot is deep-copied *before* the order is dispatched, because `_on_action` awaits the order
+  future and `ACCOUNT_UPDATE` can overwrite `self.status` during that await. `Trade.timestamp` is
+  the decision candle's `end_time`, not the fill's `T`, so trades bucket with the candle that
+  caused them on aggregated views.
+- **Flush policy**: run JSON every candle (small), month shard every `LIVE_SHARD_FLUSH_EVERY`
+  candles (default 60) and on every trade and on `stop()`. A crash loses at most that many candles
+  of series data; the next startup replays from the shards and rewrites a self-consistent run JSON.
+- **Why live numbers will not match a backtest exactly** (all expected, none are bugs): live equity
+  is exchange truth, so funding fees, other symbols' PnL and deposits/withdrawals move the curve
+  with no corresponding `Trade` and `Σ(wnl - fee)` will not reconcile with the equity delta;
+  `BinanceExecutor.execute_action` does not quantize to step size, so the filled quantity can differ
+  from the requested action; prefeed candles are not recorded, so live indicator columns have no
+  NaN warm-up prefix; `update_unrealised_pnl` marks with last price while the exchange marks with
+  mark price; and BNB-denominated commissions (`N` != margin asset) are excluded from `fee` and
+  flagged as `metadata.fee_asset_mismatch`.
 
 ### Streamer/indicator strategy framework (`core/streamer/`)
 
@@ -275,6 +334,9 @@ PnL **before** the fee, which is carried separately in `fee`. `Report` bundles a
     again) and then kept in sync by `ACCOUNT_UPDATE`/`ORDER_TRADE_UPDATE` events off the user-data
     stream. `ACCOUNT_UPDATE` carries **only changed** balances/positions, so the handler leaves
     `Status` untouched when our margin asset or symbol is absent rather than zeroing it.
+  - With `record=True` (the `RECORD` env var, default on) the trader owns a `LiveRecorder` and
+    persists the session to `asset/live/` in backtest format — see "Live run output" above for the
+    recording seams, restart-resume behaviour and the live/backtest divergences to expect.
 - `BinanceExecutor` submits orders to a `ThreadPoolExecutor` (GIL-free from the asyncio loop) with
   exponential-backoff retries, returning a `concurrent.futures.Future[OrderResult]`; callers (e.g.
   `BinanceTrader._on_action`) block on `future.result(timeout=...)` from within an async callback.
@@ -283,5 +345,7 @@ PnL **before** the fee, which is carried separately in `fee`. `Report` bundles a
 
 - Code comments and docstrings are in Korean; documentation files (`README.md`, `CLAUDE.md`,
   `core/trader/README.md`) are in English. Match whatever the file you are editing already uses.
-- `asset/` is gitignored and holds both the candle cache and backtest output. Never commit it.
+- `asset/` is gitignored and holds the candle cache, backtest output (`asset/backtest/`) and live
+  run output (`asset/live/`). Never commit it. `docker-compose.yml` bind-mounts it so live runs
+  survive container recreation.
 - Never commit `.env`. `.env.sample` holds placeholders only.

@@ -15,25 +15,63 @@ candle — this keeps them smaller than the old per-row CSV and faster to parse.
 """
 
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from boltons.fileutils import atomic_save
 
 from core.backtest.metrics import compute_max_drawdown, compute_sharpe
 from core.backtest.report import Report
 
 # 2: added the top-level "benchmark" block (buy & hold curve) + summary.benchmark_profit_pct.
-# Purely additive — the frontend hides the related UI when they are missing, so v1 runs still load.
-SCHEMA_VERSION = 2
+# 3: added trades[].position (거래 **전** 포지션). 라이브 런은 재기동 시 자기 run JSON을 다시
+#    읽어 이어쓰는데, build_summary의 승패 판정이 Trade.status.position의 부호를 보므로 이게
+#    없으면 재개 후 승패 집계를 복원할 수 없다.
+# 둘 다 순수 additive — 프론트는 없는 블록의 UI를 숨기고 키를 골라 읽으므로 구 런도 그대로 로드된다.
+SCHEMA_VERSION = 3
 
 # Columns whose empty/warm-up value should be stored as JSON null.
 _OHLC_KEYS = ("open", "high", "low", "close")
 
+_logger = logging.getLogger(__name__)
+
 
 def _month_key(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m")
+
+
+def _write_json(path: str, doc: Dict) -> None:
+    """JSON을 **원자적으로** 쓴다.
+
+    ``atomic_save``는 part 파일에 쓰고 fsync한 뒤 원자적으로 rename하며, 도중에 예외가 나면
+    part를 지우고 원본을 건드리지 않는다. 라이브 레코더는 같은 파일을 캔들마다 덮어쓰므로
+    중간에 죽어도 직전 런 JSON이 온전해야 하고, 백테스트도 Ctrl-C 시 깨진 샤드를 남기지 않게 된다.
+
+    part 경로 기본값이 ``<dest>.part``라 ``.json``으로 끝나지 않는 것도 중요하다 — 프론트의
+    디렉토리 스캐너는 ``*.json``을 전부 긁어가므로, 반쯤 쓰인 파일이 ``.json``이었다면 런 목록에
+    깨진 항목으로 떴을 것이다.
+    """
+    with atomic_save(path, text_mode=True) as f:
+        # dumps + write: json.dump은 순수 파이썬 인코더로 스트리밍하고 dumps는 C 인코더를 쓴다
+        f.write(json.dumps(doc, separators=(",", ":")))
+
+
+def read_shard(dir_path: str, file_name: str) -> Optional[Dict]:
+    """샤드 파일을 읽어 dict로 돌려준다. 없거나 깨졌으면 None.
+
+    라이브 런 재개 경로에서만 쓴다 — 마지막 샤드가 크래시로 유실됐을 수 있는데, 그 한 달치
+    시계열을 잃는 것과 트레이더가 기동하지 못하는 것 중에서는 전자가 낫다.
+    """
+    path = os.path.join(dir_path, file_name)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        _logger.warning("샤드를 읽지 못했다 (%s): %s", path, e)
+        return None
 
 
 class ShardWriter:
@@ -42,6 +80,11 @@ class ShardWriter:
     Only the current month's columns are held in memory; a shard file is flushed whenever the
     month rolls over (and once more on :meth:`close`). :meth:`close` returns the shard index
     (``[{"file", "start", "end"}, ...]``) to embed in the run JSON.
+
+    라이브 레코더는 **같은 달 샤드를 여러 번** 써야 하므로 (프로세스가 몇 주씩 살아 있고 그
+    사이 계속 체크포인트를 남긴다) 쓰기/인덱스 반영/버퍼 초기화가 분리돼 있다: :meth:`checkpoint`
+    는 버퍼를 유지한 채 파일만 갱신하고, :meth:`_flush`는 거기에 버퍼 초기화를 더한 것이다.
+    백테스트는 캔들이 시간순이라 같은 달을 두 번 방문하지 않으므로 동작이 이전과 같다.
     """
 
     def __init__(self, dir_path: str, run_id: str, indicator_names: List[str],
@@ -54,6 +97,37 @@ class ShardWriter:
         self.shards: List[Dict] = []
         self._month: Optional[str] = None
         self._reset_buffers()
+
+    @classmethod
+    def resume(cls, dir_path: str, run_id: str, indicator_names: List[str],
+               has_ohlc: bool, interval_ms: int, shards: List[Dict]) -> "ShardWriter":
+        """이전 실행이 남긴 샤드 인덱스로 writer를 복원한다 (라이브 런 재개 전용).
+
+        마지막 샤드를 버퍼로 되읽어, 이어지는 :meth:`add`가 같은 달이면 그 파일을 덮어쓰고
+        달이 바뀌면 원본 그대로 flush한 뒤 새 달로 넘어간다. 마지막 샤드가 유실/손상이면
+        그 달의 꼬리를 포기하고 (차트에 구멍이 남는다) 빈 버퍼로 이어간다.
+        """
+        writer = cls(dir_path, run_id, indicator_names, has_ohlc, interval_ms)
+        if not shards:
+            return writer
+        writer.shards = list(shards[:-1])
+        last = shards[-1]
+        shard = read_shard(dir_path, last["file"])
+        if not shard or not shard.get("time"):
+            _logger.warning("마지막 샤드를 복원하지 못했다 — %s 구간은 비어 있게 된다",
+                            last["file"])
+            return writer
+        writer._time = list(shard["time"])
+        n = len(writer._time)
+        writer._month = _month_key(writer._time[0])
+        if has_ohlc:
+            ohlc = shard.get("ohlc") or {}
+            writer._ohlc = {k: list(ohlc.get(k) or [None] * n) for k in _OHLC_KEYS}
+        # 지표 구성이 바뀐 채로 재개하는 것은 상위(LiveRecorder)에서 막지만, 방어적으로
+        # 현재 컬럼 집합에 맞춰 정렬한다 — 없던 컬럼은 그 구간만 null이 된다.
+        saved = shard.get("indicators") or {}
+        writer._ind = {name: list(saved.get(name) or [None] * n) for name in indicator_names}
+        return writer
 
     def _reset_buffers(self) -> None:
         self._time: List[int] = []
@@ -77,9 +151,10 @@ class ShardWriter:
         for name in self.indicator_names:
             self._ind[name].append(_clean_value(indicator_values.get(name)))
 
-    def _flush(self) -> None:
+    def _write_current(self) -> Optional[Dict]:
+        """현재 월 버퍼를 파일로 쓰고 인덱스 엔트리를 돌려준다 (버퍼는 유지). 비었으면 None."""
         if not self._time:
-            return
+            return None
         file_name = f"{self.run_id}.{self._month}.series.json"
         shard = {
             "start": self._time[0],
@@ -90,9 +165,33 @@ class ShardWriter:
         if self.has_ohlc:
             shard["ohlc"] = self._ohlc
         shard["indicators"] = self._ind
-        with open(os.path.join(self.dir_path, file_name), "w") as f:
-            json.dump(shard, f, separators=(",", ":"))
-        self.shards.append({"file": file_name, "start": self._time[0], "end": self._time[-1]})
+        _write_json(os.path.join(self.dir_path, file_name), shard)
+        return {"file": file_name, "start": self._time[0], "end": self._time[-1]}
+
+    def _commit(self, entry: Dict) -> None:
+        """같은 파일의 기존 엔트리를 갈아끼우고, 없으면 append.
+
+        라이브는 같은 달을 여러 번 쓰므로 무조건 append하면 인덱스에 중복이 쌓인다. 백테스트는
+        캔들이 시간순이라 같은 달을 두 번 방문하지 않아 항상 append로 퇴화한다.
+        """
+        for i, s in enumerate(self.shards):
+            if s["file"] == entry["file"]:
+                self.shards[i] = entry
+                return
+        self.shards.append(entry)
+
+    def checkpoint(self) -> None:
+        """버퍼를 비우지 않고 현재 월 샤드를 디스크에 반영한다 (라이브 전용).
+
+        인덱스는 파일 rename이 성공한 **뒤에** 갱신되므로, 인덱스가 존재하지 않는 파일을
+        가리키는 상태는 생기지 않는다.
+        """
+        entry = self._write_current()
+        if entry:
+            self._commit(entry)
+
+    def _flush(self) -> None:
+        self.checkpoint()
         self._reset_buffers()
 
     def close(self) -> List[Dict]:
@@ -164,9 +263,7 @@ def write_series_shards(dir_path: str, run_id: str, times: Sequence[int],
             shard["ohlc"] = {k: np.asarray(v[lo:hi], dtype=np.float64).tolist()
                              for k, v in ohlc.items()}
         shard["indicators"] = {name: _clean_column(col[lo:hi]) for name, col in indicators.items()}
-        with open(os.path.join(dir_path, file_name), "w") as f:
-            # dumps + write: json.dump streams via the pure-Python encoder, dumps uses the C one
-            f.write(json.dumps(shard, separators=(",", ":")))
+        _write_json(os.path.join(dir_path, file_name), shard)
         shards.append({"file": file_name, "start": month_times[0], "end": month_times[-1]})
     return shards
 
@@ -262,6 +359,9 @@ def write_run_json(dir_path: str, run_id: str, report: Report, metadata: Dict,
             "wnl": t.wnl,
             "fee": t.fee,
             "margin": t.status.total_margin(),
+            # 거래 **전** 포지션. build_summary의 승패 판정이 이 부호를 보므로, 라이브 런이
+            # 재기동 후 자기 run JSON에서 Trade를 복원할 때 이게 없으면 집계가 무너진다.
+            "position": t.status.position,
             "leverage": t.leverage,
         }
         for t in report.trades
@@ -286,6 +386,5 @@ def write_run_json(dir_path: str, run_id: str, report: Report, metadata: Dict,
     }
 
     file_path = os.path.join(dir_path, f"{run_id}.json")
-    with open(file_path, "w") as f:
-        json.dump(doc, f, separators=(",", ":"))
+    _write_json(file_path, doc)
     return file_path

@@ -41,13 +41,24 @@ async def main():
     if not SYMBOL or not INTERVAL:
         raise ValueError("SYMBOL and INTERVAL must be set in environment variables or .env file")
 
+    # Result recording. Writes to <RESULT_PATH>/live/ in the same format the backtester
+    # produces, so a live run and a backtest can be compared in the visualiser.
+    RECORD = os.getenv("RECORD", "true").lower() == "true"
+    RESULT_PATH = os.getenv("RESULT_PATH", "asset/")
+    RUN_ID = os.getenv("LIVE_RUN_ID") or None
+    SHARD_FLUSH_EVERY = int(os.getenv("LIVE_SHARD_FLUSH_EVERY", 60))
+
     # Initialize the strategy. Swap KeltnerStreamer for any other BaseStreamer here — the
     # trader only needs `decide_action` and the `indicators` dict to prefeed.
-    window = int(os.getenv("WINDOW", 72 * 60))
-    m_entry = float(os.getenv("M_ENTRY", 4.0))
-    m_exit = float(os.getenv("M_EXIT", 3.0))
-    max_loss = float(os.getenv("MAX_LOSS", 0.005))
-    streamer = KeltnerStreamer(SYMBOL, window, m_entry, m_exit, max_loss)
+    # `params` is built once and handed to both the streamer and the run metadata, so the
+    # recorded params block has the same shape backtest.py writes.
+    params = dict(
+        window=int(os.getenv("WINDOW", 72 * 60)),
+        m_entry=float(os.getenv("M_ENTRY", 4.0)),
+        m_exit=float(os.getenv("M_EXIT", 3.0)),
+        max_loss=float(os.getenv("MAX_LOSS", 0.005)),
+    )
+    streamer = KeltnerStreamer(SYMBOL, **params)
 
     # Create trader and executor
     trader = BinanceTrader(
@@ -57,7 +68,12 @@ async def main():
         interval=INTERVAL,
         streamer=streamer,
         dry_run=DRY_RUN,
-        testnet=TESTNET
+        testnet=TESTNET,
+        record=RECORD,
+        result_path=RESULT_PATH,
+        run_id=RUN_ID,
+        run_metadata={"params": params},
+        shard_flush_every=SHARD_FLUSH_EVERY,
     )
 
     try:
