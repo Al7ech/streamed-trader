@@ -20,8 +20,9 @@ async def main():
     # Load environment variables from .env file
     load_dotenv()
 
-    # Configure logging
-    logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] %(name)s:%(lineno)d %(message)s")
+    # Configure logging. LOG_LEVEL은 이름(DEBUG/INFO/...) 또는 숫자 모두 허용.
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
+    logging.basicConfig(level=LOG_LEVEL, format="[%(levelname)s] %(name)s:%(lineno)d %(message)s")
     logging.getLogger("websockets.client").setLevel(logging.INFO)
     logging.getLogger("binance.ws.reconnecting_websocket").setLevel(logging.INFO)
 
