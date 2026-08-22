@@ -17,9 +17,12 @@ Asyncio trader that:
 - Backfills every indicator's rolling window with historical candles (`_prefeed_indicators`, via
   `BinanceCandleFetcher`) before going live, asserting the fetched range is exactly what was
   expected.
-- On each **closed** kline: builds a `Candle`, calls `streamer.update_candle(candle, status)`,
-  then updates the indicators with that same pre-trade `Status`, then executes the action — the
-  same ordering the backtester uses, so live and backtest see identical indicator state.
+- On each **closed** kline: builds a `Candle`, calls `streamer.update_candle(symbol, candle, status)`
+  (returns a list of `Action`s), then updates the indicators with that same pre-trade `Status`, then
+  executes each action — the same ordering the backtester uses, so live and backtest see identical
+  indicator state. `BinanceTrader` is still single-symbol: `streamer.symbols` has exactly one entry,
+  so in practice at most one `Action` comes back per candle, but the multi-symbol-capable streamer
+  interface (shared with the backtester) always returns a list.
 - Fires registered callbacks (`add_action_callback` / `add_error_callback`).
 - With `record=True`, hands every closed candle and every fill to a `LiveRecorder`.
 
@@ -46,8 +49,8 @@ Order execution off the asyncio loop:
 - Submits orders to a `ThreadPoolExecutor` (GIL-free from the event loop) and returns a
   `concurrent.futures.Future[OrderResult]`.
 - Retries with exponential backoff (`max_retries`, `base_retry_delay`).
-- `execute_action(action, symbol)` interprets `Action.quantity` exactly like the backtester's
-  `_trade()`: a signed delta to apply to the current position.
+- `execute_action(action)` interprets `Action.quantity` exactly like the backtester's `_trade()`:
+  a signed delta to apply to `action.symbol`'s current position.
 
 ### `ReliableWebsocket.py`
 

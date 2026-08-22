@@ -6,6 +6,7 @@ from core.backtest.status import Status
 @dataclass
 class Trade:
     timestamp: int
+    symbol: str
     quantity: float
     price: float
     wnl: float  ## (win & lose) = 수수료 **차감 전** 실현손익. 순손익은 wnl - fee.

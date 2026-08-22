@@ -1,4 +1,5 @@
 import logging
+from typing import List
 
 from core.backtest.status import Status
 from core.streamer.action import Action
@@ -32,12 +33,12 @@ class MomentumTimeExitStreamer(BaseStreamer):
             # 0이면 get_index(-0) == get_index(0) 이 되어 "가장 오래된 값"(루프) 또는
             # "아직 반영 안 된 캔들의 값"(FastBacktester, = 룩어헤드)을 읽게 된다.
             raise ValueError(f"MomentumTimeExitStreamer(mom_lookback={mom_lookback}): 1 이상이어야 한다.")
-        super().__init__({
+        super().__init__([symbol], {symbol: {
             # get_index(-mom_lookback)로 읽으므로 조회 깊이가 파라미터에 걸린다.
             # 기본 이력(BaseIndicator.history_size)을 넘는 lookback을 줘도 깨지지 않게 맞춰 둔다.
             "close_hist": MovingAverage(
                 1, history_size=max(MovingAverage.history_size, mom_lookback + 2)),
-        })
+        }})
         self.symbol = symbol
         self.mom_lookback = mom_lookback
         self.entry_threshold_pct = entry_threshold_pct
@@ -57,28 +58,29 @@ class MomentumTimeExitStreamer(BaseStreamer):
             f"entry_threshold_pct={entry_threshold_pct},hold_candles={hold_candles},"
             f"max_loss={max_loss}]")
 
-    def decide_action(self, candle: Candle, status: Status) -> Action:
-        if status.position != 0:
+    def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
+        position = status.position_for(symbol).position
+        if position != 0:
             self._hold_remaining -= 1
 
             if self.use_stop:
-                if status.position > 0 and candle.low <= self._stop_price:
-                    return Action(-status.position)
-                if status.position < 0 and self._stop_price <= candle.high:
-                    return Action(-status.position)
+                if position > 0 and candle.low <= self._stop_price:
+                    return [Action(symbol, -position)]
+                if position < 0 and self._stop_price <= candle.high:
+                    return [Action(symbol, -position)]
 
             if self._hold_remaining <= 0:
-                return Action(-status.position)
-            return Action(0)
+                return [Action(symbol, -position)]
+            return []
 
-        ref = self.indicators["close_hist"].get_index(-self.mom_lookback)
+        ref = self.indicators[symbol]["close_hist"].get_index(-self.mom_lookback)
         if ref is None:
-            return Action(0)
+            return []
 
         price = candle.close
         momentum_pct = (price / ref - 1) * 100
         if abs(momentum_pct) < self.entry_threshold_pct:
-            return Action(0)
+            return []
 
         sign = 1 if momentum_pct > 0 else -1
         stop_frac = self.entry_threshold_pct / 100
@@ -87,4 +89,4 @@ class MomentumTimeExitStreamer(BaseStreamer):
 
         self._hold_remaining = self.hold_candles
         self._stop_price = price * (1 - sign * stop_frac)
-        return Action(qty)
+        return [Action(symbol, qty)]

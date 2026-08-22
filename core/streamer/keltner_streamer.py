@@ -1,4 +1,5 @@
 import logging
+from typing import List
 
 from core.backtest.status import Status
 from core.streamer.action import Action
@@ -28,10 +29,10 @@ class KeltnerStreamer(BaseStreamer):
                  m_exit: float = 0.0,
                  max_loss: float = 0.08,
                  fee_ratio: float = 0.0004):
-        super().__init__({
+        super().__init__([symbol], {symbol: {
             "MA": MovingAverage(window),
             "ATR": ATRIndicator(window),
-        })
+        }})
         self.symbol = symbol
         self.m_entry = m_entry
         self.m_exit = m_exit
@@ -43,15 +44,17 @@ class KeltnerStreamer(BaseStreamer):
             f"KeltnerStreamer initialized with params: [window={window},m_entry={m_entry},"
             f"m_exit={m_exit},max_loss={max_loss}]")
 
-    def decide_action(self, candle: Candle, status: Status) -> Action:
-        ma = self.indicators["MA"].get_latest()
-        atr = self.indicators["ATR"].get_latest()
+    def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
+        ind = self.indicators[symbol]
+        ma = ind["MA"].get_latest()
+        atr = ind["ATR"].get_latest()
         if ma is None or atr is None or atr <= 0:
-            return Action(0)
+            return []
 
         price = candle.close
+        position = status.position_for(symbol).position
 
-        if status.position == 0:
+        if position == 0:
             upper = ma + self.m_entry * atr
             lower = ma - self.m_entry * atr
             dist = (self.m_entry + self.m_exit) * atr
@@ -59,14 +62,14 @@ class KeltnerStreamer(BaseStreamer):
 
             if upper <= price:
                 qty = trunc_by_sign(status.total_margin() / (price * (1 / lev + self.fee_ratio)), 3)
-                return Action(qty)
+                return [Action(symbol, qty)]
             if price <= lower:
                 qty = trunc_by_sign(-status.total_margin() / (price * (1 / lev + self.fee_ratio)), 3)
-                return Action(qty)
+                return [Action(symbol, qty)]
 
-        if status.position > 0 and candle.low < ma - self.m_exit * atr:
-            return Action(-status.position)
-        if status.position < 0 and ma + self.m_exit * atr < candle.high:
-            return Action(-status.position)
+        if position > 0 and candle.low < ma - self.m_exit * atr:
+            return [Action(symbol, -position)]
+        if position < 0 and ma + self.m_exit * atr < candle.high:
+            return [Action(symbol, -position)]
 
-        return Action(0)
+        return []

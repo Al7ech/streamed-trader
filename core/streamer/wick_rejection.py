@@ -1,4 +1,5 @@
 import logging
+from typing import List
 
 from core.backtest.status import Status
 from core.streamer.action import Action
@@ -30,9 +31,9 @@ class WickRejectionStreamer(BaseStreamer):
                  fee_ratio: float = 0.0004,
                  use_stop: bool = True,
                  side: int = 1):
-        super().__init__({
+        super().__init__([symbol], {symbol: {
             "atr": ATRIndicator(60),
-        })
+        }})
         self.symbol = symbol
         self.wick_atr_mult = wick_atr_mult
         self.close_pos = close_pos
@@ -52,27 +53,28 @@ class WickRejectionStreamer(BaseStreamer):
             f"close_pos={close_pos},hold_candles={hold_candles},stop_atr_mult={stop_atr_mult},"
             f"max_loss={max_loss},use_stop={use_stop},side={side}]")
 
-    def decide_action(self, candle: Candle, status: Status) -> Action:
-        if status.position != 0:
+    def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
+        position = status.position_for(symbol).position
+        if position != 0:
             self._hold_remaining -= 1
 
             if self.use_stop:
-                if status.position > 0 and candle.low <= self._stop_price:
-                    return Action(-status.position)
-                if status.position < 0 and self._stop_price <= candle.high:
-                    return Action(-status.position)
+                if position > 0 and candle.low <= self._stop_price:
+                    return [Action(symbol, -position)]
+                if position < 0 and self._stop_price <= candle.high:
+                    return [Action(symbol, -position)]
 
             if self._hold_remaining <= 0:
-                return Action(-status.position)
-            return Action(0)
+                return [Action(symbol, -position)]
+            return []
 
-        atr = self.indicators["atr"].get_latest()
+        atr = self.indicators[symbol]["atr"].get_latest()
         if atr is None or atr <= 0:
-            return Action(0)
+            return []
 
         rng = candle.high - candle.low
         if rng <= 0:
-            return Action(0)
+            return []
 
         if self.side > 0:
             wick = min(candle.open, candle.close) - candle.low
@@ -81,7 +83,7 @@ class WickRejectionStreamer(BaseStreamer):
             wick = candle.high - max(candle.open, candle.close)
             in_pos = (candle.high - candle.close) >= self.close_pos * rng
         if wick < self.wick_atr_mult * atr or not in_pos:
-            return Action(0)
+            return []
 
         price = candle.close
         stop_frac = self.stop_atr_mult * atr / price
@@ -90,4 +92,4 @@ class WickRejectionStreamer(BaseStreamer):
 
         self._hold_remaining = self.hold_candles
         self._stop_price = price * (1 - self.side * stop_frac)
-        return Action(qty)
+        return [Action(symbol, qty)]

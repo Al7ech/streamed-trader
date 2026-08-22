@@ -7,12 +7,15 @@ repository.
 
 An algorithmic trading system for Binance USD-M Futures with two independent halves:
 
-- `core/` — Python engine: historical candle fetching, two backtesters (a reference
-  implementation and a vectorized fast path), a pluggable streamer/indicator strategy framework,
-  and an asyncio live trader/executor.
+- `core/` — Python engine: historical candle fetching, two multi-symbol-capable backtesters (a
+  reference implementation and a vectorized fast path — see "Data flow" below for how symbols'
+  candles are merged into one event timeline), a pluggable, cross-symbol-aware streamer/indicator
+  strategy framework, and an asyncio live trader/executor (still single-symbol; see "Live
+  trading").
 - `visualise/` — a Create React App frontend that reads the JSON files the backtester writes and
   renders them with `lightweight-charts`. It has no backend of its own; the user picks the `asset/`
-  directory with the File System Access API and everything is parsed client-side.
+  directory with the File System Access API and everything is parsed client-side. **Does not yet
+  render multi-symbol runs** — see "Backtest output format" below.
 
 There is no automated test suite (no `pytest`/`unittest` files in `core/`, only the default CRA
 `react-scripts test` in `visualise/`). `core/backtest_fast_check.py` is the de-facto correctness
@@ -117,55 +120,82 @@ when the process is launched with cwd = `core/`.
    ends. It returns `List[Candle]` only. `binance_candle_fetcher/candle_storage.py` is an older
    CSV(.gz) load/save path for the same `Candle` objects.
 
-3. **Backtest.** `backtest/SingleThreadedBacktester.py` replays a `List[Candle]` through a
-   `BaseStreamer`, updating a `Status` (margin/position/avg_price/unrealised_pnl/leverage) and
-   (when `metadata` is passed to `run()`) writing a run JSON plus month-bucketed columnar series
-   shards into `asset/backtest/` (`result_writer.py`). It also force-liquidates a position when
-   mark-to-market equity (`margin + unrealised_pnl`, i.e. `Status.total_margin()`) falls to zero
-   or below.
+3. **Backtest.** The backtesters are multi-symbol: `backtest/SingleThreadedBacktester.py` takes
+   `Dict[str, List[Candle]]` (one ragged list per symbol — symbols don't need to start/end at the
+   same time) and merges them via `backtest/candle_merge.merge_candle_timeline` into one
+   chronological stream of **events**, where an event bundles every symbol whose candle closes at
+   that exact timestamp. Within an event, symbols are processed in `streamer.symbols` order:
+   mark-to-market → before-indicators → `decide_action` → record → after-indicators, and a
+   strategy's `decide_action` can read every symbol's indicator state and return `Action`s for
+   symbols other than the one that triggered the call (see "Streamer/indicator strategy
+   framework" below) — a same-event action targeting another symbol fills at that symbol's
+   `Status.last_close`, frozen before any symbol in the event is processed, so cross-symbol fills
+   are deterministic regardless of `streamer.symbols` order. `Status.apply_fill` is updated per
+   symbol; `margin` is one pool shared across all symbols (matches Binance cross margin). It also
+   force-liquidates — flattening *every* open position, since the shared pool means one symbol's
+   loss can force-close the rest — when mark-to-market equity (`Status.total_margin()`, margin
+   plus the sum of every symbol's unrealised PnL) falls to zero or below.
 
    `backtest/FastBacktester.py` is the drop-in fast version the entry scripts use: it precomputes
-   every `VectorizedIndicator` as a numpy array (swapped in as a cursor-backed `ArrayIndicator`
-   shim), keeps plain `BaseIndicator`s loop-updated, rebuilds the equity curve vectorized, and
-   bulk-writes shards after the loop — same trades/outputs, ~2x faster loop and ~5x faster
-   `save_series` runs. `SingleThreadedBacktester` stays as the reference implementation.
+   every `VectorizedIndicator` **per symbol** as a numpy array (swapped in as a cursor-backed
+   `ArrayIndicator` shim whose cursor advances only on events where that symbol appears, not on
+   the shared event index), keeps plain `BaseIndicator`s loop-updated, rebuilds the equity curve
+   vectorized (a per-symbol forward-filled close matrix dot the per-segment position vector,
+   generalizing the single-symbol piecewise-constant trick), and bulk-writes shards after the
+   loop. `SingleThreadedBacktester` stays as the reference implementation; parity between the two
+   (including multi-symbol cases — overlapping symbols, a staggered-start symbol, cross-symbol
+   actions, forced liquidation across symbols) is asserted by `backtest_fast_check.py`.
 
 4. **Visualise.** `visualise/` reads the run JSON and shards client-side — it does not talk to
    Binance or the Python code at all.
 
 ### Backtest output format (`core/backtest/result_writer.py`)
 
-`SCHEMA_VERSION = 3` (v2 added the `benchmark` block and `summary.benchmark_profit_pct`; v3 added
+`SCHEMA_VERSION = 4` (v2 added the `benchmark` block and `summary.benchmark_profit_pct`; v3 added
 `trades[].position`, the pre-trade signed position, which lets a resumed live run rebuild the
-win/lose classification `build_summary` derives from `Trade.status.position`). All additions are
-purely additive — the frontend hides UI for missing blocks and picks named trade keys — so older
-runs still load. A run with `metadata` produces:
+win/lose classification; v4 added multi-symbol support — `trades[].symbol`, `series.symbols` (the
+traded set), `summary.by_symbol` (per-symbol win/lose breakdown alongside the unchanged aggregate
+fields), and restructured the shard body to nest OHLC/indicators per symbol — see below). v1-v3
+additions are purely additive — the frontend hides UI for missing blocks and picks named trade
+keys — so older runs still load unchanged through their own flat shard shape; v4 is the one place
+"additive" means "old files untouched, new files use a new shape" rather than "old files gain new
+keys," since folding N symbols into the old flat single-`ohlc`-dict shape would be a namespace
+collision, not an addition. **The frontend does not yet render the v4 nested shard shape or the
+multi-symbol run JSON fields** — this is core-engine-only support so far; see the note under
+"Streamer/indicator strategy framework" below. A run with `metadata` produces:
 
 - `asset/backtest/<run_id>.json` — `metadata`, `summary` (max leverage, final margin, profit %,
-  buy & hold profit %, win/lose counts, win rate, `sharpe`, `max_drawdown` — computed by
-  `backtest/metrics.py`; `compute_sharpe` resamples to daily before annualising because
+  buy & hold profit %, win/lose counts, win rate, `by_symbol`, `sharpe`, `max_drawdown` — computed
+  by `backtest/metrics.py`; `compute_sharpe` resamples to daily before annualising because
   per-candle returns are mostly zero-noise, and `result_writer._sharpe_sampling` derives the
   stride/annualisation from `interval_ms` so the resample is genuinely daily at any candle size.
   Win/lose counts only include **realising** fills — those whose signed quantity opposes the
-  pre-trade position — and compare `wnl - fee`, so a close whose realised PnL is eaten by the
-  fee counts as a loss), a downsampled `equity` block (≤2000 points for the
-  timeline sparkline), a `benchmark` block downsampled the same way, the full `trades` list, and a
+  pre-trade position for that trade's symbol — and compare `wnl - fee`, so a close whose realised
+  PnL is eaten by the fee counts as a loss), a downsampled `equity` block (≤2000 points for the
+  timeline sparkline; equity is account-wide, one point per merged event, not per symbol), a
+  `benchmark` block downsampled the same way, the full `trades` list (each with a `symbol`), and a
   `series` index describing the shards.
 
-  `benchmark` is the buy & hold curve of the traded symbol (`init_margin * close_i / close_0`,
-  built by `metrics.build_buy_and_hold_curve` and carried on `Report.benchmark_curve`). It has the
-  same length as the equity curve, so `_downsample_equity` picks the same stride and
-  `benchmark.time` is element-wise identical to `equity.time` — the frontend pairs them by index
-  with no interpolation. Because it is in the run JSON rather than the shards, the Trades tab can
-  overlay it and derive the relative-strength curve without loading any per-month shard.
-- `asset/backtest/<run_id>.<YYYY-MM>.series.json` — one shard per month with per-candle OHLC and
-  indicator values, **columnar** (parallel arrays) so column keys aren't repeated per candle.
-  `SingleThreadedBacktester` streams these out through `ShardWriter` (only the current month is in
-  memory); `FastBacktester` bulk-writes them after the loop. The frontend loads them lazily per
+  `benchmark` is an **equal-weighted portfolio buy & hold** across every traded symbol
+  (`metrics.build_multi_symbol_buy_and_hold_curve`, carried on `Report.benchmark_curve`): each
+  symbol is allocated `init_margin / N` at its own first available close (so a symbol that starts
+  trading later still gets a fair, un-lookahead-biased basis) and held to the end; with one symbol
+  this reduces to the old `init_margin * close_i / close_0` curve. It has the same length as the
+  equity curve, so `_downsample_equity` picks the same stride and `benchmark.time` is element-wise
+  identical to `equity.time` — the frontend pairs them by index with no interpolation.
+- `asset/backtest/<run_id>.<YYYY-MM>.series.json` — one shard per month. `time` (the merged event
+  timestamps) and `balance` (account-wide `Status.total_margin()` — not per-symbol, since margin
+  is a shared pool) sit at the shard's top level; a `symbols` key nests each traded symbol's own
+  `ohlc`/`indicators`, **columnar** (parallel arrays) so column keys aren't repeated per event. A
+  symbol absent from a given event (ragged series, staggered start) gets `null` across the board
+  for that row — the existing warm-up-null convention, no new sentinel. `SingleThreadedBacktester`
+  streams these out through `ShardWriter` (only the current month is in memory); `FastBacktester`
+  bulk-writes them via `write_series_shards` after the loop. The frontend loads them lazily per
   viewport.
 
 `run_id` is `<StreamerClassName>_<YYYYmmdd_HHMMSS>`. `series.column_groups` carries each
-indicator's `scale_group`, which decides whether the frontend overlays it on the price pane or
+indicator's `scale_group`, keyed by indicator **name** only (shared meaning across symbols, a
+deliberate simplification) — it decides whether the frontend overlays it on the price pane or
 gives it its own.
 
 All writes go through `result_writer._write_json`, which wraps `boltons.fileutils.atomic_save`
@@ -183,16 +213,26 @@ so the visualiser loads both from one directory list (`filterRunFiles` accepts `
 splitting `ShardWriter._flush` into `checkpoint()` (write the current month, keep the buffer) and
 buffer reset, since a live process rewrites one month's shard for weeks.
 
+**`LiveRecorder`/`BinanceTrader` are still single-symbol** — `streamer.symbols` has exactly one
+entry (`streamer.symbols[0]`, which the recorder caches as `self._symbol`), even though the
+`Status`/shard shapes they write are the multi-symbol-capable ones described above. A real
+multi-symbol live trader (multiplexed kline socket, per-`(symbol, order_id)` fill dispatch) is not
+implemented; see "Live trading" below.
+
 - **`run_id` is stable across restarts**: `<live|dry>_<Streamer>_<SYMBOL>_<INTERVAL>` (override with
   `LIVE_RUN_ID`). Docker's `restart: always` means the process dies often, and a fresh file per
   start would fragment the equity curve into unusable pieces. On startup the recorder reloads its
   own run JSON and shards and continues appending — `equity_curve`/`closes` are replayed from the
-  shards' `balance`/`ohlc.close` columns, never from the run JSON's `equity` block (that one is
-  downsampled to ≤2000 points and would decay a little more on every restart). `init_margin` also
-  comes from the saved metadata, not the current wallet, or `profit_pct` would reset each restart.
-- **Config changes fork a new run.** If `series.columns`, `params`, `symbol`, `interval` or
-  `streamer` differ from the saved run, the recorder logs an ERROR and starts
-  `<run_id>_<timestamp>` rather than appending mismatched columns into the old shards.
+  shards' top-level `balance` column and its own symbol's `ohlc.close` column, never from the run
+  JSON's `equity` block (that one is downsampled to ≤2000 points and would decay a little more on
+  every restart). `init_margin` also comes from the saved metadata, not the current wallet, or
+  `profit_pct` would reset each restart.
+- **Config changes fork a new run.** If `schema_version`, `series.columns`, `params`, `symbol`,
+  `interval` or `streamer` differ from the saved run, the recorder logs an ERROR and starts
+  `<run_id>_<timestamp>` rather than appending mismatched data into the old shards. The
+  `schema_version` check specifically exists so a v1-v3 run (flat shard shape) is never resumed by
+  v4 code — it always forks a fresh run instead, deliberately, rather than special-casing the old
+  shape in the resume path.
 - **`metadata.last_status`** carries the account state at the last flush, and on resume
   `BinanceTrader._restore_dry_run_status` applies it **in dry-run only**. Dry-run margin is
   synthetic (`1e6`) and would otherwise reset on every process start while the equity curve
@@ -227,27 +267,39 @@ buffer reset, since a live process rewrites one month's shard for weeks.
 
 ### Streamer/indicator strategy framework (`core/streamer/`)
 
-- `BaseStreamer` (ABC) holds a `Dict[str, BaseIndicator]` and exposes
-  `update_candle(candle, status) -> Action`, which delegates to the abstract `decide_action`.
-  Subclasses only implement `decide_action`.
+- `BaseStreamer` (ABC) is multi-symbol and **cross-symbol aware**: `__init__(symbols,
+  indicators)` takes the list of symbols it trades and `indicators: Dict[str, Dict[str,
+  BaseIndicator]]` — one indicator instance per `(symbol, name)` pair (never shared across
+  symbols, since each instance carries its own series state). It exposes `update_candle(symbol,
+  candle, status) -> List[Action]`, which delegates to the abstract `decide_action(symbol, candle,
+  status) -> List[Action]`. `symbol` identifies whose candle just closed and triggered the call,
+  but `self.indicators` holds every traded symbol's state, so an implementation can read other
+  symbols' indicators too and return `Action`s (each carrying its own `.symbol`) for symbols other
+  than the trigger — this is what makes pairs/relative-strength/rotation strategies possible. A
+  single-symbol strategy just ignores the `symbol` argument (`self.symbols` has one element) and
+  returns `[Action(self.symbols[0], qty)]` or `[]`.
 - Indicators come in two types. `BaseIndicator` (ABC) is a loop-updated rolling-window indicator:
   `update(candle, status=None)` ingests one candle plus the *pre-trade* `Status` snapshot — the
   same one `decide_action` saw for that candle (the live trader's `_prefeed_indicators` passes
   `None`, so status-aware indicators must treat `None` as warm-up); `get_index(idx)`/`get_latest()`
   read back past values (`-1` = latest, `-2` = previous, ...). An indicator that reads `status`
   cannot be vectorized (account state is a feedback loop of the strategy's own trades) and must
-  stay a plain `BaseIndicator` — `indicator/position_age.py` is the canonical example.
+  stay a plain `BaseIndicator` — `indicator/position_age.py` is the canonical example (it's told
+  which symbol it belongs to at construction, since it reads `status.position_for(self._symbol)`
+  directly rather than only through `decide_action`).
   `VectorizedIndicator` (subclass ABC) additionally requires
   `precompute_series(open, high, low, close, volume) -> np.ndarray` (element i = `get_latest()`
-  after i+1 updates, NaN during warm-up), which `FastBacktester` uses to compute the whole series
-  at once — `update()` must still work for the live trader. `MovingAverage`,
-  `MinDonchianIndicator`/`MaxDonchianIndicator` (monotonic-deque min/max over a window),
-  `ATRIndicator`, `RollingStd` and the `volume_stats` indicators are vectorized; `ADXIndicator`,
-  `SupertrendIndicator`, `PivotTrendlineIndicator`, `TakerImbalanceIndicator` and
-  `PositionAgeIndicator` are path-dependent or status-aware and stay plain `BaseIndicator`s
-  (correct everywhere, just on the loop path). Both kinds mix freely within one strategy.
+  after i+1 updates, NaN during warm-up), which `FastBacktester` uses to compute each symbol's
+  whole series at once (against that symbol's **own** OHLCV arrays) — `update()` must still work
+  for the live trader. `MovingAverage`, `MinDonchianIndicator`/`MaxDonchianIndicator`
+  (monotonic-deque min/max over a window), `ATRIndicator`, `RollingStd` and the `volume_stats`
+  indicators are vectorized; `ADXIndicator`, `SupertrendIndicator`, `PivotTrendlineIndicator`,
+  `TakerImbalanceIndicator` and `PositionAgeIndicator` are path-dependent or status-aware and stay
+  plain `BaseIndicator`s (correct everywhere, just on the loop path). Both kinds mix freely within
+  one strategy.
 - Each indicator's `scale_group` (default `"price"`) tells the frontend which chart pane to plot
-  it on; indicators sharing a group share a pane and price scale.
+  it on; indicators sharing a group share a pane and price scale (this grouping is keyed by
+  indicator **name** only, shared across symbols).
 - Each indicator also carries `updates_before_decide` (default `False`), which selects **which
   side of `decide_action` it ingests the current candle on**. Every shipped indicator leaves it
   `False`, so the default ordering described below is what actually runs today. Setting it `True`
@@ -256,22 +308,26 @@ buffer reset, since a live process rewrites one month's shard for weeks.
   Donchian max channel including the current bar satisfies `channel_max >= candle.high >=
   candle.close` and could never fire.
 
-  All three engines partition `streamer.indicators` on this flag: `SingleThreadedBacktester`,
-  `FastBacktester` and `BinanceTrader._on_kline`. Two non-obvious consequences in
-  `FastBacktester`: the flag is mirrored onto each `ArrayIndicator` shim and the shim's `cursor`
-  is advanced to `i+1` *before* the decision for flagged indicators; and
-  `_build_series_columns` skips its usual one-candle right-shift for them (their decide-time
-  value at candle `i` is `seq[i]`, unshifted). Both backtesters record the series between the two
-  update groups, so every plotted column is the value the decision actually saw regardless of
+  All three engines partition `streamer.indicators[symbol]` on this flag, **per symbol**:
+  `SingleThreadedBacktester`, `FastBacktester` and `BinanceTrader._on_kline` (the live trader is
+  still single-symbol, so its own partitioning is over `streamer.indicators[self.symbol]`). Two
+  non-obvious consequences in `FastBacktester`: each symbol's `ArrayIndicator` shims are just
+  called via the same `.update()` as everything else — every appearance of that symbol in the
+  merged event stream advances their `cursor` by one, so no manual index bookkeeping is needed even
+  though the shared merged-event index and a symbol's own candle-index no longer coincide; and
+  `_build_symbol_series_columns` skips its usual one-candle right-shift for flagged indicators
+  (their decide-time value at that symbol's j-th own candle is `seq[j]`, unshifted) before
+  scattering the result onto the shared event grid. Both backtesters record the series between the
+  two update groups, so every plotted column is the value the decision actually saw regardless of
   which side it was fed on.
-- **Ordering matters**: both the backtester and `BinanceTrader` call
-  `streamer.decide_action/update_candle` on the *closed* candle first, then update the indicators
-  with that candle and the still pre-trade `Status`, and only then apply/execute the action (the
-  `updates_before_decide` indicators above are the opt-in exception, fed just before the call) — so
-  a decision always sees indicator state that excludes the candle it's deciding on, and an
-  indicator always sees the status that decision was made with. The current candle's OHLCV is not
-  hidden from the decision — it arrives directly as the `candle` argument, and every strategy uses
-  it.
+- **Ordering matters**: both the backtester and `BinanceTrader` call `streamer.decide_action` /
+  `update_candle` for a symbol on its *closed* candle first, then update that symbol's indicators
+  with that candle and the still pre-trade `Status`, and only then apply/execute the returned
+  actions (the `updates_before_decide` indicators above are the opt-in exception, fed just before
+  the call) — so a decision always sees indicator state that excludes the candle it's deciding on,
+  and an indicator always sees the status that decision was made with. The current candle's OHLCV
+  is not hidden from the decision — it arrives directly as the `candle` argument, and every
+  strategy uses it.
 
   This ordering is a **semantic convention, not a look-ahead guard**. The candle has already
   closed by the time `decide_action` runs, so folding it into the indicators would leak no future
@@ -280,14 +336,18 @@ buffer reset, since a live process rewrites one month's shard for weeks.
   `close > channel_max` unfireable. What the convention guarantees is that `get_latest()` means
   exactly one thing, in the backtester and in the live trader alike.
 
-  Look-ahead is actually held out elsewhere: fills use the decision candle's `close` (not a later
-  or more favourable price), the `Status` handed to both `decide_action` and `update` is the
-  pre-trade snapshot, and path-dependent indicators delay their own confirmation internally
-  (`PivotTrendlineIndicator` only confirms a fractal pivot k bars later).
-- `Action` is just a signed `quantity` delta to apply to the current position (positive = buy/long,
-  negative = sell/short); it is interpreted identically by the backtester's `_trade()` and by
-  `BinanceExecutor.execute_action`.
-- Example strategies (illustrations of the framework, not tuned or recommended):
+  Look-ahead is actually held out elsewhere: a fill uses its target symbol's decision-candle
+  `close` when that symbol is the trigger, or `Status.last_close[symbol]` — frozen before any
+  symbol in the current merged event is processed — for a same-event action targeting a different
+  symbol; the `Status` handed to both `decide_action` and `update` is the pre-trade snapshot; and
+  path-dependent indicators delay their own confirmation internally (`PivotTrendlineIndicator`
+  only confirms a fractal pivot k bars later).
+- `Action(symbol, quantity)` is a signed `quantity` delta to apply to `symbol`'s current position
+  (positive = buy/long, negative = sell/short); it is interpreted identically by the backtester's
+  `_trade()` and by `BinanceExecutor.execute_action` (which reads `action.symbol` directly).
+- Example strategies (illustrations of the framework, not tuned or recommended — all still
+  single-symbol, `self.symbols == [symbol]`, migrated to the multi-symbol-capable interface
+  mechanically):
   `CrossMovingAverageStreamer` (MA10/MA25 cross — the simplest one, read it first),
   `KeltnerStreamer` (ATR channel breakout; wired into `backtest.py` and `trader.py`),
   `SupertrendStreamer` (always-in trend flip), `MeanReversionZScoreStreamer` (z-score fade;
@@ -295,27 +355,54 @@ buffer reset, since a live process rewrites one month's shard for weeks.
   `VolumeConfirmedMomentumStreamer` (the previous one subclassed to add a volume entry filter),
   `WickRejectionStreamer` (candlestick pattern), `TrendlineBounceStreamer` (pivot-trendline
   geometry), and `TradeStreamer` (alternating long/short every bar — a fixture, not a strategy).
+  A genuinely cross-symbol strategy exists only as a test fixture so far
+  (`RelativeStrengthRotationStreamer` in `backtest_fast_check.py`) — no shipped example strategy
+  uses the cross-symbol capability yet. **The `visualise/` frontend does not render multi-symbol
+  runs** (multiple price panes, per-symbol trade markers, `summary.by_symbol`) — that's unbuilt
+  follow-up work; only the core engine and output schema support multiple symbols today.
 
 ### Position & PnL accounting (`core/backtest/status.py`, `trade.py`, `report.py`)
 
-`Status` is the single shared representation of account state (`avg_price`, `margin`,
-`unrealised_pnl`, `position`, `leverage`) used by *both* the backtester and the live
-`BinanceTrader`. `Status.apply_fill(quantity, price, fee_ratio)` holds the one copy of the
-averaging/PNL math and models opening, pyramiding (same-direction add), partial close, full close,
-and direction-flip; `SingleThreadedBacktester._trade` is a thin wrapper over it (inherited
-unchanged by `FastBacktester`), and `BinanceTrader`'s dry-run path calls it directly, so dry-run
-equity tracks a backtest of the same candles exactly. A `Trade`
-is an immutable record of one fill plus a deep-copied pre-trade `Status`; its `wnl` is realised
-PnL **before** the fee, which is carried separately in `fee`. `Report` bundles all
-`Trade`s with `max_leverage`, the final `Status` and the equity curve.
+`Status` is the single shared representation of account state used by *both* the backtester and
+the live `BinanceTrader`, modelling one **shared cross-margin pool** (`margin`, a bare scalar)
+across per-symbol positions (`positions: Dict[str, PositionState]`, each holding `avg_price`,
+`position`, `unrealised_pnl`) — matching how Binance USD-M cross margin actually works: a loss on
+one symbol draws down the same pool a profit on another symbol credits. `status.position_for(
+symbol)` lazily creates a flat `PositionState` for a symbol not yet touched, so callers never
+`KeyError` on a symbol they haven't traded. `total_margin()` sums `margin` plus every symbol's
+`unrealised_pnl`; `update_leverage()` sums notional (`avg_price * abs(position)`) across every
+symbol over that. `status.last_close: Dict[str, float]` is engine-maintained (set to each
+symbol's close as it's processed within a merged event, before any symbol's own `decide_action`
+runs that event) — it's what lets a cross-symbol action price a non-trigger symbol correctly.
+`Status.apply_fill(symbol, quantity, price, fee_ratio)` holds the one copy of the averaging/PNL
+math and models opening, pyramiding (same-direction add), partial close, full close, and
+direction-flip on that symbol's `PositionState`, crediting/debiting the shared `margin`;
+`SingleThreadedBacktester._trade` is a thin wrapper over it (inherited unchanged by
+`FastBacktester`), and `BinanceTrader`'s dry-run path calls it directly, so dry-run equity tracks
+a backtest of the same candles exactly. A `Trade` is an immutable record of one fill (with its
+`symbol`) plus a deep-copied pre-trade `Status`; its `wnl` is realised PnL **before** the fee,
+which is carried separately in `fee`. `Report` bundles all `Trade`s with `max_leverage`, the final
+`Status` and the equity curve.
 
 ### Live trading (`core/trader/`)
+
+Live trading is **still single-symbol** — `BinanceTrader` always constructs/uses a streamer with
+`self.symbols == [self.symbol]`, opens one kline socket for that symbol, and hard-filters
+`ORDER_TRADE_UPDATE`/`ACCOUNT_UPDATE` events to it — even though it now sits on top of the
+multi-symbol-capable `Status`/`Action`/`BaseStreamer` shared with the backtester (see "Position &
+PnL accounting" and "Streamer/indicator strategy framework" above). A real multi-symbol live
+trader isn't built: it would need python-binance's `futures_multiplex_socket` (available, unused)
+in place of the single-symbol `kline_futures_socket`, and `_order_agg` keyed by `(symbol,
+order_id)` instead of `order_id` alone, since Binance's futures user-data stream is already
+account-wide (not per-symbol) on the exchange side.
 
 - `BinanceTrader` is asyncio-based: it opens a futures kline websocket (and, unless `dry_run`, a
   futures user-data websocket) via `ReliableWebsocket` (a thin wrapper around python-binance's
   `ReconnectingWebsocket` that recovers from a dropped `recv()` by closing/reconnecting the
-  delegate). On each *closed* kline it builds a `Candle`, calls the streamer, updates indicators,
-  and fires registered action/error callbacks (`add_action_callback`/`add_error_callback`).
+  delegate). On each *closed* kline it builds a `Candle`, calls the streamer with its one symbol
+  (`streamer.update_candle(self.symbol, candle, status) -> List[Action]`, defensively looped over
+  even though a single-symbol streamer returns at most one), updates indicators, and fires
+  registered action/error callbacks (`add_action_callback`/`add_error_callback`).
   `_prefeed_indicators()` backfills each indicator's window with historical candles (via
   `BinanceCandleFetcher`, off the event loop through `asyncio.to_thread`) before going live,
   asserting the fetched range exactly matches what's expected. The range is floored to the

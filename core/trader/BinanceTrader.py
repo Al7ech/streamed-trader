@@ -270,10 +270,12 @@ class BinanceTrader:
         if not self.dry_run or not self.recorder or not self.recorder.resumed_status:
             return
         saved = self.recorder.resumed_status
-        self.status.avg_price = saved.avg_price
-        self.status.unrealised_pnl = saved.unrealised_pnl
+        saved_pos = saved.position_for(self.symbol)
+        pos = self.status.position_for(self.symbol)
+        pos.avg_price = saved_pos.avg_price
+        pos.unrealised_pnl = saved_pos.unrealised_pnl
+        pos.position = saved_pos.position
         self.status.margin = saved.margin
-        self.status.position = saved.position
         self.status.leverage = saved.leverage
         self.logger.info(f"[dry-run] 이전 런의 계좌 상태를 복원했다: {self.status}")
 
@@ -406,20 +408,27 @@ class BinanceTrader:
             self._pending_decision = None
 
         # Update status with current price
-        self.status.update_unrealised_pnl(close_price)
+        self.status.update_unrealised_pnl(self.symbol, close_price)
 
         self.logger.debug(f"status: {self.status}")
 
+        symbol_indicators = self.streamer.indicators.get(self.symbol, {})
+
         # Indicators that opt into updates_before_decide ingest this candle first, so the
         # decision sees them including it. Same split the backtester applies.
-        for indicator_name, indicator in self.streamer.indicators.items():
+        for indicator_name, indicator in symbol_indicators.items():
             if indicator.updates_before_decide:
                 indicator.update(candle, self.status)
 
-        # Get action from streamer
-        action = self.streamer.update_candle(candle, self.status)
+        # Get actions from streamer. 단일심볼 트레이더이므로 self.symbols == [self.symbol]이라
+        # 현실적으로 0~1개가 돌아온다 — 2개 이상은 방어적으로만 순차 처리한다 (진짜 멀티심볼
+        # 라이브 트레이딩은 아직 지원 범위 밖).
+        actions = self.streamer.update_candle(self.symbol, candle, self.status)
+        if len(actions) > 1:
+            self.logger.warning(f"스트리머가 캔들 하나에 액션 {len(actions)}개를 반환했다 — "
+                                f"순차 처리한다: {actions}")
 
-        self.logger.debug(f"streamer action: {action}")
+        self.logger.debug(f"streamer actions: {actions}")
 
         # 백테스터와 **같은 자리**에서 기록한다: 두 지표 갱신 그룹 사이. 아래 after 루프
         # 뒤로 옮기면 updates_before_decide=False 인 모든 지표 컬럼이 백테스트 대비 한 캔들씩
@@ -429,43 +438,48 @@ class BinanceTrader:
 
         # The rest are updated after the decision (the default).
         # Indicators receive the same pre-trade status decide_action saw (action not yet executed).
-        for indicator_name, indicator in self.streamer.indicators.items():
+        for indicator_name, indicator in symbol_indicators.items():
             if not indicator.updates_before_decide:
                 indicator.update(candle, self.status)
 
-        self.logger.debug(f"successfully updated indicators: {generate_dict_string(self.streamer.indicators)}")
-
-        # 거래 전 스냅샷은 주문을 내보내기 **전에** 떠야 한다. _on_action이 주문 future를
-        # await하며 이벤트 루프에 양보하므로, 그 사이 체결/계정 갱신 이벤트가 도착해
-        # self.status를 이미 바꿔놓을 수 있다.
-        # dry-run은 유저 데이터 소켓을 열지 않아 ORDER_TRADE_UPDATE가 오지 않는다. 짝지을
-        # 상대가 없으므로 여기서 만들지 않고, 아래 dry-run 블록이 직접 스냅샷을 뜬다.
-        if self.recorder and not self.dry_run and action.quantity != 0:
-            self._pending_decision = _PendingDecision(
-                timestamp=candle.end_time,
-                quantity=action.quantity,
-                pre_status=copy.deepcopy(self.status),
-            )
-
-        # Execute action if callback is set
-        if self.on_action_callbacks and action.quantity != 0:
-            await asyncio.gather(*[c(action) for c in self.on_action_callbacks])
+        self.logger.debug(f"successfully updated indicators: {generate_dict_string(symbol_indicators)}")
 
         traded = False
-        if self.dry_run and action.quantity != 0:
-            # 라이브에서는 거래소 체결(ACCOUNT_UPDATE)이 status를 갱신하지만, dry-run에는
-            # 체결이 없으므로 백테스터와 **같은** 회계를 직접 돌린다. 예전에는 자체 근사식이라
-            # 부분 청산에서 avg_price를 현재가로 덮어써 미실현을 날렸고 margin은 아예 갱신하지
-            # 않아서, dry-run 자본이 초기값에 영원히 고정됐다.
-            pre_status = copy.deepcopy(self.status)
-            wnl, fee = self.status.apply_fill(action.quantity, candle.close, self.fee_ratio)
-            leverage = self.status.update_leverage()
-            self.logger.info(f"[dry-run] filled qty={action.quantity} @ {candle.close} "
-                             f"wnl={wnl:.4f} fee={fee:.4f} -> {self.status}")
-            if self.recorder:
-                self.recorder.record_trade(candle.end_time, action.quantity, candle.close,
-                                           wnl, fee, pre_status, leverage)
-                traded = True
+        for action in actions:
+            if action.quantity == 0:
+                continue
+
+            # 거래 전 스냅샷은 주문을 내보내기 **전에** 떠야 한다. _on_action이 주문 future를
+            # await하며 이벤트 루프에 양보하므로, 그 사이 체결/계정 갱신 이벤트가 도착해
+            # self.status를 이미 바꿔놓을 수 있다.
+            # dry-run은 유저 데이터 소켓을 열지 않아 ORDER_TRADE_UPDATE가 오지 않는다. 짝지을
+            # 상대가 없으므로 여기서 만들지 않고, 아래 dry-run 블록이 직접 스냅샷을 뜬다.
+            if self.recorder and not self.dry_run:
+                self._pending_decision = _PendingDecision(
+                    timestamp=candle.end_time,
+                    quantity=action.quantity,
+                    pre_status=copy.deepcopy(self.status),
+                )
+
+            # Execute action if callback is set
+            if self.on_action_callbacks:
+                await asyncio.gather(*[c(action) for c in self.on_action_callbacks])
+
+            if self.dry_run:
+                # 라이브에서는 거래소 체결(ACCOUNT_UPDATE)이 status를 갱신하지만, dry-run에는
+                # 체결이 없으므로 백테스터와 **같은** 회계를 직접 돌린다. 예전에는 자체 근사식이라
+                # 부분 청산에서 avg_price를 현재가로 덮어써 미실현을 날렸고 margin은 아예 갱신하지
+                # 않아서, dry-run 자본이 초기값에 영원히 고정됐다.
+                pre_status = copy.deepcopy(self.status)
+                wnl, fee = self.status.apply_fill(action.symbol, action.quantity, candle.close,
+                                                  self.fee_ratio)
+                leverage = self.status.update_leverage()
+                self.logger.info(f"[dry-run] filled symbol={action.symbol} qty={action.quantity} "
+                                 f"@ {candle.close} wnl={wnl:.4f} fee={fee:.4f} -> {self.status}")
+                if self.recorder:
+                    self.recorder.record_trade(action.symbol, candle.end_time, action.quantity,
+                                               candle.close, wnl, fee, pre_status, leverage)
+                    traded = True
 
         if self.recorder:
             # 체결이 있었으면 샤드까지 체크포인트한다 (라이브 체결 경로와 같은 정책).
@@ -551,9 +565,10 @@ class BinanceTrader:
                 # Process position updates — 해당 심볼 항목이 있을 때만
                 for position in (account_data.get('P') or []):
                     if position.get('s', '') == self.symbol:
-                        self.status.avg_price = float(position.get('ep', 0.0))  # entry price
-                        self.status.position = float(position.get('pa', 0.0))  # position amount
-                        self.status.unrealised_pnl = float(position.get('up', 0.0))  # unrealized
+                        pos = self.status.position_for(self.symbol)
+                        pos.avg_price = float(position.get('ep', 0.0))  # entry price
+                        pos.position = float(position.get('pa', 0.0))  # position amount
+                        pos.unrealised_pnl = float(position.get('up', 0.0))  # unrealized
                         self.status.update_leverage()
                         break
 
@@ -652,8 +667,8 @@ class BinanceTrader:
             # 수백 ms 뒤라, 집계 뷰(1h/1d)에서 원인이 된 캔들과 다른 버킷에 떨어질 수 있다.
             timestamp = pending.timestamp
 
-        self.recorder.record_trade(timestamp, quantity, agg.avg_price, agg.wnl, agg.fee,
-                                   pre_status, self.status.update_leverage())
+        self.recorder.record_trade(self.symbol, timestamp, quantity, agg.avg_price, agg.wnl,
+                                   agg.fee, pre_status, self.status.update_leverage())
         self.recorder.flush(force=True)
 
     async def _handle_stream_error_frame(self, data: dict, stream: str) -> bool:
@@ -730,24 +745,21 @@ class BinanceTrader:
                     position_info = position
                     break
 
+            pos = self.status.position_for(self.symbol)
             if position_info:
-                avg_price = float(position_info.get('entryPrice', 0.0))
-                position_size = float(position_info.get('positionAmt', 0.0))
-                unrealised_pnl = float(position_info.get('unrealizedProfit', 0.0))
-
                 # Update status with current position
-                self.status.avg_price = avg_price
-                self.status.unrealised_pnl = unrealised_pnl
+                pos.avg_price = float(position_info.get('entryPrice', 0.0))
+                pos.unrealised_pnl = float(position_info.get('unrealizedProfit', 0.0))
                 self.status.margin = margin_balance
-                self.status.position = position_size
+                pos.position = float(position_info.get('positionAmt', 0.0))
                 self.status.update_leverage()
 
             else:
                 # No position for this symbol
-                self.status.avg_price = 0.0
-                self.status.unrealised_pnl = 0.0
+                pos.avg_price = 0.0
+                pos.unrealised_pnl = 0.0
                 self.status.margin = margin_balance
-                self.status.position = 0.0
+                pos.position = 0.0
                 self.status.leverage = 0.0
 
             self.logger.info(f"successfully loaded status: {self.status}")
@@ -762,8 +774,9 @@ class BinanceTrader:
             self.logger.info("Pre-feeding indicators with historical data...")
 
             # Find maximum window size among all indicators
+            symbol_indicators = self.streamer.indicators.get(self.symbol, {})
             max_window = 0
-            for indicator_name, indicator in self.streamer.indicators.items():
+            for indicator_name, indicator in symbol_indicators.items():
                 max_window = max(max_window, indicator.window)
 
             if max_window == 0:
@@ -823,7 +836,7 @@ class BinanceTrader:
             # Convert to Candle objects and update indicators
             for candle in candles:
                 # Update all indicators
-                for indicator_name, indicator in self.streamer.indicators.items():
+                for indicator_name, indicator in symbol_indicators.items():
                     indicator.update(candle)
 
             s = ms_timestamp_to_datetime(start_datetime)
@@ -831,7 +844,7 @@ class BinanceTrader:
             self.logger.info(
                 f"Pre-fed indicators with {candle_count} historical candles: {s} ~ {e}")
 
-            self.logger.info(f"Pre-fed indicators: {generate_dict_string(self.streamer.indicators)}")
+            self.logger.info(f"Pre-fed indicators: {generate_dict_string(symbol_indicators)}")
 
         except Exception as e:
             self.logger.error(f"Failed to pre-feed indicators: {e}")
@@ -843,8 +856,8 @@ class BinanceTrader:
             self.logger.info(f"dry run: {action}")
 
         else:
-            # Execute order asynchronously
-            future = self._executor.execute_action(action, self.symbol)
+            # Execute order asynchronously. action.symbol이 대상 심볼이다.
+            future = self._executor.execute_action(action)
 
             # concurrent.futures.Future라서 .result()는 **블로킹**이다 — 코루틴 안에서 부르면
             # 유저 데이터 스트림을 포함한 이벤트 루프 전체가 최대 10초 멈춘다. wrap_future로 감싼다.

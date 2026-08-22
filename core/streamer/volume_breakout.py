@@ -1,5 +1,5 @@
 import logging
-from typing import Optional
+from typing import List, Optional
 
 from core.backtest.status import Status
 from core.streamer.action import Action
@@ -32,8 +32,8 @@ class VolumeConfirmedMomentumStreamer(MomentumTimeExitStreamer):
                          max_loss, fee_ratio, use_stop)
         self.min_vol_z = min_vol_z
         if min_vol_z is not None:
-            self.indicators["vol_MA"] = VolumeMovingAverage(vol_window)
-            self.indicators["vol_STD"] = VolumeRollingStd(vol_window)
+            self.indicators[symbol]["vol_MA"] = VolumeMovingAverage(vol_window)
+            self.indicators[symbol]["vol_STD"] = VolumeRollingStd(vol_window)
 
         self.logger = logging.getLogger(__name__)
         self.logger.info(
@@ -41,17 +41,19 @@ class VolumeConfirmedMomentumStreamer(MomentumTimeExitStreamer):
             f"[mom_lookback={mom_lookback},entry_threshold_pct={entry_threshold_pct},"
             f"hold_candles={hold_candles},vol_window={vol_window},min_vol_z={min_vol_z}]")
 
-    def decide_action(self, candle: Candle, status: Status) -> Action:
-        action = super().decide_action(candle, status)
+    def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
+        actions = super().decide_action(symbol, candle, status)
 
         # 플랫 상태의 진입 액션만 볼륨 게이트로 필터
-        if self.min_vol_z is not None and status.position == 0 and action.quantity != 0:
-            vol_ma = self.indicators["vol_MA"].get_latest()
-            vol_std = self.indicators["vol_STD"].get_latest()
+        position = status.position_for(symbol).position
+        if (self.min_vol_z is not None and position == 0
+                and actions and actions[0].quantity != 0):
+            vol_ma = self.indicators[symbol]["vol_MA"].get_latest()
+            vol_std = self.indicators[symbol]["vol_STD"].get_latest()
             if vol_ma is None or vol_std is None or vol_std <= 0:
-                return Action(0)
+                return []
             vol_z = (candle.volume - vol_ma) / vol_std
             if vol_z < self.min_vol_z:
-                return Action(0)
+                return []
 
-        return action
+        return actions

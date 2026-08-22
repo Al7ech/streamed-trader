@@ -1,3 +1,5 @@
+from typing import List
+
 from core.backtest.status import Status
 from core.streamer.action import Action
 from core.streamer.base_streamer import BaseStreamer
@@ -18,38 +20,41 @@ class CrossMovingAverageStreamer(BaseStreamer):
       마진이 음수로 떨어지지 않는다.
 
     `decide_action`이 반환하는 `Action`은 목표 포지션이 아니라 **현재 포지션에 더할 증감분**
-    이라는 점에 주의 (`target_qty - status.position`).
+    이라는 점에 주의 (`target_qty - position`).
     """
 
     def __init__(self, symbol: str, fee_ratio: float):
-        super().__init__({
+        super().__init__([symbol], {symbol: {
             "ma10": MovingAverage(10),
             "ma25": MovingAverage(25),
-        })
+        }})
         self.symbol = symbol
         self.fee_ratio = fee_ratio
 
-    def decide_action(self, candle: Candle, status: Status) -> Action:
-        ma10 = self.indicators["ma10"].get_latest()
-        ma25 = self.indicators["ma25"].get_latest()
-        prev_ma10 = self.indicators["ma10"].get_index(-2)
-        prev_ma25 = self.indicators["ma25"].get_index(-2)
+    def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
+        ind = self.indicators[symbol]
+        ma10 = ind["ma10"].get_latest()
+        ma25 = ind["ma25"].get_latest()
+        prev_ma10 = ind["ma10"].get_index(-2)
+        prev_ma25 = ind["ma25"].get_index(-2)
 
         # 워밍업 중에는 지표가 None이다 (MA25 기준 25봉 + 이전 값 1봉).
         if prev_ma10 is None or prev_ma25 is None or ma10 is None or ma25 is None:
-            return Action(0)
+            return []
+
+        position = status.position_for(symbol).position
 
         # 크로스가 발생할 때만 매수/매도
         if prev_ma10 <= prev_ma25 and ma10 > ma25:  # 골든크로스
-            target_qty = long_safe_qty(status.total_margin(), status.position, candle.close, 3,
+            target_qty = long_safe_qty(status.total_margin(), position, candle.close, 3,
                                        self.fee_ratio)
-            return Action(target_qty - status.position)
+            return [Action(symbol, target_qty - position)]
         if prev_ma10 >= prev_ma25 and ma10 < ma25:  # 데드크로스
-            target_qty = short_safe_qty(status.total_margin(), status.position, candle.close, 3,
+            target_qty = short_safe_qty(status.total_margin(), position, candle.close, 3,
                                         self.fee_ratio)
-            return Action(target_qty - status.position)
+            return [Action(symbol, target_qty - position)]
 
-        return Action(0)
+        return []
 
 
 def long_safe_qty(margin: float, position: float, price: float, ndigits: int, fee_ratio: float) -> float:

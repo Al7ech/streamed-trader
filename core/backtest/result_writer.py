@@ -6,9 +6,9 @@ Replaces the old CSV output. A single run produces:
   summary metrics (Sharpe / max-drawdown / win-rate / profit) and the (small) trade list,
   plus an index of the heavy time-series shards.
 - ``<result_path>/backtest/<run_id>.<YYYY-MM>.series.json`` — one month-bucketed columnar
-  shard per month, holding per-candle OHLC and indicator values. These are streamed out
-  during the backtest (see :class:`ShardWriter`) so they never all sit in memory at once, and
-  are loaded lazily/per-viewport by the frontend.
+  shard per month, holding per-candle OHLC and indicator values, nested per symbol. These are
+  streamed out during the backtest (see :class:`ShardWriter`) so they never all sit in memory
+  at once, and are loaded lazily/per-viewport by the frontend.
 
 Columnar (parallel arrays) encoding is used for the shards so column keys are not repeated per
 candle — this keeps them smaller than the old per-row CSV and faster to parse.
@@ -28,10 +28,17 @@ from core.backtest.report import Report
 
 # 2: added the top-level "benchmark" block (buy & hold curve) + summary.benchmark_profit_pct.
 # 3: added trades[].position (거래 **전** 포지션). 라이브 런은 재기동 시 자기 run JSON을 다시
-#    읽어 이어쓰는데, build_summary의 승패 판정이 Trade.status.position의 부호를 보므로 이게
-#    없으면 재개 후 승패 집계를 복원할 수 없다.
-# 둘 다 순수 additive — 프론트는 없는 블록의 UI를 숨기고 키를 골라 읽으므로 구 런도 그대로 로드된다.
-SCHEMA_VERSION = 3
+#    읽어 이어쓰는데, build_summary의 승패 판정이 그 심볼의 거래 전 포지션 부호를 보므로
+#    (v4부터는 Trade.status.position_for(symbol).position) 이게 없으면 재개 후 승패 집계를
+#    복원할 수 없다.
+# 4: 멀티심볼 — trades[]에 "symbol", series에 "symbols"(거래 대상 심볼 목록) 추가. 샤드의
+#    "ohlc"/"indicators"가 심볼별로 "symbols" 아래 중첩되고, "time"/"balance"(계좌 전체
+#    시가평가)는 최상위에 남는다 (증거금이 심볼 간 공유 풀이라 balance는 심볼별 값이 아니다).
+#    v1-v3 샤드의 평평한 ohlc/indicators 모양은 그대로 두고 건드리지 않는다 — 심볼 N개를
+#    평평한 ohlc dict 하나에 욱여넣으면 어느 심볼의 close인지 알 수 없어져 addition이 아니라
+#    네임스페이스 충돌이 되기 때문이다. summary에 by_symbol(심볼별 승패 집계)도 추가됐다.
+# 모두 순수 additive — 프론트는 없는 블록의 UI를 숨기고 키를 골라 읽으므로 구 런도 그대로 로드된다.
+SCHEMA_VERSION = 4
 
 # Columns whose empty/warm-up value should be stored as JSON null.
 _OHLC_KEYS = ("open", "high", "low", "close")
@@ -74,8 +81,19 @@ def read_shard(dir_path: str, file_name: str) -> Optional[Dict]:
         return None
 
 
+def _empty_symbol_buffer(indicator_names: List[str]) -> Dict:
+    return {
+        "ohlc": {k: [] for k in _OHLC_KEYS},
+        "indicators": {name: [] for name in indicator_names},
+    }
+
+
 class ShardWriter:
-    """Streams per-candle OHLC + indicator values into month-bucketed columnar JSON shards.
+    """Streams per-event OHLC + indicator values into month-bucketed columnar JSON shards.
+
+    한 "이벤트"는 하나 이상의 심볼이 같은 시각에 마감한 캔들들의 묶음이다 (멀티심볼 병합
+    타임라인의 단위, :func:`core.backtest.candle_merge.merge_candle_timeline` 참고). 이번
+    이벤트에 캔들이 없는 심볼은 그 행에서 OHLC/지표가 전부 null이 된다.
 
     Only the current month's columns are held in memory; a shard file is flushed whenever the
     month rolls over (and once more on :meth:`close`). :meth:`close` returns the shard index
@@ -84,13 +102,14 @@ class ShardWriter:
     라이브 레코더는 **같은 달 샤드를 여러 번** 써야 하므로 (프로세스가 몇 주씩 살아 있고 그
     사이 계속 체크포인트를 남긴다) 쓰기/인덱스 반영/버퍼 초기화가 분리돼 있다: :meth:`checkpoint`
     는 버퍼를 유지한 채 파일만 갱신하고, :meth:`_flush`는 거기에 버퍼 초기화를 더한 것이다.
-    백테스트는 캔들이 시간순이라 같은 달을 두 번 방문하지 않으므로 동작이 이전과 같다.
+    백테스트는 이벤트가 시간순이라 같은 달을 두 번 방문하지 않으므로 동작이 이전과 같다.
     """
 
-    def __init__(self, dir_path: str, run_id: str, indicator_names: List[str],
-                 has_ohlc: bool, interval_ms: int):
+    def __init__(self, dir_path: str, run_id: str, symbols: List[str],
+                 indicator_names: List[str], has_ohlc: bool, interval_ms: int):
         self.dir_path = dir_path
         self.run_id = run_id
+        self.symbols = symbols
         self.indicator_names = indicator_names
         self.has_ohlc = has_ohlc
         self.interval_ms = interval_ms
@@ -99,7 +118,7 @@ class ShardWriter:
         self._reset_buffers()
 
     @classmethod
-    def resume(cls, dir_path: str, run_id: str, indicator_names: List[str],
+    def resume(cls, dir_path: str, run_id: str, symbols: List[str], indicator_names: List[str],
                has_ohlc: bool, interval_ms: int, shards: List[Dict]) -> "ShardWriter":
         """이전 실행이 남긴 샤드 인덱스로 writer를 복원한다 (라이브 런 재개 전용).
 
@@ -107,7 +126,7 @@ class ShardWriter:
         달이 바뀌면 원본 그대로 flush한 뒤 새 달로 넘어간다. 마지막 샤드가 유실/손상이면
         그 달의 꼬리를 포기하고 (차트에 구멍이 남는다) 빈 버퍼로 이어간다.
         """
-        writer = cls(dir_path, run_id, indicator_names, has_ohlc, interval_ms)
+        writer = cls(dir_path, run_id, symbols, indicator_names, has_ohlc, interval_ms)
         if not shards:
             return writer
         writer.shards = list(shards[:-1])
@@ -120,36 +139,55 @@ class ShardWriter:
         writer._time = list(shard["time"])
         n = len(writer._time)
         writer._month = _month_key(writer._time[0])
-        if has_ohlc:
-            ohlc = shard.get("ohlc") or {}
-            writer._ohlc = {k: list(ohlc.get(k) or [None] * n) for k in _OHLC_KEYS}
-        # 지표 구성이 바뀐 채로 재개하는 것은 상위(LiveRecorder)에서 막지만, 방어적으로
-        # 현재 컬럼 집합에 맞춰 정렬한다 — 없던 컬럼은 그 구간만 null이 된다.
-        saved = shard.get("indicators") or {}
-        writer._ind = {name: list(saved.get(name) or [None] * n) for name in indicator_names}
+        writer._balance = list(shard.get("balance") or [None] * n)
+        saved_symbols = shard.get("symbols") or {}
+        for sym in symbols:
+            saved = saved_symbols.get(sym) or {}
+            if has_ohlc:
+                ohlc = saved.get("ohlc") or {}
+                writer._symbols[sym]["ohlc"] = {k: list(ohlc.get(k) or [None] * n)
+                                                for k in _OHLC_KEYS}
+            # 지표 구성이 바뀐 채로 재개하는 것은 상위(LiveRecorder)에서 막지만, 방어적으로
+            # 현재 컬럼 집합에 맞춰 정렬한다 — 없던 컬럼은 그 구간만 null이 된다.
+            saved_ind = saved.get("indicators") or {}
+            writer._symbols[sym]["indicators"] = {name: list(saved_ind.get(name) or [None] * n)
+                                                  for name in indicator_names}
         return writer
 
     def _reset_buffers(self) -> None:
         self._time: List[int] = []
-        self._ohlc: Dict[str, List[float]] = {k: [] for k in _OHLC_KEYS}
-        self._ind: Dict[str, List[Optional[float]]] = {name: [] for name in self.indicator_names}
+        self._balance: List[Optional[float]] = []
+        self._symbols: Dict[str, Dict] = {sym: _empty_symbol_buffer(self.indicator_names)
+                                          for sym in self.symbols}
 
-    def add(self, candle, indicator_values: Dict[str, Optional[float]]) -> None:
-        key = _month_key(candle.end_time)
+    def add(self, time_ms: int, balance: float,
+            symbol_data: Dict[str, Tuple[object, Dict[str, Optional[float]]]]) -> None:
+        """이벤트 하나를 적재한다.
+
+        :param time_ms: 이벤트 시각 (병합 타임라인의 end_time).
+        :param balance: 이 이벤트 시점의 계좌 전체 시가평가 자본 (margin + Σ unrealised_pnl).
+        :param symbol_data: 이번 이벤트에 캔들이 마감한 심볼만 담는다 — ``{symbol: (candle,
+            indicator_values)}``. 나머지 심볼은 이 행에서 OHLC/지표가 전부 null이 된다.
+        """
+        key = _month_key(time_ms)
         if self._month is None:
             self._month = key
         elif key != self._month:
             self._flush()
             self._month = key
 
-        self._time.append(candle.end_time)
-        if self.has_ohlc:
-            self._ohlc["open"].append(candle.open)
-            self._ohlc["high"].append(candle.high)
-            self._ohlc["low"].append(candle.low)
-            self._ohlc["close"].append(candle.close)
-        for name in self.indicator_names:
-            self._ind[name].append(_clean_value(indicator_values.get(name)))
+        self._time.append(time_ms)
+        self._balance.append(_clean_value(balance))
+        for sym in self.symbols:
+            buf = self._symbols[sym]
+            data = symbol_data.get(sym)
+            candle = data[0] if data else None
+            values = data[1] if data else {}
+            if self.has_ohlc:
+                for k in _OHLC_KEYS:
+                    buf["ohlc"][k].append(getattr(candle, k) if candle is not None else None)
+            for name in self.indicator_names:
+                buf["indicators"][name].append(_clean_value(values.get(name)))
 
     def _write_current(self) -> Optional[Dict]:
         """현재 월 버퍼를 파일로 쓰고 인덱스 엔트리를 돌려준다 (버퍼는 유지). 비었으면 None."""
@@ -161,10 +199,13 @@ class ShardWriter:
             "end": self._time[-1],
             "interval_ms": self.interval_ms,
             "time": self._time,
+            "balance": self._balance,
+            "symbols": {
+                sym: ({"ohlc": buf["ohlc"], "indicators": buf["indicators"]} if self.has_ohlc
+                     else {"indicators": buf["indicators"]})
+                for sym, buf in self._symbols.items()
+            },
         }
-        if self.has_ohlc:
-            shard["ohlc"] = self._ohlc
-        shard["indicators"] = self._ind
         _write_json(os.path.join(self.dir_path, file_name), shard)
         return {"file": file_name, "start": self._time[0], "end": self._time[-1]}
 
@@ -172,7 +213,7 @@ class ShardWriter:
         """같은 파일의 기존 엔트리를 갈아끼우고, 없으면 append.
 
         라이브는 같은 달을 여러 번 쓰므로 무조건 append하면 인덱스에 중복이 쌓인다. 백테스트는
-        캔들이 시간순이라 같은 달을 두 번 방문하지 않아 항상 append로 퇴화한다.
+        이벤트가 시간순이라 같은 달을 두 번 방문하지 않아 항상 append로 퇴화한다.
         """
         for i, s in enumerate(self.shards):
             if s["file"] == entry["file"]:
@@ -218,14 +259,20 @@ def _clean_column(values: Sequence) -> List[Optional[float]]:
 
 
 def write_series_shards(dir_path: str, run_id: str, times: Sequence[int],
-                        ohlc: Optional[Dict[str, Sequence[float]]],
-                        indicators: Dict[str, Sequence], interval_ms: int) -> List[Dict]:
+                        balance: Sequence[float],
+                        symbol_columns: Dict[str, Dict[str, Optional[Dict[str, Sequence]]]],
+                        interval_ms: int, has_ohlc: bool) -> List[Dict]:
     """Bulk counterpart of :class:`ShardWriter`: writes the same month-bucketed columnar shard
     files from whole-run columns (numpy arrays or lists) in one pass after the backtest loop.
 
-    ``indicators`` columns must already hold decide-time values (i.e. the value the streamer saw
-    for that candle, which excludes the candle itself). Returns the same shard index as
-    ``ShardWriter.close()``.
+    :param symbol_columns: ``{symbol: {"ohlc": {...} or None, "indicators": {...}}}``, every
+        array the same length as ``times``. Indicator columns must already hold decide-time
+        values (i.e. the value the streamer saw for that event, which excludes the event's own
+        candle for that symbol unless the indicator opted into ``updates_before_decide``).
+    :param has_ohlc: whether to embed OHLC per symbol (mirrors ``symbol_columns[*]["ohlc"]``
+        being non-None).
+
+    Returns the same shard index as ``ShardWriter.close()``.
     """
     n = len(times)
     if n == 0:
@@ -258,20 +305,25 @@ def write_series_shards(dir_path: str, run_id: str, times: Sequence[int],
             "end": month_times[-1],
             "interval_ms": interval_ms,
             "time": month_times,
+            "balance": _clean_column(balance[lo:hi]),
+            "symbols": {},
         }
-        if ohlc is not None:
-            shard["ohlc"] = {k: np.asarray(v[lo:hi], dtype=np.float64).tolist()
-                             for k, v in ohlc.items()}
-        shard["indicators"] = {name: _clean_column(col[lo:hi]) for name, col in indicators.items()}
+        for sym, cols in symbol_columns.items():
+            entry = {"indicators": {name: _clean_column(col[lo:hi])
+                                    for name, col in cols["indicators"].items()}}
+            if has_ohlc and cols.get("ohlc") is not None:
+                entry["ohlc"] = {k: np.asarray(v[lo:hi], dtype=np.float64).tolist()
+                                 for k, v in cols["ohlc"].items()}
+            shard["symbols"][sym] = entry
         _write_json(os.path.join(dir_path, file_name), shard)
         shards.append({"file": file_name, "start": month_times[0], "end": month_times[-1]})
     return shards
 
 
 def _downsample_equity(equity_curve: Sequence, max_points: int = 2000) -> Optional[Dict]:
-    """Uniform-stride downsample of the per-candle equity curve (always keeping the last
+    """Uniform-stride downsample of the per-event equity curve (always keeping the last
     point) into a small columnar block for the run JSON — the frontend timeline sparkline
-    needs the whole run's balance at once, while the accurate per-candle series lives in the
+    needs the whole run's balance at once, while the accurate per-event series lives in the
     lazily-loaded shards."""
     n = len(equity_curve)
     if n == 0:
@@ -305,6 +357,16 @@ def _sharpe_sampling(interval_ms: int) -> Tuple[int, float]:
     return sample_every, periods_per_year
 
 
+def _win_lose_counts(trades) -> Tuple[int, int, int]:
+    """승패는 **실현이 일어난 체결**만 센다. 순수 진입은 wnl=0인데 수수료는 붙으므로 그냥
+    (wnl - fee)로 재면 진입이 전부 패배로 집계된다. 거래 전 스냅샷의 포지션과 체결 수량의
+    부호가 반대면 축소 또는 방향 전환 = 실현이 발생한 체결이다."""
+    closes = [t for t in trades if t.status.position_for(t.symbol).position * t.quantity < 0]
+    wins = sum(1 for t in closes if t.wnl - t.fee > 0)
+    losses = sum(1 for t in closes if t.wnl - t.fee < 0)
+    return wins, losses, wins + losses
+
+
 def build_summary(report: Report, init_margin: float, interval_ms: int = 0) -> Dict:
     """Compute the summary block from the in-memory Report (reuses metrics.py).
 
@@ -312,22 +374,33 @@ def build_summary(report: Report, init_margin: float, interval_ms: int = 0) -> D
     ``profit_pct`` (percent, x100), None when the run has no benchmark so the frontend can tell
     "no data" from "0%".
 
+    ``by_symbol``은 심볼별 승패 집계를 추가로 담는다 — 위 aggregate 수치는 전 심볼 합산으로
+    그대로 유지된다.
+
     ``interval_ms``는 Sharpe의 리샘플 간격을 캔들 간격에 맞추는 데 쓴다. 0이면 예전 기본값
     (1분봉 가정)으로 되돌아간다.
     """
-    # 승패는 **실현이 일어난 체결**만 센다. 순수 진입은 wnl=0인데 수수료는 붙으므로 그냥
-    # (wnl - fee)로 재면 진입이 전부 패배로 집계된다. 거래 전 스냅샷의 포지션과 체결 수량의
-    # 부호가 반대면 축소 또는 방향 전환 = 실현이 발생한 체결이다.
-    closes = [t for t in report.trades if t.status.position * t.quantity < 0]
-    wins = sum(1 for t in closes if t.wnl - t.fee > 0)
-    losses = sum(1 for t in closes if t.wnl - t.fee < 0)
-    total = wins + losses
+    wins, losses, total = _win_lose_counts(report.trades)
     final_margin = report.status.total_margin()
     benchmark_profit_pct = (
         (report.benchmark_curve[-1][1] / init_margin - 1) * 100
         if report.benchmark_curve and init_margin
         else None
     )
+
+    by_symbol: Dict[str, Dict] = {}
+    trades_by_symbol: Dict[str, List] = {}
+    for t in report.trades:
+        trades_by_symbol.setdefault(t.symbol, []).append(t)
+    for symbol, trades in trades_by_symbol.items():
+        s_wins, s_losses, s_total = _win_lose_counts(trades)
+        by_symbol[symbol] = {
+            "win_trades": s_wins,
+            "lose_trades": s_losses,
+            "total_trades": s_total,
+            "win_rate": (s_wins / s_total) if s_total else 0.0,
+        }
+
     return {
         "max_leverage": report.max_leverage,
         "final_margin": final_margin,
@@ -337,23 +410,26 @@ def build_summary(report: Report, init_margin: float, interval_ms: int = 0) -> D
         "lose_trades": losses,
         "total_trades": total,
         "win_rate": (wins / total) if total else 0.0,
+        "by_symbol": by_symbol,
         "sharpe": compute_sharpe(report.equity_curve, *_sharpe_sampling(interval_ms)),
         "max_drawdown": compute_max_drawdown(report.equity_curve),
     }
 
 
 def write_run_json(dir_path: str, run_id: str, report: Report, metadata: Dict,
-                   shards: List[Dict], columns: List[str], column_groups: Dict[str, str],
-                   has_ohlc: bool, interval_ms: int, init_margin: float) -> str:
+                   shards: List[Dict], symbols: List[str], columns: List[str],
+                   column_groups: Dict[str, str], has_ohlc: bool, interval_ms: int,
+                   init_margin: float) -> str:
     """Assemble and write the run JSON. Returns the written file path.
 
-    ``report.benchmark_curve`` (buy & hold of the traded symbol, same length and timestamps as
-    ``report.equity_curve``) is written as a sibling ``benchmark`` block so the frontend can
-    overlay it on the equity chart without loading the heavy series shards.
+    ``report.benchmark_curve`` (동일가중 포트폴리오 buy & hold, equity_curve와 같은 길이/
+    타임스탬프)는 프론트가 시리즈 샤드를 불러오지 않고도 자본 곡선에 겹쳐 그릴 수 있도록
+    별도 ``benchmark`` 블록으로 쓴다.
     """
     trades = [
         {
             "timestamp": t.timestamp,
+            "symbol": t.symbol,
             "quantity": t.quantity,
             "price": t.price,
             "wnl": t.wnl,
@@ -361,7 +437,7 @@ def write_run_json(dir_path: str, run_id: str, report: Report, metadata: Dict,
             "margin": t.status.total_margin(),
             # 거래 **전** 포지션. build_summary의 승패 판정이 이 부호를 보므로, 라이브 런이
             # 재기동 후 자기 run JSON에서 Trade를 복원할 때 이게 없으면 집계가 무너진다.
-            "position": t.status.position,
+            "position": t.status.position_for(t.symbol).position,
             "leverage": t.leverage,
         }
         for t in report.trades
@@ -377,6 +453,7 @@ def write_run_json(dir_path: str, run_id: str, report: Report, metadata: Dict,
         "benchmark": _downsample_equity(report.benchmark_curve),
         "trades": trades,
         "series": {
+            "symbols": symbols,
             "columns": columns,
             "column_groups": column_groups,
             "has_ohlc": has_ohlc,

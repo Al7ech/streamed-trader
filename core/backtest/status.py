@@ -1,47 +1,61 @@
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
+
+@dataclass
+class PositionState:
+    """한 심볼의 포지션 상태. ``Status.margin``은 전 심볼이 공유하는 증거금 풀이라 여기 없다."""
+    avg_price: float = 0.0
+    position: float = 0.0
+    unrealised_pnl: float = 0.0
 
 
 class Status:
     def __init__(self,
-                 avg_price: float = 0.0,
-                 unrealised_pnl: float = 0.0,
                  margin: float = 0.0,
-                 position: float = 0.0,
-                 leverage: float = 0.0):
-        self.avg_price = avg_price
+                 positions: Optional[Dict[str, PositionState]] = None,
+                 leverage: float = 0.0,
+                 last_close: Optional[Dict[str, float]] = None):
         self.margin = margin
-        self.unrealised_pnl = unrealised_pnl
-
-        self.position = position
+        self.positions: Dict[str, PositionState] = positions if positions is not None else {}
         self.leverage = leverage
+        #: 심볼별 최근 알려진 종가. 엔진이 매 이벤트마다 갱신한다 — 트리거 심볼이 아닌
+        #: 다른 심볼을 대상으로 하는 Action의 체결가/시가평가에 쓰인다.
+        self.last_close: Dict[str, float] = last_close if last_close is not None else {}
 
-    def total_margin(self):
-        return self.margin + self.unrealised_pnl
+    def position_for(self, symbol: str) -> PositionState:
+        """해당 심볼의 PositionState. 처음 보는 심볼이면 flat 상태로 만들어 등록한다."""
+        return self.positions.setdefault(symbol, PositionState())
 
-    def update_unrealised_pnl(self, price: float) -> float:
-        self.unrealised_pnl = self.position * (price - self.avg_price)
-        return self.unrealised_pnl
+    def total_margin(self) -> float:
+        return self.margin + sum(p.unrealised_pnl for p in self.positions.values())
+
+    def update_unrealised_pnl(self, symbol: str, price: float) -> float:
+        p = self.position_for(symbol)
+        p.unrealised_pnl = p.position * (price - p.avg_price)
+        return p.unrealised_pnl
 
     def update_leverage(self) -> float:
-        """실효 레버리지 = 명목가치(평단 기준) / 시가평가 자본.
+        """실효 레버리지 = 전 심볼 명목가치(평단 기준) 합 / 시가평가 자본.
 
         분모는 margin이 아니라 total_margin()이다. margin만 쓰면 미실현손익이 빠져서, 수수료로
         margin이 음수가 된 순간 비율이 음수가 되고 그게 max(0.0, ...)에 눌려 **파산이 레버리지
         0으로 보고되는** 문제가 있었다. 자본을 분모로 두면 그 퇴화가 원천 제거된다 — 강제청산이
         자본 0 이하에서 걸리므로 포지션이 열려 있는 한 분모는 양수다.
 
-        값이 달라지는 것은 같은 방향 증량 체결뿐이다: 이 함수는 체결 직후에만 불리는데,
-        flat에서의 신규 진입은 미실현이 0이라 margin == total_margin()이고 전량 청산은
-        position이 0이다. 손익 계산에는 쓰이지 않는 보고 전용 값이다.
+        마진이 공유 풀이므로 레버리지는 계좌 전체 기준이다: 각 심볼의 명목가치를 더해 하나의
+        분자로 쓴다.
         """
         equity = self.total_margin()
         if equity <= 0.0:
             self.leverage = 0.0
         else:
-            self.leverage = self.avg_price * abs(self.position) / equity
+            notional = sum(p.avg_price * abs(p.position) for p in self.positions.values())
+            self.leverage = notional / equity
         return self.leverage
 
-    def apply_fill(self, quantity: float, price: float, fee_ratio: float) -> Tuple[float, float]:
+    def apply_fill(self, symbol: str, quantity: float, price: float,
+                    fee_ratio: float) -> Tuple[float, float]:
         """체결 하나를 이 Status에 반영한다. 반환값은 (wnl, fee).
 
         백테스터(``SingleThreadedBacktester._trade``)와 라이브 트레이더의 dry-run 경로가
@@ -49,58 +63,65 @@ class Status:
         부분 청산에서 avg_price를 현재가로 덮어쓰고 margin을 아예 갱신하지 않았다.
 
         ``wnl``은 **수수료 차감 전** 실현손익이고 ``fee``는 별도로 반환한다. margin에는 둘 다
-        반영된다(실현손익 가산 후 수수료 차감).
+        반영된다(실현손익 가산 후 수수료 차감). margin은 전 심볼이 공유하는 증거금 풀이라
+        어느 심볼의 체결이든 같은 ``self.margin``을 갱신한다 — 심볼별로 분리되는 것은
+        position/avg_price/unrealised_pnl 뿐이다.
 
+        :param symbol: 체결이 일어난 심볼.
         :param quantity: 현재 포지션에 더할 부호 있는 수량 (양수=매수, 음수=매도)
         :param price: 체결가
         :param fee_ratio: 명목가치에 곱할 수수료율
         """
+        p = self.position_for(symbol)
         qty = quantity
         wnl = 0.0
         fee = price * abs(qty) * fee_ratio
 
         # 신규 진입 (롱/숏 방향 동일하게 처리)
-        if self.position == 0.0:
-            self.avg_price = price
-            self.position = qty
+        if p.position == 0.0:
+            p.avg_price = price
+            p.position = qty
 
         # 같은 방향 추가 진입 (롱/숏)
-        elif (self.position > 0 and qty > 0) or (self.position < 0 and qty < 0):
-            total_cost = abs(self.avg_price * self.position) + abs(price * qty)
-            total_pos = self.position + qty
-            self.avg_price = total_cost / abs(total_pos)
-            self.position = total_pos
+        elif (p.position > 0 and qty > 0) or (p.position < 0 and qty < 0):
+            total_cost = abs(p.avg_price * p.position) + abs(price * qty)
+            total_pos = p.position + qty
+            p.avg_price = total_cost / abs(total_pos)
+            p.position = total_pos
             # margin, unrealised_pnl는 변동 없음
 
         # 반대 방향 청산(부분/전부)
         else:
-            if abs(qty) > abs(self.position):
+            if abs(qty) > abs(p.position):
                 # 방향 전환: 기존 포지션 청산 후 신규 진입
-                open_qty = qty + self.position
+                open_qty = qty + p.position
 
-                wnl = self.unrealised_pnl
+                wnl = p.unrealised_pnl
                 # PNL/margin 계산 (전부 청산)
-                self.avg_price = price
-                self.margin += self.unrealised_pnl
-                self.unrealised_pnl = 0.0
-                self.position = open_qty
+                p.avg_price = price
+                self.margin += p.unrealised_pnl
+                p.unrealised_pnl = 0.0
+                p.position = open_qty
             else:
                 # 부분 청산 (수량이 정확히 같으면 비율이 1이라 전량 청산이 된다)
                 closed_qty = qty
-                realised_pnl = self.unrealised_pnl * (-closed_qty / self.position)
+                realised_pnl = p.unrealised_pnl * (-closed_qty / p.position)
 
                 wnl = realised_pnl
                 # avg_price는 변동 없음
                 self.margin += realised_pnl
-                self.unrealised_pnl -= realised_pnl
-                self.position += closed_qty
+                p.unrealised_pnl -= realised_pnl
+                p.position += closed_qty
 
-        if self.position == 0.0:
-            self.avg_price = 0.0
+        if p.position == 0.0:
+            p.avg_price = 0.0
 
         self.margin -= fee
 
         return wnl, fee
 
     def __repr__(self):
-        return f"[margin: {self.margin}, avg_price: {self.avg_price}, unrealised_pnl: {self.unrealised_pnl}, position: {self.position}, leverage: {self.leverage}]"
+        positions = ", ".join(f"{sym}: [avg_price: {p.avg_price}, position: {p.position}, "
+                              f"unrealised_pnl: {p.unrealised_pnl}]"
+                              for sym, p in self.positions.items())
+        return f"[margin: {self.margin}, leverage: {self.leverage}, positions: {{{positions}}}]"

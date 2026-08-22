@@ -93,9 +93,9 @@ class BaseIndicator(ABC):
         Update the indicator with a new candle.
 
         ``status`` is the pre-trade account snapshot — the same one ``decide_action`` saw for
-        this candle (on an entry candle, ``status.position`` is still 0). During the live
-        trader's indicator prefeed the historical status is unknown and ``None`` is passed,
-        so status-aware indicators must treat ``None`` as warm-up.
+        this candle (on an entry candle, ``status.position_for(symbol).position`` is still 0).
+        During the live trader's indicator prefeed the historical status is unknown and ``None``
+        is passed, so status-aware indicators must treat ``None`` as warm-up.
         """
         pass
 
