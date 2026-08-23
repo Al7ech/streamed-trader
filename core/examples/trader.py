@@ -11,8 +11,11 @@ import os
 
 from dotenv import load_dotenv
 
+from core.logging_config import setup_logging
 from core.streamer.keltner_streamer import KeltnerStreamer
 from core.trader.BinanceTrader import BinanceTrader
+
+logger = logging.getLogger(__name__)
 
 
 async def main():
@@ -21,10 +24,7 @@ async def main():
     load_dotenv()
 
     # Configure logging. LOG_LEVEL은 이름(DEBUG/INFO/...) 또는 숫자 모두 허용.
-    LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
-    logging.basicConfig(level=LOG_LEVEL, format="[%(levelname)s] %(name)s:%(lineno)d %(message)s")
-    logging.getLogger("websockets.client").setLevel(logging.INFO)
-    logging.getLogger("binance.ws.reconnecting_websocket").setLevel(logging.INFO)
+    setup_logging()
 
     # Configuration from environment variables
     API_KEY = os.getenv("API_KEY")
@@ -78,23 +78,26 @@ async def main():
     )
 
     try:
-        # Start the trader
-        print("Starting BinanceTrader...")
+        # Start the trader.
+        # 프로세스 생명주기는 로그 스트림에 남아야 한다 — print로 stdout에 흘리면 도커
+        # 로그에서 레벨도 타임스탬프도 없이 로그 사이에 섞여, 정작 "언제 죽고 언제 살아났나"를
+        # 사후에 읽을 수 없다.
+        logger.info("Starting BinanceTrader...")
         await trader.start()
 
         # Keep running. is_running을 봐야 리스너가 치명적 오류로 stop()을 부른 뒤 프로세스가
         # 빠져나온다 (docker의 restart: always가 재기동할 수 있게).
-        print("Trader is running. Press Ctrl+C to stop.")
+        logger.info("Trader is running. Press Ctrl+C to stop.")
         while trader.is_running:
             await asyncio.sleep(1)
-        print("Trader is no longer running.")
+        logger.warning("Trader is no longer running.")
 
     except KeyboardInterrupt:
-        print("\nStopping trader...")
+        logger.info("Stopping trader...")
     finally:
         # Cleanup
         await trader.stop()
-        print("Trader stopped.")
+        logger.info("Trader stopped.")
 
 
 def run():

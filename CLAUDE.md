@@ -220,10 +220,43 @@ buffer reset, since a live process rewrites one month's shard for weeks.
   is exchange truth, so funding fees, other symbols' PnL and deposits/withdrawals move the curve
   with no corresponding `Trade` and `Σ(wnl - fee)` will not reconcile with the equity delta;
   `BinanceExecutor.execute_action` does not quantize to step size, so the filled quantity can differ
-  from the requested action; prefeed candles are not recorded, so live indicator columns have no
+  from the requested action (`_record_live_fill` warns past
+  `_QUANTITY_DIVERGENCE_TOLERANCE`, 1%, so the size of that drift is visible rather than
+  merely expected); prefeed candles are not recorded, so live indicator columns have no
   NaN warm-up prefix; `update_unrealised_pnl` marks with last price while the exchange marks with
   mark price; and BNB-denominated commissions (`N` != margin asset) are excluded from `fee` and
   flagged as `metadata.fee_asset_mismatch`.
+
+### Logging (`core/logging_config.py`)
+
+Every entry point calls `setup_logging()` before doing anything else — `core/examples/trader.py`,
+`core/examples/backtest.py`, `core/backtest_fast_check.py` and `core/fetch_stock_check.py`. It is
+the only place `logging.basicConfig` is called. Without it, `logger.info` from the fetchers and
+backtester is dropped entirely and `WARNING`+ falls through to Python's `logging.lastResort`
+handler, which prints a bare message with no level, logger name or timestamp — which is how the
+two warnings that decide whether a backtest is trustworthy (a month chunk with a data gap in
+`candle_fetcher/base.py`, a Sharpe truncated at bankruptcy in `backtest/metrics.py`) used to come
+out, as anonymous lines between tqdm bars.
+
+Level resolution is `level` argument > `LOG_LEVEL` env var > the entry point's `default` (INFO for
+the trader and backtest, WARNING for the two check scripts, whose verdicts are printed). The
+format carries `asctime` because the live trader is a weeks-long process that docker restarts on
+every crash, and omits `lineno` because it churns with every edit and breaks grep patterns.
+
+Level guidance for the live path: `INFO` is the operational narrative (startup config, fills,
+account updates that actually changed something, order submission) and is intended to stay
+readable for a process that runs for weeks. `DEBUG` adds one line per candle carrying
+candle/action/status/indicators — it is guarded by `isEnabledFor`, since `generate_dict_string`
+walks every indicator and would otherwise run on every candle just to have its result discarded.
+Broad `except` blocks in the message handlers use `logger.exception`, not `logger.error`: they
+catch bugs, and a one-line message with no traceback is not enough to find one.
+
+Log records go to **stderr** and every tqdm progress bar is pinned to **stdout**
+(`file=sys.stdout` in both backtesters and both Binance fetchers), so a warning raised
+mid-fetch no longer shreds the bar it prints through. Library code under `core/` logs;
+it does not `print`. The remaining `print` calls are deliberate CLI report output —
+`examples/backtest.py`'s result summary and the two `*_check.py` verdicts — which is why
+those two scripts default to WARNING.
 
 ### Streamer/indicator strategy framework (`core/streamer/`)
 
@@ -314,7 +347,9 @@ PnL **before** the fee, which is carried separately in `fee`. `Report` bundles a
 - `BinanceTrader` is asyncio-based: it opens a futures kline websocket (and, unless `dry_run`, a
   futures user-data websocket) via `ReliableWebsocket` (a thin wrapper around python-binance's
   `ReconnectingWebsocket` that recovers from a dropped `recv()` by closing/reconnecting the
-  delegate). On each *closed* kline it builds a `Candle`, calls the streamer, updates indicators,
+  delegate, logging both the failure and the recovery with a running `reconnects` count —
+  a reconnect an hour and a reconnect a minute are very different operationally, and only
+  logging the failures made that impossible to read off the log). On each *closed* kline it builds a `Candle`, calls the streamer, updates indicators,
   and fires registered action/error callbacks (`add_action_callback`/`add_error_callback`).
   `_prefeed_indicators()` backfills each indicator's window with historical candles (via
   `BinanceCandleFetcher`, off the event loop through `asyncio.to_thread`) before going live,
@@ -325,7 +360,21 @@ PnL **before** the fee, which is carried separately in `fee`. `Report` bundles a
     user-data queue can't overflow during a long backfill), sets `is_running = True` *before*
     spawning listener tasks (they loop on that flag), and **re-raises** on failure — a trader that
     could not start must not look like one that did. Listener tasks are kept in `self._tasks` so
-    asyncio can't garbage-collect them mid-flight.
+    asyncio can't garbage-collect them mid-flight. On success it logs one line naming the whole
+    configuration — mode (LIVE/DRY-RUN), symbol, interval, testnet, streamer, fee ratio, run id.
+    `dry_run` appears nowhere else in the log, so without it a strategy that goes days without
+    trading gives no way to tell whether real money is at stake.
+  - `_check_candle_continuity` warns when a closed kline is not exactly one interval after the
+    previous one (missed candles, a replayed candle, or a candle off the interval grid). A gap
+    raises no exception — `ReliableWebsocket` only recovers from a throwing `recv()` — so nothing
+    crashes, `restart: always` never fires, and the log just goes quiet, while the hole propagates
+    into every rolling-window indicator and into the recorded series. It compares
+    `start_time + interval_ms`, not `end_time`, because a websocket kline's `T` is
+    `start + interval - 1` (the fetcher's `end_time` is exclusive; the stream's is not).
+  - `_reconcile_resumed_position` (live only) compares the position the resumed run remembers
+    (`LiveRecorder.resumed_status`) against the exchange's actual position and warns when they
+    differ — a liquidation/ADL, a manual order, or a fill event missed while the process was
+    down. It only reports: live `Status` is exchange truth and is left alone.
   - In `dry_run` mode: margin starts at a fixed synthetic `1e6`, no user-data socket is opened and
     no orders are sent; fills are applied locally through `Status.apply_fill` with the streamer's
     `fee_ratio`, which is the same accounting the backtester runs.

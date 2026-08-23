@@ -15,6 +15,7 @@ import numpy as np
 from dotenv import load_dotenv
 
 from core.backtest.FastBacktester import FastBacktester
+from core.logging_config import setup_logging
 from core.stock_candle_fetcher import nyse_session
 from core.stock_candle_fetcher.massive_fetcher import MassiveStockFetcher
 from core.streamer.keltner_streamer import KeltnerStreamer
@@ -37,6 +38,9 @@ def parse_args():
 
 def main():
     load_dotenv()
+    # 페처의 경고(합성봉 비율, 세션 그리드 밖 캔들, 액면분할로 인한 캐시 폐기)가 형식을
+    # 갖춰 나오게 한다. 판정은 아래 print가 하므로 기본은 조용한 쪽으로 둔다.
+    setup_logging(default="WARNING")
     symbol, start, end = parse_args()
     interval = "1m"
     print(f"=== {symbol} {interval} | {start} ~ {end} ===\n")

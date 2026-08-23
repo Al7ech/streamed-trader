@@ -1,10 +1,13 @@
 import io
+import logging
 import os
 import pickle
 from datetime import datetime
 from typing import List
 
 from core.streamer import Candle
+
+_logger = logging.getLogger(__name__)
 
 
 class PickleStorage:
@@ -38,7 +41,8 @@ class PickleStorage:
             candles = pickle.load(f)
 
         if verbose:
-            print(f"Loaded {os.path.basename(file_path)} in {(datetime.now() - start_time).total_seconds() * 1000}ms")
+            _logger.info("loaded %s in %.0fms", os.path.basename(file_path),
+                         (datetime.now() - start_time).total_seconds() * 1000)
 
         # 타입 힌트 만족을 위한 간단한 검증 (선택적)
         if not isinstance(candles, list):

@@ -83,7 +83,19 @@ class BaseCandleFetcher(ABC):
                 missing_months.append(month)
         if loaded_chunks:
             elapsed_ms = (datetime.now() - load_start).total_seconds() * 1000
-            print(f"Loaded {loaded_chunks} cached month chunk(s) from {chunk_dir} in {elapsed_ms:.0f}ms")
+            self.logger.info("loaded %d cached month chunk(s) from %s in %.0fms",
+                             loaded_chunks, chunk_dir, elapsed_ms)
+        # 무엇을 새로 받는지 남긴다. 예전에는 캐시에서 몇 개를 읽었는지만 찍어서, 백테스트가
+        # 몇 분씩 멈춰 있을 때 어느 달을 받는 중인지 (혹은 뭔가에 걸린 건지) 알 수 없었다.
+        if delta_months:
+            self.logger.info("delta-fetching in-progress month(s): %s",
+                             self._format_months(delta_months))
+        # available_until 이후의 달은 아래 루프가 통째로 건너뛴다 (아직 데이터가 없는 구간).
+        # 그것까지 "fetching"이라고 찍으면 실제로는 아무것도 받지 않으면서 받는 척하게 된다.
+        fetchable = [m for m in missing_months if m < available_until]
+        if fetchable:
+            self.logger.info("fetching %d uncached month(s): %s",
+                             len(fetchable), self._format_months(fetchable))
 
         # partial 청크가 있는 달은 마지막 캔들 이후 구간만 델타 fetch해 이어붙임
         for month in delta_months:
@@ -142,6 +154,14 @@ class BaseCandleFetcher(ABC):
                 PickleStorage.save_to_pickle(closed, partial_path)
                 break  # 이후 달은 아직 데이터가 없음
             month = month_end
+
+    @staticmethod
+    def _format_months(months: List[datetime]) -> str:
+        """로그용 달 목록. 길어지면 양끝만 남긴다 (--full 백테스트는 수십 개월이 된다)."""
+        names = [m.strftime("%Y-%m") for m in months]
+        if len(names) <= 6:
+            return ", ".join(names)
+        return f"{names[0]} ~ {names[-1]}"
 
     @staticmethod
     def _chunk_name(month: datetime) -> str:

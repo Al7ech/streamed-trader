@@ -3,9 +3,14 @@ from datetime import datetime, timezone
 
 from core.backtest.FastBacktester import FastBacktester
 from core.binance_candle_fetcher.vision_fetcher import BinanceVisionFetcher
+from core.logging_config import setup_logging
 from core.streamer.keltner_streamer import KeltnerStreamer
 
 if __name__ == "__main__":
+    # 0. 로깅 설정. 이게 없으면 페처/백테스터의 경고가 lastResort 핸들러로 빠져
+    #    레벨명 없는 맨 줄로 tqdm 진행바 사이에 섞인다 (월 청크 데이터 구멍 경고 등).
+    setup_logging()
+
     # 1. 캔들 데이터 로드 (없는 달만 data.binance.vision에서 받아 asset/candle/ 에 캐시)
     symbol = "ETHUSDT"
     start_date = datetime(2026, 1, 1, tzinfo=timezone.utc)

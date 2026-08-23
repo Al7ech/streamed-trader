@@ -186,7 +186,10 @@ class BinanceExecutor:
                 if result.success:
                     self.successful_orders += 1
                     result.execution_time = execution_time
-                    self.logger.info(f"Order executed successfully: {result}")
+                    # 체결의 실체(수량/평균가/손익)는 ORDER_TRADE_UPDATE를 받는
+                    # BinanceTrader._process_order_trade_update가 "order filled: [...]"로
+                    # 남긴다. 여기서 남길 수 있는 건 주문 id와 왕복 시간뿐이라 DEBUG로 둔다.
+                    self.logger.debug(f"Order accepted: {result}")
 
                     return result
                 else:
@@ -199,8 +202,10 @@ class BinanceExecutor:
 
             # Wait before retry (exponential backoff)
             if attempt < self.max_retries:
+                # 기본 backoff가 0.1/0.2초라 사람이 읽을 이유가 없다. 재시도가 있었다는
+                # 사실은 바로 위 "Order failed (attempt N)" 경고가 이미 남긴다.
                 delay = self.base_retry_delay * (2 ** attempt)
-                self.logger.info(f"Retrying order in {delay} seconds...")
+                self.logger.debug(f"Retrying order in {delay} seconds...")
                 time.sleep(delay)
 
         # All retries failed.

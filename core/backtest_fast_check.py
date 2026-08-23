@@ -29,6 +29,7 @@ from core.backtest.FastBacktester import ArrayIndicator, FastBacktester
 from core.backtest.SingleThreadedBacktester import SingleThreadedBacktester
 from core.backtest.status import Status
 from core.binance_candle_fetcher.vision_fetcher import BinanceVisionFetcher
+from core.logging_config import setup_logging
 from core.streamer.action import Action
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.candle import Candle
@@ -304,6 +305,10 @@ def compare_reports(label, ref_report, ref_final, fast_report, fast_final) -> bo
 
 
 if __name__ == "__main__":
+    # 페처/백테스터의 경고(월 청크 데이터 구멍 등)가 형식을 갖춰 나오게 한다. 여기서는
+    # 판정 결과를 print로 읽는 게 본론이라, 기본 레벨을 WARNING으로 두고 노이즈를 줄인다.
+    setup_logging(default="WARNING")
+
     symbol = "ETHUSDT"
     interval = "1m"
     end_date = datetime(2026, 7, 4, tzinfo=timezone.utc)

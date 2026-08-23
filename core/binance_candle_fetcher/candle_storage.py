@@ -1,10 +1,14 @@
 import gzip
+import logging
+import sys
 from typing import List
 
 import pandas as pd
 from tqdm import tqdm
 
 from core.streamer import Candle
+
+_logger = logging.getLogger(__name__)
 
 
 class CandleStorage:
@@ -55,7 +59,7 @@ class CandleStorage:
                 file_path = file_path[:-3]
             df = pd.read_csv(file_path)
 
-        print("loading candles...")
+        _logger.info("parsing %d rows from %s", len(df), file_path)
         candles = [
             Candle(
                 open=row['open'],
@@ -65,6 +69,6 @@ class CandleStorage:
                 volume=row['volume'],
                 start_time=int(row['start_time']),
                 end_time=int(row['end_time'])
-            ) for _, row in tqdm(df.iterrows(), total=len(df))
+            ) for _, row in tqdm(df.iterrows(), total=len(df), file=sys.stdout)
         ]
         return candles

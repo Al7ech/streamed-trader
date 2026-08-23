@@ -8,6 +8,7 @@ and integrates with the streamer system to get trading actions.
 import asyncio
 import copy
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Callable, Dict, Any, Coroutine, List
@@ -38,6 +39,11 @@ _TERMINAL_ORDER_STATES = ("FILLED", "CANCELED", "EXPIRED", "REJECTED")
 
 #: 기록/로그 대상이 되는 상태. 종결 상태 + 진행 중인 부분 체결.
 _TRACKED_ORDER_STATES = _TERMINAL_ORDER_STATES + ("PARTIALLY_FILLED",)
+
+#: 결정 수량과 실제 체결 수량의 상대 차이가 이 값을 넘으면 경고한다.
+#: ``BinanceExecutor.execute_action``은 거래소의 step size로 양자화하지 않으므로 약간의
+#: 차이는 정상이고 문서화돼 있다. 다만 "약간"이 얼마인지는 아무도 보지 않고 있었다.
+_QUANTITY_DIVERGENCE_TOLERANCE = 0.01
 
 #: 진행 중인 주문 집계를 들고 있을 최대 개수. 현재 실행기는 MARKET 주문만 내므로 즉시
 #: 종결되고 사실상 1을 넘지 않는다. 다만 종결 이벤트를 놓치면 항목이 영영 남는데, 이 프로세스는
@@ -127,6 +133,7 @@ class BinanceTrader:
         self.api_secret = api_secret
         self.symbol = symbol.upper()
         self.interval = interval
+        self.interval_ms = interval_to_minutes(interval) * 60_000
         self.streamer = streamer
         self.status = Status(margin=1e6 if dry_run else 0.0)
         self.dry_run = dry_run
@@ -144,7 +151,6 @@ class BinanceTrader:
         self.socket_manager: Optional[BinanceSocketManager] = None
         self.kline_socket: Optional[ReliableWebsocket] = None
         self.user_socket: Optional[ReliableWebsocket] = None
-        self.max_retries = 5
 
         # Executor
         self._executor = BinanceExecutor(
@@ -156,7 +162,6 @@ class BinanceTrader:
 
         # Control flags
         self.is_running = False
-        self.should_reconnect = True
 
         # 리스너 태스크는 강한 참조를 들고 있어야 한다 — asyncio는 실행 중 태스크를 약한
         # 참조로만 잡아서, 놔두면 중간에 GC될 수 있다.
@@ -173,6 +178,11 @@ class BinanceTrader:
         self._pending_decision: Optional[_PendingDecision] = None
         self._order_agg: Dict[int, _OrderAggregate] = {}
         self._warned_fee_asset = False
+        self._warned_margin_asset = False
+
+        #: 마지막으로 처리한 마감 캔들의 start_time. 캔들 누락을 알아채는 데 쓴다 —
+        #: 누락은 예외를 내지 않으므로 이게 없으면 완전히 무증상이다.
+        self._last_candle_start: Optional[int] = None
 
         # Logging
         self.logger = logging.getLogger(__name__)
@@ -211,6 +221,7 @@ class BinanceTrader:
             # 3-1. 결과 레코더. 지갑 조회(2) 뒤여야 라이브 init_margin이 실제 잔고이고,
             #      소켓을 열기(5) 전이어야 recorder가 None인 채로 캔들이 들어오지 않는다.
             self._setup_recorder()
+            self._reconcile_resumed_position()
 
             # 4. 리스너 태스크 생성 전에 플래그를 세운다. 리스너 루프가 `while self.is_running`
             #    으로 시작하므로, 나중에 세우면 첫 await에서 태스크가 곧바로 빠져나간다.
@@ -221,7 +232,15 @@ class BinanceTrader:
                 await self._connect_user_websocket()
             await self._connect_kline_websocket()
 
-            self.logger.info(f"BinanceTrader started for symbol: {self.symbol}, interval: {self.interval}")
+            # 이 프로세스가 무엇인지 한 줄로 남긴다. 특히 **dry_run**은 여기 말고는 어디에도
+            # 기록되지 않는다 — 체결이 나면 "[dry-run]" 접두사로 알 수 있지만, 전략이 며칠간
+            # 매매를 안 하면 로그만 보고 실제 돈이 걸려 있는지 판단할 방법이 없었다.
+            self.logger.info(
+                "BinanceTrader started: mode=%s symbol=%s interval=%s testnet=%s "
+                "streamer=%s fee_ratio=%s record=%s run_id=%s",
+                "DRY-RUN" if self.dry_run else "LIVE", self.symbol, self.interval,
+                self.testnet, type(self.streamer).__name__, self.fee_ratio,
+                bool(self.recorder), self.recorder.run_id if self.recorder else None)
 
         except Exception as e:
             # 삼키면 안 된다. 호출자(examples/trader.py)는 기동 성공/실패를 구분하지 못하고
@@ -241,7 +260,7 @@ class BinanceTrader:
                                                      self.interval, self.dry_run),
                 streamer=self.streamer,
                 status=self.status,
-                interval_ms=interval_to_minutes(self.interval) * 60_000,
+                interval_ms=self.interval_ms,
                 init_margin=self.status.total_margin(),
                 metadata={
                     **self.run_metadata,
@@ -277,6 +296,32 @@ class BinanceTrader:
         self.status.leverage = saved.leverage
         self.logger.info(f"[dry-run] 이전 런의 계좌 상태를 복원했다: {self.status}")
 
+    def _reconcile_resumed_position(self):
+        """재개한 런이 기억하는 포지션과 거래소의 실제 포지션을 대조한다 — **라이브 전용**.
+
+        드라이런은 저장된 상태가 곧 정답이라 (``_restore_dry_run_status``가 그대로 되살린다)
+        대조할 대상이 없다. 라이브는 다르다: 프로세스가 죽어 있는 동안 청산/ADL이 일어났거나,
+        앱에서 수동으로 포지션을 건드렸거나, 마지막 주문의 체결 이벤트를 못 받고 죽었을 수
+        있다. 그러면 전략이 이어서 계산하는 포지션과 거래소의 실제 포지션이 어긋난 채로
+        매매가 재개되는데, 지금까지는 거래소 상태와 복원된 상태를 각각 따로 찍기만 하고
+        둘을 비교하는 곳이 없어서 이 상황이 조용히 지나갔다.
+
+        되살리지는 않는다 — 라이브에서는 거래소가 정답이고 ``status``는 이미 거래소 값이다.
+        여기서 하는 일은 사람이 알아챌 수 있게 남기는 것뿐이다.
+        """
+        if self.dry_run or not self.recorder or not self.recorder.resumed_status:
+            return
+        saved = self.recorder.resumed_status.position
+        actual = self.status.position
+        if math.isclose(saved, actual, rel_tol=1e-9, abs_tol=1e-12):
+            self.logger.info("재개한 런의 포지션이 거래소와 일치한다: %s", actual)
+            return
+        self.logger.warning(
+            "재개한 런의 포지션(%s)이 거래소의 실제 포지션(%s)과 다르다 — 프로세스가 멈춘 "
+            "사이의 청산/ADL/수동 주문이거나 마지막 체결 이벤트를 놓친 것이다. "
+            "거래소 값으로 계속한다",
+            saved, actual)
+
     def _spawn(self, coro) -> asyncio.Task:
         """리스너 태스크를 만들고 강한 참조를 유지한다 (GC 방지)."""
         task = asyncio.create_task(coro)
@@ -287,7 +332,6 @@ class BinanceTrader:
     async def stop(self):
         """Stop the trader and close connections."""
         self.is_running = False
-        self.should_reconnect = False
 
         # 소켓/실행기 정리보다 **먼저** 기록을 마무리한다. 아래 try에서 예외가 나면 남은
         # 정리가 통째로 건너뛰어지므로, 마지막 flush가 거기 묻히면 안 된다.
@@ -354,14 +398,16 @@ class BinanceTrader:
                 try:
                     await self._process_kline_message(data)
                 except Exception as e:
-                    self.logger.error(f"Error processing kline message: {e}")
+                    # exception()으로 스택트레이스까지 남긴다. 예전에는 한 줄뿐이라, 핸들러
+                    # 안에서 KeyError가 나면 로그에 키 이름 하나만 남고 어느 줄인지 알 수 없었다.
+                    self.logger.exception("Error processing kline message: %s", e)
                     await self._handle_error(e)
 
             # Something is very wrong at this point. Stop trader
             except Exception as e:
                 if not self.is_running:
                     break
-                self.logger.fatal(f"Stopping trader. Error receiving kline message: {e}")
+                self.logger.critical(f"Stopping trader. Error receiving kline message: {e}")
                 await self.stop()
                 break
 
@@ -396,7 +442,7 @@ class BinanceTrader:
             end_time=end_time
         )
 
-        self.logger.debug(f"candle closed: {candle}")
+        self._check_candle_continuity(candle)
 
         # 지난 캔들의 결정이 아직 남아 있다면 그 주문은 체결 이벤트를 못 받은 것이다
         # (주문 실패 등). 그대로 두면 이번 캔들의 체결에 엉뚱한 거래 전 스냅샷이 붙는다.
@@ -408,8 +454,6 @@ class BinanceTrader:
         # Update status with current price
         self.status.update_unrealised_pnl(close_price)
 
-        self.logger.debug(f"status: {self.status}")
-
         # Indicators that opt into updates_before_decide ingest this candle first, so the
         # decision sees them including it. Same split the backtester applies.
         for indicator_name, indicator in self.streamer.indicators.items():
@@ -418,8 +462,6 @@ class BinanceTrader:
 
         # Get action from streamer
         action = self.streamer.update_candle(candle, self.status)
-
-        self.logger.debug(f"streamer action: {action}")
 
         # 백테스터와 **같은 자리**에서 기록한다: 두 지표 갱신 그룹 사이. 아래 after 루프
         # 뒤로 옮기면 updates_before_decide=False 인 모든 지표 컬럼이 백테스트 대비 한 캔들씩
@@ -433,7 +475,13 @@ class BinanceTrader:
             if not indicator.updates_before_decide:
                 indicator.update(candle, self.status)
 
-        self.logger.debug(f"successfully updated indicators: {generate_dict_string(self.streamer.indicators)}")
+        # 캔들 하나당 DEBUG 한 줄. 예전에는 candle/status/action/indicators/"Processed
+        # completed"로 다섯 줄이었다 (1분봉이면 하루 7천 줄).
+        # isEnabledFor로 감싸는 게 핵심이다: generate_dict_string은 전 지표를 순회하며
+        # get_latest()를 부르는데, 인자로 넘기면 DEBUG가 꺼져 있어도 매 캔들 실행된 뒤 버려진다.
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("candle=%s action=%s status=%s indicators=%s", candle, action,
+                              self.status, generate_dict_string(self.streamer.indicators))
 
         # 거래 전 스냅샷은 주문을 내보내기 **전에** 떠야 한다. _on_action이 주문 future를
         # await하며 이벤트 루프에 양보하므로, 그 사이 체결/계정 갱신 이벤트가 도착해
@@ -473,7 +521,52 @@ class BinanceTrader:
             # 통째로 없는, 앞뒤가 맞지 않는 런이 남는다.
             self.recorder.flush(force=traded)
 
-        self.logger.debug(f"Processed completed")
+    def _check_candle_continuity(self, candle: Candle) -> None:
+        """마감 캔들이 직전 캔들 바로 다음인지 확인하고, 아니면 경고한다.
+
+        캔들 누락은 **아무 예외도 내지 않는다**. ``ReliableWebsocket``은 recv()가 던질 때만
+        복구하므로, 스트림이 조용히 캔들을 건너뛰면 로그도 조용해지고 크래시가 없어
+        ``restart: always``도 걸리지 않는다. 그런데 캔들이 빠지면 롤링 윈도우 지표에 구멍이
+        생기고(그 상태로 계속 매매한다) 기록된 시계열도 백테스트와 어긋난다.
+
+        웹소켓 캔들의 ``end_time``은 ``T``(= start + interval - 1)라 다음 캔들의 start와 1ms
+        차이가 난다. 그래서 end_time이 아니라 **start_time + interval**로 비교한다.
+        """
+        previous = self._last_candle_start
+        # 진행 지점은 **되돌리지 않는다**. 재전송된 옛 캔들에 맞춰 커서를 뒤로 옮기면, 바로
+        # 다음에 오는 정상 캔들이 있지도 않은 구멍으로 보여 가짜 누락 경고가 뒤따른다.
+        self._last_candle_start = (candle.start_time if previous is None
+                                   else max(previous, candle.start_time))
+        if previous is None:
+            return
+
+        expected = previous + self.interval_ms
+        if candle.start_time == expected:
+            return
+
+        if candle.start_time <= previous:
+            # 재전송/순서 뒤바뀜. 그대로 처리하면 같은 캔들로 지표를 두 번 갱신한다.
+            self.logger.warning(
+                "캔들 순서가 어긋났다: 직전 %s 다음에 %s 가 왔다 (재전송이면 지표가 "
+                "이중 갱신된다)",
+                ms_timestamp_to_datetime(previous), ms_timestamp_to_datetime(candle.start_time))
+            return
+
+        missed, remainder = divmod(candle.start_time - expected, self.interval_ms)
+        if remainder:
+            # 인터벌 격자에 안 맞는 캔들. 설정한 interval과 실제 스트림이 다르다는 뜻이라
+            # 누락보다 더 근본적인 문제다.
+            self.logger.warning(
+                "캔들이 %s 인터벌 격자에서 벗어났다: 직전 %s 다음에 %s 가 왔다",
+                self.interval, ms_timestamp_to_datetime(previous),
+                ms_timestamp_to_datetime(candle.start_time))
+            return
+
+        self.logger.warning(
+            "캔들 %d개 누락: %s ~ %s 구간이 비었다 — 롤링 윈도우 지표에 구멍이 생기고 "
+            "기록된 시계열이 백테스트와 어긋난다",
+            missed, ms_timestamp_to_datetime(expected),
+            ms_timestamp_to_datetime(candle.start_time))
 
     async def _connect_user_websocket(self):
         """Establish WebSocket connection to Binance futures user data stream."""
@@ -517,14 +610,14 @@ class BinanceTrader:
                         await self._process_order_trade_update(data)
 
                 except Exception as e:
-                    self.logger.error(f"Error processing user message: {e}")
+                    self.logger.exception("Error processing user message: %s", e)
                     await self._handle_error(e)
 
             # Something is very wrong at this point. Stop trader
             except Exception as e:
                 if not self.is_running:
                     break
-                self.logger.fatal(f"Stopping trader. Error receiving user message: {e}")
+                self.logger.critical(f"Stopping trader. Error receiving user message: {e}")
                 await self.stop()
                 break
 
@@ -539,11 +632,13 @@ class BinanceTrader:
         try:
             account_data = data.get('a') or {}
             margin_asset = self._get_margin_asset()
+            updated = []
 
             # Update margin balance — 해당 자산 항목이 있을 때만
             for m in (account_data.get('B') or []):
                 if m.get('a') == margin_asset:
                     self.status.margin = float(m.get("wb", 0.0))
+                    updated.append("margin")
                     break
 
             # exclude m=FUNDING_FEE
@@ -555,12 +650,24 @@ class BinanceTrader:
                         self.status.position = float(position.get('pa', 0.0))  # position amount
                         self.status.unrealised_pnl = float(position.get('up', 0.0))  # unrealized
                         self.status.update_leverage()
+                        updated.append("position")
                         break
 
-            self.logger.info(f"Status updated from account: {self.status}")
+            # 실제로 뭔가 반영됐을 때만 INFO. 이 핸들러는 우리 자산/심볼 항목이 없으면
+            # status를 건드리지 않는 게 설계인데(위 주석 참고), 예전에는 그런 이벤트 —
+            # 다른 심볼의 주문, 펀딩피 정산 — 에서도 "Status updated"를 찍어서 아무것도
+            # 바뀌지 않은 줄이 로그의 대부분을 차지했다.
+            if updated:
+                self.logger.info("Status updated from account (%s): %s",
+                                 "+".join(updated), self.status)
+            else:
+                self.logger.debug("ACCOUNT_UPDATE에 %s/%s 항목이 없어 status를 유지한다 (m=%s)",
+                                  margin_asset, self.symbol, account_data.get("m"))
 
         except Exception as e:
-            self.logger.error(f"Error processing account update: {e}")
+            # 바로 아래에서 re-raise 하므로 스택트레이스는 이걸 받는
+            # _listen_user_websocket의 logger.exception이 남긴다. 여기서 또 쓰면 중복된다.
+            self.logger.error("Error processing account update: %s", e)
             raise
 
     async def _process_order_trade_update(self, data):
@@ -626,7 +733,9 @@ class BinanceTrader:
             if self.recorder and agg.cum_qty > 0:
                 self._record_live_fill(agg, filled)
         except Exception as e:
-            self.logger.error(f"Error processing order trade update: {e}")
+            # 바로 아래에서 re-raise 하므로 스택트레이스는 이걸 받는
+            # _listen_user_websocket의 logger.exception이 남긴다. 여기서 또 쓰면 중복된다.
+            self.logger.error("Error processing order trade update: %s", e)
             raise
 
     def _record_live_fill(self, agg: _OrderAggregate, quantity: float):
@@ -647,6 +756,17 @@ class BinanceTrader:
             if pending.quantity * quantity <= 0:
                 self.logger.warning(
                     f"체결 수량 {quantity} 이 직전 결정 {pending.quantity} 과 방향이 다르다")
+            elif abs(quantity - pending.quantity) > \
+                    abs(pending.quantity) * _QUANTITY_DIVERGENCE_TOLERANCE:
+                # 실행기가 step size로 양자화하지 않아서 생기는, 예상된 종류의 차이다
+                # (CLAUDE.md의 "라이브가 백테스트와 다를 수밖에 없는 이유" 참고). 다만
+                # 지금까지는 주문 요청과 체결이 서로 다른 줄에 찍힐 뿐 아무도 대조하지
+                # 않아서, 실제 괴리가 얼마인지 로그에서 알 수 없었다.
+                self.logger.warning(
+                    "체결 수량이 결정과 %.2f%% 어긋났다: 결정 %s → 체결 %s "
+                    "(step size 양자화 미적용, order_id=%s)",
+                    abs(quantity - pending.quantity) / abs(pending.quantity) * 100,
+                    pending.quantity, quantity, agg.order_id)
             pre_status = pending.pre_status
             # 체결 시각(T)이 아니라 **결정 캔들의 마감 시각**을 쓴다. T는 캔들 경계보다
             # 수백 ms 뒤라, 집계 뷰(1h/1d)에서 원인이 된 캔들과 다른 버킷에 떨어질 수 있다.
@@ -879,7 +999,12 @@ class BinanceTrader:
         for asset in _MARGIN_ASSETS:
             if self.symbol.endswith(asset) and len(self.symbol) > len(asset):
                 return asset
-        self.logger.warning(
-            f"{self.symbol}의 정산 자산을 알 수 없다 — USDT로 가정한다. "
-            f"알려진 자산: {_MARGIN_ASSETS}")
+        # 이 함수는 ACCOUNT_UPDATE마다, ORDER_TRADE_UPDATE마다 (체결 하나당 두 번) 불린다.
+        # 매번 찍으면 심볼을 모르는 동안 경고가 끝없이 쏟아지므로 _warned_fee_asset과 같이
+        # 한 번만 남긴다.
+        if not self._warned_margin_asset:
+            self._warned_margin_asset = True
+            self.logger.warning(
+                f"{self.symbol}의 정산 자산을 알 수 없다 — USDT로 가정한다. "
+                f"알려진 자산: {_MARGIN_ASSETS}")
         return "USDT"

@@ -1,6 +1,7 @@
 import concurrent.futures
 import csv
 import io
+import sys
 import time
 import zipfile
 from collections import namedtuple
@@ -191,7 +192,7 @@ class BinanceVisionFetcher(BinanceCandleFetcher):
         if not specs:
             return
         futures = [pool.submit(self._fetch_one, session, symbol, interval, s) for s in specs]
-        with tqdm(total=len(futures), desc=desc, unit="file") as pbar:
+        with tqdm(total=len(futures), desc=desc, unit="file", file=sys.stdout) as pbar:
             for future in concurrent.futures.as_completed(futures):
                 yield future.result()
                 pbar.update(1)

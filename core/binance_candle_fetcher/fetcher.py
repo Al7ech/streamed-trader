@@ -1,3 +1,4 @@
+import sys
 import time
 from datetime import datetime, timedelta
 from typing import List, Tuple
@@ -72,7 +73,8 @@ class BinanceCandleFetcher(BaseCandleFetcher):
         all_candles = []
 
         # Process each chunk with progress bar
-        with tqdm(total=len(date_chunks), desc=f"Fetching {symbol} candles", unit="chunk") as pbar:
+        with tqdm(total=len(date_chunks), desc=f"Fetching {symbol} candles", unit="chunk",
+                  file=sys.stdout) as pbar:
             for i, (chunk_start, chunk_end) in enumerate(date_chunks):
                 # Respect limit
                 if i % 23 == 0 and i != 0:

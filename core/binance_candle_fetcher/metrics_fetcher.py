@@ -11,6 +11,7 @@ funding_fetcher와 같은 소스의 metrics 덤프(5분 스냅샷, 2021-12-01~)�
 import calendar
 import csv
 import io
+import logging
 import os
 import pickle
 import zipfile
@@ -18,6 +19,8 @@ from datetime import datetime, timezone
 from typing import List, Tuple
 
 import requests
+
+_logger = logging.getLogger(__name__)
 
 BASE_URL = "https://data.binance.vision/data/futures/um/daily/metrics"
 DEFAULT_CACHE_DIR = "asset/metrics"
@@ -68,7 +71,7 @@ def _fetch_month(symbol: str, year: int, month: int) -> List[MetricsRow]:
             missing.append(day)
         rows.extend(day_rows)
     if missing:
-        print(f"  {symbol} {year:04d}-{month:02d}: 결측일 {missing}", flush=True)
+        _logger.warning("%s %04d-%02d: 결측일 %s", symbol, year, month, missing)
     return rows
 
 
@@ -86,7 +89,7 @@ def get_metrics_with_cache(symbol: str, start: datetime, end: datetime,
             with open(path, "rb") as f:
                 month_rows = pickle.load(f)
         else:
-            print(f"Fetching metrics {symbol} {year:04d}-{month:02d}...", flush=True)
+            _logger.info("fetching metrics %s %04d-%02d...", symbol, year, month)
             month_rows = _fetch_month(symbol, year, month)
             in_progress = (year, month) == (now.year, now.month)
             if month_rows and not in_progress:
