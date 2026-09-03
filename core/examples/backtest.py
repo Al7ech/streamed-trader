@@ -22,7 +22,7 @@ if __name__ == "__main__":
     #    레버리지가 ~1.6x에 머무는 값을 쓴다.
     params = dict(window=72 * 60, m_entry=4.0, m_exit=3.0,
                   fee_ratio=0.0004, max_loss=0.005)
-    streamer = KeltnerStreamer(symbol=symbol, **params)
+    streamer = KeltnerStreamer(symbols=[symbol], **params)
 
     # 3. 백테스트 실행. 멀티심볼 엔진은 심볼별 캔들 리스트를 받는다 — 단일 심볼 전략은
     #    자기 심볼 하나짜리 dict만 넘기면 그대로 동작한다.

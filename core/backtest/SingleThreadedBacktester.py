@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 from tqdm import tqdm
 
 from core.backtest.candle_merge import merge_candle_timeline
+from core.backtest.indicator_columns import collect_indicator_columns
 from core.backtest.metrics import build_multi_symbol_buy_and_hold_curve
 from core.backtest.report import Report
 from core.backtest.result_writer import ShardWriter, write_run_json
@@ -86,21 +87,7 @@ class SingleThreadedBacktester:
         closes_by_symbol: Dict[str, List[Optional[float]]] = {
             s: [] for s in self.streamer.symbols}
 
-        # 지표 이름의 합집합 (심볼마다 다를 수 있으나, 컬럼 이름/그룹은 심볼 간 공유된 뜻으로 다룬다)
-        indicator_names: List[str] = []
-        seen = set()
-        for symbol in self.streamer.symbols:
-            for name in self.streamer.indicators.get(symbol, {}):
-                if name not in seen:
-                    seen.add(name)
-                    indicator_names.append(name)
-        column_groups: Dict[str, str] = {}
-        for name in indicator_names:
-            for symbol in self.streamer.symbols:
-                ind = self.streamer.indicators.get(symbol, {}).get(name)
-                if ind is not None:
-                    column_groups[name] = ind.scale_group
-                    break
+        indicator_names, column_groups = collect_indicator_columns(self.streamer)
 
         streamer_name = type(self.streamer).__name__
         run_id = f"{streamer_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"

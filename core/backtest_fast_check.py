@@ -96,7 +96,7 @@ class EquityGatedKeltner(KeltnerStreamer):
         super().__init__(**kwargs)
         equity = EquityIndicator()
         equity.updates_before_decide = True
-        self.indicators[self.symbol]["EQ"] = equity
+        self.indicators[self.symbols[0]]["EQ"] = equity
 
     def decide_action(self, symbol, candle: Candle, status: Status):
         position = status.position_for(symbol).position
@@ -210,9 +210,9 @@ def check_nonflat_start(candles) -> bool:
         return bt
 
     candles_by_symbol = {"X": sub}
-    ref_bt = seed(SingleThreadedBacktester(KeltnerStreamer(symbol="X", window=600), candles_by_symbol))
+    ref_bt = seed(SingleThreadedBacktester(KeltnerStreamer(symbols=["X"], window=600), candles_by_symbol))
     ref_report = ref_bt.run()
-    fast_bt = seed(FastBacktester(KeltnerStreamer(symbol="X", window=600), candles_by_symbol))
+    fast_bt = seed(FastBacktester(KeltnerStreamer(symbols=["X"], window=600), candles_by_symbol))
     fast_report = fast_bt.run()
 
     ok = compare_reports("non-flat start", ref_report, ref_bt.status.total_margin(),
@@ -241,7 +241,7 @@ def check_empty_range(candles) -> bool:
     reports = {}
     candles_by_symbol = {"X": candles}
     for name, cls in (("ref", SingleThreadedBacktester), ("fast", FastBacktester)):
-        bt = cls(KeltnerStreamer(symbol="X", window=600), candles_by_symbol)
+        bt = cls(KeltnerStreamer(symbols=["X"], window=600), candles_by_symbol)
         try:
             reports[name] = bt.run(start_time=far_future, end_time=far_future + 1000)
         except Exception as e:
@@ -461,14 +461,14 @@ if __name__ == "__main__":
                           max_loss=0.08, fee_ratio=0.0004)
 
     def make_mixed():
-        streamer = KeltnerStreamer(symbol=symbol, **keltner_params)
+        streamer = KeltnerStreamer(symbols=[symbol], **keltner_params)
         # force the ATR onto the loop path to exercise mixed precomputed/live execution
         streamer.indicators[symbol]["ATR"] = LoopOnlyIndicator(streamer.indicators[symbol]["ATR"])
         return streamer
 
     def make_before():
         # every indicator ingests the current candle before decide_action (per-instance override)
-        streamer = KeltnerStreamer(symbol=symbol, **keltner_params)
+        streamer = KeltnerStreamer(symbols=[symbol], **keltner_params)
         for indicator in streamer.indicators[symbol].values():
             indicator.updates_before_decide = True
         return streamer
@@ -477,13 +477,13 @@ if __name__ == "__main__":
         # MA stays vectorized+after (shims_after), ATR becomes loop-only+before (live_before).
         # Together with the two cases above this covers all four partition branches:
         # shims_before/shims_after/live_before/live_after.
-        streamer = KeltnerStreamer(symbol=symbol, **keltner_params)
+        streamer = KeltnerStreamer(symbols=[symbol], **keltner_params)
         streamer.indicators[symbol]["ATR"] = LoopOnlyIndicator(streamer.indicators[symbol]["ATR"])
         streamer.indicators[symbol]["ATR"].updates_before_decide = True
         return streamer
 
     cases = {
-        "KeltnerStreamer": lambda: KeltnerStreamer(symbol=symbol, **keltner_params),
+        "KeltnerStreamer": lambda: KeltnerStreamer(symbols=[symbol], **keltner_params),
         # stateful streamer: carries _timeout_remaining/_stop_price across candles, so it also
         # checks that the fast path doesn't disturb streamer-side state
         "MeanReversionZScoreStreamer": lambda: MeanReversionZScoreStreamer(
@@ -495,7 +495,7 @@ if __name__ == "__main__":
         # status를 읽는 before 지표 — before 그룹이 시가평가 전/후 어느 status를 보는지 검사한다.
         # 위 케이스들은 ATR/MA만 써서 status를 아예 읽지 않으므로 이 규약을 못 잡는다.
         "EquityGatedKeltner (status-aware before indicator)":
-            lambda: EquityGatedKeltner(symbol=symbol, **keltner_params),
+            lambda: EquityGatedKeltner(symbols=[symbol], **keltner_params),
     }
 
     all_ok = True

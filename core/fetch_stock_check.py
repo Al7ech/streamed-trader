@@ -108,7 +108,7 @@ def main():
         print("    2회차는 API 호출 없음")
 
     # 6. 파이프라인 통합 — 크래시 없이 도는지만 (파라미터 튜닝은 범위 밖)
-    streamer = KeltnerStreamer(symbol=symbol, window=120, m_entry=2.0, m_exit=0.0,
+    streamer = KeltnerStreamer(symbols=[symbol], window=120, m_entry=2.0, m_exit=0.0,
                                fee_ratio=0.0005, max_loss=0.08)
     backtester = FastBacktester(streamer, candles)
     init_margin = backtester.status.total_margin()

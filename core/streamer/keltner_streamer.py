@@ -23,17 +23,16 @@ class KeltnerStreamer(BaseStreamer):
       레버리지 설정, 6x 캡
     """
 
-    def __init__(self, symbol: str,
+    def __init__(self, symbols: List[str],
                  window: int = 20 * 60,
                  m_entry: float = 2.0,
                  m_exit: float = 0.0,
                  max_loss: float = 0.08,
                  fee_ratio: float = 0.0004):
-        super().__init__([symbol], {symbol: {
+        super().__init__(symbols, {s: {
             "MA": MovingAverage(window),
             "ATR": ATRIndicator(window),
-        }})
-        self.symbol = symbol
+        } for s in symbols})
         self.m_entry = m_entry
         self.m_exit = m_exit
         self.max_loss = max_loss
