@@ -267,8 +267,8 @@ def write_series_shards(dir_path: str, run_id: str, times: Sequence[int],
 
     :param symbol_columns: ``{symbol: {"ohlc": {...} or None, "indicators": {...}}}``, every
         array the same length as ``times``. Indicator columns must already hold decide-time
-        values (i.e. the value the streamer saw for that event, which excludes the event's own
-        candle for that symbol unless the indicator opted into ``updates_before_decide``).
+        values (i.e. the value the streamer saw for that event, which includes the event's own
+        candle for that symbol — every indicator ingests it before ``decide_action`` runs).
     :param has_ohlc: whether to embed OHLC per symbol (mirrors ``symbol_columns[*]["ohlc"]``
         being non-None).
 

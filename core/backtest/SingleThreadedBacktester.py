@@ -94,18 +94,6 @@ class SingleThreadedBacktester:
         init_margin = self.status.total_margin()
         interval_ms = self._interval_ms()
 
-        # Indicators are split by when they ingest the candle being decided on, per symbol.
-        before_indicators = {
-            symbol: [ind for ind in self.streamer.indicators.get(symbol, {}).values()
-                    if ind.updates_before_decide]
-            for symbol in self.streamer.symbols
-        }
-        after_indicators = {
-            symbol: [ind for ind in self.streamer.indicators.get(symbol, {}).values()
-                    if not ind.updates_before_decide]
-            for symbol in self.streamer.symbols
-        }
-
         write_output = metadata is not None
         backtest_dir = os.path.join(self.result_path, "backtest")
         shard_writer: Optional[ShardWriter] = None
@@ -153,7 +141,9 @@ class SingleThreadedBacktester:
                 if candle is None:
                     continue
 
-                for indicator in before_indicators.get(symbol, []):
+                # indicators always ingest the candle before the decision, with the same
+                # pre-trade status decide_action sees for this candle
+                for indicator in self.streamer.indicators.get(symbol, {}).values():
                     indicator.update(candle, self.status)
 
                 if bankrupt:
@@ -163,15 +153,11 @@ class SingleThreadedBacktester:
                     symbol_actions = self.streamer.update_candle(symbol, candle, self.status)
 
                 if shard_writer is not None:
-                    # recorded between the two update groups, so every column is the value
-                    # decide_action actually saw — whichever side of the decision it was fed on
+                    # recorded right after decide_action, once every indicator for this symbol
+                    # is already updated — so every column is the value the decision actually saw
                     values = {name: ind.get_latest()
                              for name, ind in self.streamer.indicators.get(symbol, {}).items()}
                     symbol_data[symbol] = (candle, values)
-
-                # indicators see the same pre-trade status decide_action saw for this candle
-                for indicator in after_indicators.get(symbol, []):
-                    indicator.update(candle, self.status)
 
                 actions.extend(symbol_actions)
 

@@ -607,27 +607,19 @@ class BinanceTrader:
 
         symbol_indicators = self.streamer.indicators.get(symbol, {})
 
-        # Indicators that opt into updates_before_decide ingest this candle first, so the
-        # decision sees them including it. Same split the backtester applies.
+        # 모든 지표가 decide_action보다 먼저 이 캔들을 반영한다 (백테스터와 같은 규약).
+        # status는 decide_action이 보는 것과 같은 거래 전 스냅샷이다.
         for indicator_name, indicator in symbol_indicators.items():
-            if indicator.updates_before_decide:
-                indicator.update(candle, self.status)
+            indicator.update(candle, self.status)
 
         # 교차 심볼 전략은 다른 심볼을 겨냥하는 액션도 반환할 수 있다 — 이후 처리는 각
         # 액션의 action.symbol을 그대로 따라간다.
         actions = self.streamer.update_candle(symbol, candle, self.status)
 
-        # 백테스터와 **같은 자리**에서 기록한다: 두 지표 갱신 그룹 사이. 아래 after 루프
-        # 뒤로 옮기면 updates_before_decide=False 인 모든 지표 컬럼이 백테스트 대비 한 캔들씩
-        # 밀려서, 정작 이 기록으로 하려던 비교가 어긋난다.
+        # 백테스터와 **같은 자리**에서 기록한다: 지표가 이미 전부 갱신된 직후, decide_action이
+        # 반환한 바로 뒤. 그래서 모든 컬럼이 결정이 실제로 본 값이다.
         if self.recorder:
             self.recorder.record_candle(symbol, candle, self.status)
-
-        # The rest are updated after the decision (the default).
-        # Indicators receive the same pre-trade status decide_action saw (action not yet executed).
-        for indicator_name, indicator in symbol_indicators.items():
-            if not indicator.updates_before_decide:
-                indicator.update(candle, self.status)
 
         # 캔들 하나당 DEBUG 한 줄. 예전에는 candle/status/action/indicators/"Processed
         # completed"로 다섯 줄이었다 (1분봉이면 하루 7천 줄).

@@ -342,41 +342,32 @@ those two scripts default to WARNING.
 - Each indicator's `scale_group` (default `"price"`) tells the frontend which chart pane to plot
   it on; indicators sharing a group share a pane and price scale (this grouping is keyed by
   indicator **name** only, shared across symbols).
-- Each indicator also carries `updates_before_decide` (default `False`), which selects **which
-  side of `decide_action` it ingests the current candle on**. Every shipped indicator leaves it
-  `False`, so the default ordering described below is what actually runs today. Setting it `True`
-  (per subclass or per instance) makes `get_latest()` include the candle being decided on, which
-  shifts every read by one index — breakout comparisons must then use `get_index(-2)`, since a
-  Donchian max channel including the current bar satisfies `channel_max >= candle.high >=
-  candle.close` and could never fire.
+- **Ordering matters**: all three engines (`SingleThreadedBacktester`, `FastBacktester`,
+  `BinanceTrader._handle_candle`) always update **every** indicator for a symbol with its closed
+  candle *before* calling `streamer.decide_action`/`update_candle` for that symbol, so
+  `get_latest()` includes the candle being decided on and `get_index(-2)` is the previous one —
+  the current candle's OHLCV is also available directly as the `candle` argument, and every
+  strategy uses it. The `Status` passed to both `update` and `decide_action` is still the
+  pre-trade snapshot (fills are only applied after every symbol in the event has been decided),
+  so an indicator that reads `status` sees exactly what the decision it's paired with saw. Both
+  backtesters record the series right after `decide_action` returns, once every indicator is
+  already updated, so every plotted column is the value the decision actually saw.
 
-  All three engines partition `streamer.indicators[symbol]` on this flag, **per symbol**:
-  `SingleThreadedBacktester`, `FastBacktester` and `BinanceTrader._handle_candle` (partitioning
-  over `streamer.indicators[symbol]` for whichever symbol's candle just closed). Two
-  non-obvious consequences in `FastBacktester`: each symbol's `ArrayIndicator` shims are just
-  called via the same `.update()` as everything else — every appearance of that symbol in the
-  merged event stream advances their `cursor` by one, so no manual index bookkeeping is needed even
-  though the shared merged-event index and a symbol's own candle-index no longer coincide; and
-  `_build_symbol_series_columns` skips its usual one-candle right-shift for flagged indicators
-  (their decide-time value at that symbol's j-th own candle is `seq[j]`, unshifted) before
-  scattering the result onto the shared event grid. Both backtesters record the series between the
-  two update groups, so every plotted column is the value the decision actually saw regardless of
-  which side it was fed on.
-- **Ordering matters**: both the backtester and `BinanceTrader` call `streamer.decide_action` /
-  `update_candle` for a symbol on its *closed* candle first, then update that symbol's indicators
-  with that candle and the still pre-trade `Status`, and only then apply/execute the returned
-  actions (the `updates_before_decide` indicators above are the opt-in exception, fed just before
-  the call) — so a decision always sees indicator state that excludes the candle it's deciding on,
-  and an indicator always sees the status that decision was made with. The current candle's OHLCV
-  is not hidden from the decision — it arrives directly as the `candle` argument, and every
-  strategy uses it.
+  In `FastBacktester`, each symbol's `ArrayIndicator` shims are just called via the same
+  `.update()` as everything else — every appearance of that symbol in the merged event stream
+  advances their `cursor` by one before the decision reads it, so no manual index bookkeeping is
+  needed even though the shared merged-event index and a symbol's own candle-index don't coincide
+  — and `_build_symbol_series_columns` scatters each precomputed series onto the shared event
+  grid unshifted (the decide-time value at that symbol's j-th own candle is always `seq[j]`).
 
-  This ordering is a **semantic convention, not a look-ahead guard**. The candle has already
-  closed by the time `decide_action` runs, so folding it into the indicators would leak no future
-  information. The reason to exclude it is that breakout logic requires it: a Donchian max channel
-  that included the current bar would satisfy `channel_max >= candle.high >= candle.close`, making
-  `close > channel_max` unfireable. What the convention guarantees is that `get_latest()` means
-  exactly one thing, in the backtester and in the live trader alike.
+  This ordering is a **semantic convention, not a look-ahead guard**: the candle has already
+  closed by the time `decide_action` runs, so feeding it to the indicators first leaks no future
+  information. It does mean any breakout/extremum comparison against the current candle's own
+  OHLC must read `get_index(-2)` instead of `get_latest()` — a Donchian max channel that includes
+  the current bar satisfies `channel_max >= candle.high >= candle.close`, making
+  `close > channel_max` unfireable. Level-style indicators (MA, ATR, rolling std) read fine at
+  `get_latest()` either way. What the convention guarantees is that `get_latest()` means exactly
+  one thing, in the backtester and in the live trader alike.
 
   Look-ahead is actually held out elsewhere: a fill uses its target symbol's decision-candle
   `close` when that symbol is the trigger, or `Status.last_close[symbol]` — frozen before any

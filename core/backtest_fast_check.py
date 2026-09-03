@@ -63,8 +63,8 @@ class LoopOnlyIndicator(BaseIndicator):
 class EquityIndicator(BaseIndicator):
     """매 캔들의 거래 전 시가평가 자본을 기록하는 status 의존 지표 (검사용).
 
-    ``status``를 읽으므로 벡터화가 불가능하고 항상 루프 경로에 남는다. ``updates_before_decide``
-    를 켜면 "before 그룹은 시가평가 **후**의 status를 봐야 한다"는 규약을 직접 찌른다.
+    ``status``를 읽으므로 벡터화가 불가능하고 항상 루프 경로에 남는다. decide_action보다 먼저
+    갱신되므로 "지표 갱신은 시가평가 **후**의 status를 봐야 한다"는 규약을 직접 찌른다.
     """
 
     scale_group = "balance"
@@ -89,14 +89,13 @@ class EquityIndicator(BaseIndicator):
 class EquityGatedKeltner(KeltnerStreamer):
     """Keltner에 "자본이 직전 대비 줄면 즉시 청산" 규칙을 얹은 픽스처.
 
-    청산 판단이 EquityIndicator의 값에 직접 걸리므로, before 그룹이 보는 status가 한 캔들
+    청산 판단이 EquityIndicator의 값에 직접 걸리므로, 지표 갱신이 보는 status가 한 캔들
     어긋나면 청산 시점이 달라지고 체결 목록이 갈린다.
     """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         equity = EquityIndicator()
-        equity.updates_before_decide = True
         self.indicators[self.symbols[0]]["EQ"] = equity
 
     def decide_action(self, symbol, candle: Candle, status: Status):
@@ -471,22 +470,6 @@ if __name__ == "__main__":
         streamer.indicators[symbol]["ATR"] = LoopOnlyIndicator(streamer.indicators[symbol]["ATR"])
         return streamer
 
-    def make_before():
-        # every indicator ingests the current candle before decide_action (per-instance override)
-        streamer = KeltnerStreamer(symbols=[symbol], **keltner_params)
-        for indicator in streamer.indicators[symbol].values():
-            indicator.updates_before_decide = True
-        return streamer
-
-    def make_split():
-        # MA stays vectorized+after (shims_after), ATR becomes loop-only+before (live_before).
-        # Together with the two cases above this covers all four partition branches:
-        # shims_before/shims_after/live_before/live_after.
-        streamer = KeltnerStreamer(symbols=[symbol], **keltner_params)
-        streamer.indicators[symbol]["ATR"] = LoopOnlyIndicator(streamer.indicators[symbol]["ATR"])
-        streamer.indicators[symbol]["ATR"].updates_before_decide = True
-        return streamer
-
     cases = {
         "KeltnerStreamer": lambda: KeltnerStreamer(symbols=[symbol], **keltner_params),
         # stateful streamer: carries _timeout_remaining/_stop_price across candles, so it also
@@ -495,11 +478,9 @@ if __name__ == "__main__":
             symbol=symbol, window=60, entry_z=2.0, timeout_candles=60,
             max_loss=0.08, fee_ratio=0.0004),
         "KeltnerStreamer (mixed: ATR loop-only)": make_mixed,
-        "KeltnerStreamer (all updates_before_decide)": make_before,
-        "KeltnerStreamer (split: MA after / ATR loop-only before)": make_split,
-        # status를 읽는 before 지표 — before 그룹이 시가평가 전/후 어느 status를 보는지 검사한다.
-        # 위 케이스들은 ATR/MA만 써서 status를 아예 읽지 않으므로 이 규약을 못 잡는다.
-        "EquityGatedKeltner (status-aware before indicator)":
+        # status를 읽는 지표 — 지표 갱신이 시가평가 전/후 어느 status를 보는지 검사한다. 위
+        # 케이스들은 ATR/MA만 써서 status를 아예 읽지 않으므로 이 규약을 못 잡는다.
+        "EquityGatedKeltner (status-aware indicator)":
             lambda: EquityGatedKeltner(symbols=[symbol], **keltner_params),
     }
 

@@ -9,9 +9,11 @@ from core.streamer.indicator.base_indicator import BaseIndicator
 class PositionAgeIndicator(BaseIndicator):
     """포지션을 보유한 연속 캔들 수를 세는 status 기반 지표.
 
-    update()는 pre-trade status를 받으므로 진입 캔들 자체는 age 0으로 기록되고, 이후
-    캔들부터 1씩 증가한다. 즉 decide_action 시점의 get_latest()는 "직전 캔들 기준,
-    진입 캔들을 제외하고 몇 캔들째 보유 중인지"를 돌려준다 (flat이면 0).
+    update()는 decide_action보다 먼저, pre-trade status로 불린다. 진입 캔들 자체는 그 시점에
+    아직 체결 전이라 age 0으로 기록되고, 이후 캔들부터 1씩 증가한다 — 체결은 같은 캔들의
+    decide_action 이후에 일어나므로, 진입 캔들의 update()는 여전히 flat인 status를 본다.
+    즉 decide_action 시점의 get_latest()는 "이번 캔들까지 몇 캔들째 보유 중인지"를 돌려준다
+    (flat이면 0).
 
     status가 벡터화 불가능한 피드백이므로 plain BaseIndicator(loop 경로)로만 동작한다.
     라이브 트레이더의 prefeed는 status=None을 넘기므로 age는 0에서 시작한다 — 포지션을

@@ -18,24 +18,6 @@ class BaseIndicator(ABC):
     #: and overlays the candlestick pane; any other value gets its own pane.
     scale_group: str = "price"
 
-    #: When to ingest the candle a decision is being made on.
-    #:
-    #: False (default) — the engine calls ``decide_action`` first and updates this indicator
-    #: afterwards, so ``get_latest()`` is the value *through the previous candle* and
-    #: ``get_index(-2)`` the one before that.
-    #:
-    #: True — the engine feeds the current candle *before* ``decide_action``, so ``get_latest()``
-    #: includes the candle being decided on and ``get_index(-2)`` is the previous one. That candle
-    #: has already closed by then, so this is a semantics choice, not look-ahead.
-    #:
-    #: Turning it on shifts every read by one index. Breakout comparisons in particular must move
-    #: to ``get_index(-2)``: a Donchian max channel that includes the current bar satisfies
-    #: ``channel_max >= candle.high >= candle.close``, so ``close > channel_max`` could never fire.
-    #: Level-style indicators (MA, ATR, rolling std) read fine at ``get_latest()`` either way.
-    #:
-    #: Settable per subclass or per instance. Every indicator shipped here leaves it False.
-    updates_before_decide: bool = False
-
     #: How many past output values stay readable through ``get_index``.
     #:
     #: Output series are bounded deques. Without a bound they grow for as long as the process
@@ -52,6 +34,7 @@ class BaseIndicator(ABC):
     #: constructor when a strategy parameter can drive the read depth past it.
     history_size: int = 8192
 
+    # TODO: baseIndicator는 get_* abstract method만 제공하고, update는 별도의 StreamedIndicator에서 제공
     def __init__(self, window: int, history_size: Optional[int] = None):
         self.window = window
         if history_size is not None:
@@ -91,6 +74,14 @@ class BaseIndicator(ABC):
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
         """
         Update the indicator with a new candle.
+
+        The engine always calls this **before** ``decide_action`` runs for the same candle, so
+        ``get_latest()`` includes the candle being decided on and ``get_index(-2)`` is the
+        previous one. That candle has already closed by then, so this is a semantics choice, not
+        look-ahead — but it does mean breakout/extremum comparisons must read ``get_index(-2)``
+        instead of ``get_latest()``: a Donchian max channel that included the current bar would
+        satisfy ``channel_max >= candle.high >= candle.close``, so ``close > channel_max`` could
+        never fire. Level-style indicators (MA, ATR, rolling std) read fine at ``get_latest()``.
 
         ``status`` is the pre-trade account snapshot — the same one ``decide_action`` saw for
         this candle (on an entry candle, ``status.position_for(symbol).position`` is still 0).

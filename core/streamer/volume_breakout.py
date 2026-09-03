@@ -13,8 +13,8 @@ class VolumeConfirmedMomentumStreamer(MomentumTimeExitStreamer):
     볼륨 확인 단기 모멘텀 — 기존 전략을 상속해 진입 필터만 얹는 예제.
 
     가격 단독 신호에 거래량이라는 다른 정보원을 게이트로 건다: 현재 캔들 volume의
-    z-score (직전 vol_window 캔들의 평균/표준편차 대비)가 min_vol_z 이상일 때만
-    모멘텀 진입을 허용. 청산/사이징은 MomentumTimeExitStreamer 그대로다.
+    z-score (이번 캔들을 포함한 최근 vol_window 캔들의 평균/표준편차 대비)가 min_vol_z
+    이상일 때만 모멘텀 진입을 허용. 청산/사이징은 MomentumTimeExitStreamer 그대로다.
 
     min_vol_z=None 이면 게이트 off (부모와 완전 동일 — 동등성 검증용).
     """

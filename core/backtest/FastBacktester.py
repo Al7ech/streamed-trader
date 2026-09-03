@@ -23,10 +23,10 @@ class ArrayIndicator(BaseIndicator):
     """Cursor-backed view over a precomputed indicator series.
 
     ``cursor`` is the number of candles (of the owning symbol's **own** series) already applied,
-    and ``seq[i]`` is the value after i+1 updates. An ``updates_before_decide=False`` indicator
-    sits at cursor == j during that symbol's j-th own candle and ``get_latest()`` excludes it,
-    while a flagged one is advanced to j+1 first so ``get_latest()`` includes it. Either way this
-    matches what a loop-updated indicator on the same side of ``decide_action`` would return.
+    and ``seq[i]`` is the value after i+1 updates. Every symbol's appearance in the merged event
+    stream advances the cursor to j+1 *before* the decision reads it, so ``get_latest()`` returns
+    ``seq[j]`` — the value through that symbol's j-th own candle, matching what a loop-updated
+    indicator would return now that every indicator ingests the candle before ``decide_action``.
 
     ``history_size`` is mirrored from the original indicator so a read deeper than the loop
     path retains raises ``IndexError`` here too, instead of quietly returning a value the loop
@@ -136,10 +136,7 @@ class FastBacktester(SingleThreadedBacktester):
         run_indicators: Dict[str, Dict] = {symbol: {} for symbol in symbols}
         precomputed: Dict[str, Dict[str, np.ndarray]] = {symbol: {} for symbol in symbols}
         live: Dict[str, Dict[str, BaseIndicator]] = {symbol: {} for symbol in symbols}
-        before_names: Dict[str, set] = {}
         for symbol in symbols:
-            before_names[symbol] = {name for name, ind in original_indicators.get(symbol, {}).items()
-                                    if ind.updates_before_decide}
             a = arrays[symbol]
             for name, indicator in original_indicators.get(symbol, {}).items():
                 if isinstance(indicator, VectorizedIndicator):
@@ -147,7 +144,6 @@ class FastBacktester(SingleThreadedBacktester):
                                                        a["volume"])
                     precomputed[symbol][name] = seq
                     shim = ArrayIndicator(seq, indicator.window, indicator.history_size)
-                    shim.updates_before_decide = indicator.updates_before_decide
                     run_indicators[symbol][name] = shim
                 else:
                     live[symbol][name] = indicator
@@ -201,16 +197,6 @@ class FastBacktester(SingleThreadedBacktester):
         trade_marks: List[Tuple[int, float, Dict[str, Tuple[float, float]]]] = []
 
         status = self.status
-        before_indicators = {
-            symbol: [ind for name, ind in run_indicators[symbol].items()
-                    if name in before_names[symbol]]
-            for symbol in symbols
-        }
-        after_indicators = {
-            symbol: [ind for name, ind in run_indicators[symbol].items()
-                    if name not in before_names[symbol]]
-            for symbol in symbols
-        }
         self.streamer.indicators = run_indicators
         try:
             for event_idx, (event_time, batch) in enumerate(
@@ -237,8 +223,9 @@ class FastBacktester(SingleThreadedBacktester):
 
                     # ArrayIndicator.update()는 자기 cursor를 1 증가시킬 뿐이라, 그 심볼의
                     # 이벤트마다 정확히 한 번씩만 불러도 "자기 몇 번째 캔들까지 반영했는지"가
-                    # 맞게 유지된다 — live(루프) 지표와 같은 호출 하나로 충분하다.
-                    for indicator in before_indicators[symbol]:
+                    # 맞게 유지된다 — live(루프) 지표와 같은 호출 하나로 충분하다. 모든 지표가
+                    # decide_action보다 먼저 갱신된다.
+                    for indicator in run_indicators[symbol].values():
                         indicator.update(candle, status)
 
                     if bankrupt:
@@ -250,9 +237,6 @@ class FastBacktester(SingleThreadedBacktester):
                     if collect_live_series:
                         for name, indicator in live[symbol].items():
                             live_series_on_grid[symbol][name][event_idx] = indicator.get_latest()
-
-                    for indicator in after_indicators[symbol]:
-                        indicator.update(candle, status)
 
                     actions.extend(symbol_actions)
 
@@ -298,7 +282,7 @@ class FastBacktester(SingleThreadedBacktester):
                     idxs = event_index_by_symbol[symbol]
                     cols = self._build_symbol_series_columns(
                         indicator_names, precomputed[symbol], live_series_on_grid.get(symbol, {}),
-                        len(sliced_candles[symbol]), n_events, idxs, before_names[symbol])
+                        n_events, idxs)
                     symbol_columns[symbol] = {
                         "indicators": cols,
                         "ohlc": ohlc_on_grid.get(symbol) if has_ohlc else None,
@@ -367,13 +351,11 @@ class FastBacktester(SingleThreadedBacktester):
     @staticmethod
     def _build_symbol_series_columns(indicator_names: List[str], precomputed_sym: Dict[str, np.ndarray],
                                      live_series_sym: Dict[str, List[Optional[float]]],
-                                     n_sym: int, n_events: int, event_indices_sym: List[int],
-                                     before_names_sym: set) -> Dict[str, object]:
+                                     n_events: int, event_indices_sym: List[int]) -> Dict[str, object]:
         """한 심볼의 지표 컬럼을 결정 시점 값으로 조립해 이벤트 그리드에 흩뿌린다.
 
-        ``precomputed_sym[name][j]``는 그 심볼의 j+1번째 캔들 반영 후 값이다. before-그룹
-        지표는 이미 그 캔들까지 반영된 채로 결정을 봤으므로 그대로 쓰고, 나머지는 결정 시점에
-        한 캔들 뒤처져 있었으므로 한 칸 밀어 넣는다 — 참조/단일심볼 FastBacktester와 같은 규칙.
+        ``precomputed_sym[name][j]``는 그 심볼의 j+1번째 캔들 반영 후 값이자 그 캔들의 결정이
+        본 값이므로(모든 지표가 decide_action보다 먼저 갱신된다) 시프트 없이 그대로 쓴다.
         live(루프) 컬럼은 결정 시점에 이미 이벤트 그리드 위에서 수집됐다.
         """
         idxs = np.asarray(event_indices_sym, dtype=np.int64) if event_indices_sym else None
@@ -381,17 +363,9 @@ class FastBacktester(SingleThreadedBacktester):
         for name in indicator_names:
             if name in precomputed_sym:
                 seq = precomputed_sym[name]
-                if name in before_names_sym:
-                    sym_col = seq
-                else:
-                    shifted = np.empty(n_sym, dtype=np.float64)
-                    if n_sym > 0:
-                        shifted[0] = np.nan
-                        shifted[1:] = seq[:-1]
-                    sym_col = shifted
                 grid = np.full(n_events, np.nan, dtype=np.float64)
-                if idxs is not None and n_sym > 0:
-                    grid[idxs] = sym_col
+                if idxs is not None and len(seq) > 0:
+                    grid[idxs] = seq
                 columns[name] = grid
             elif name in live_series_sym:
                 columns[name] = live_series_sym[name]

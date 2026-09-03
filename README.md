@@ -79,34 +79,18 @@ Two rules matter:
 
 1. **`Action.quantity` is a signed delta, not a target.** Positive buys, negative sells.
    `Action(-status.position)` closes; `Action(-2 * status.position)` flips.
-2. **Indicators exclude the candle you are deciding on — by default.** The engine calls
-   `decide_action` on a closed candle *first*, then updates the indicators with it. `get_latest()`
-   is the value through the previous candle, `get_index(-2)` the one before that — while the
-   current candle's OHLCV is available directly as the `candle` argument.
+2. **Indicators ingest the candle you are deciding on — always.** The engine updates every
+   indicator with a closed candle *first*, then calls `decide_action`. `get_latest()` is the
+   value through the candle being decided on, `get_index(-2)` the one before that — the current
+   candle's OHLCV is also available directly as the `candle` argument.
 
    This is a semantic convention, not a look-ahead guard: the candle has already closed, so
-   including it would leak nothing. The reason to exclude it is that breakout comparisons need it.
-   For a Donchian max channel that included the current bar you'd have
+   including it leaks nothing. It does mean breakout comparisons need `get_index(-2)`, not
+   `get_latest()`: for a Donchian max channel that included the current bar you'd have
    `channel_max >= candle.high >= candle.close`, so `close > channel_max` could never fire.
    "Price broke out of the range formed by *prior* bars" is the definition, not a precaution.
-   The convention is identical live and in backtest, so `get_latest()` never means two things.
-
-   **Opting out per indicator.** Set `updates_before_decide = True` and the engine feeds that
-   indicator the current candle *before* `decide_action`, so `get_latest()` includes the candle
-   being decided on and `get_index(-2)` is the previous one:
-
-   ```python
-   class MyIndicator(BaseIndicator):
-       updates_before_decide = True
-   ```
-
-   It also works per instance — `streamer.indicators["ATR"].updates_before_decide = True` — and
-   the two kinds mix freely inside one strategy. Every indicator shipped here leaves it `False`,
-   so this changes nothing unless you ask for it.
-
-   If you turn it on, every read shifts by one index. Breakout comparisons in particular must move
-   to `get_index(-2)`, for the reason above. Level-style indicators (MA, ATR, rolling std) read
-   fine at `get_latest()` either way.
+   Level-style indicators (MA, ATR, rolling std) read fine at `get_latest()` either way. The
+   convention is identical live and in backtest, so `get_latest()` never means two things.
 
 Point `core/examples/backtest.py` at your class and run it.
 
@@ -125,15 +109,14 @@ An indicator that reads `status` **cannot** be vectorized: account state depends
 strategy makes, which is a feedback loop. Keep those as plain `BaseIndicator`
 (`indicator/position_age.py` is the example). The two kinds mix freely in one strategy.
 
-Two class attributes tune an indicator, both settable per subclass or per instance:
+One class attribute tunes an indicator, settable per subclass or per instance:
 
 | Attribute | Default | Effect |
 |---|---|---|
 | `scale_group` | `"price"` | Chart pane. `"price"` overlays the candles; any other value gets its own pane, shared by indicators with the same group. |
-| `updates_before_decide` | `False` | When the current candle is ingested. `False` = after `decide_action` (`get_latest()` excludes it); `True` = before (`get_latest()` includes it). See rule 2 above. |
 
-So there are three independent choices per indicator: which pane it draws on, which side of the
-decision it ingests the candle on, and whether it is vectorized.
+So there are two independent choices per indicator: which pane it draws on, and whether it is
+vectorized.
 
 ### Bundled examples
 

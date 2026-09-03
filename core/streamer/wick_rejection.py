@@ -15,8 +15,8 @@ class WickRejectionStreamer(BaseStreamer):
 
     아래꼬리 >= wick_atr_mult x ATR(60) 이고 종가가 봉 레인지 상단
     (close - low >= close_pos x range) 이면 다음 봉에 롱 진입, hold_candles 경과 시
-    시간 청산. ATR은 인디케이터가 decide_action 이후 업데이트되므로 현재 봉을 제외한
-    직전 60봉 기준이다 (look-ahead 없음).
+    시간 청산. ATR은 인디케이터가 decide_action보다 먼저 업데이트되므로 이번 봉을 포함한
+    최근 60봉 기준이다 (봉은 이미 닫혔으므로 look-ahead는 아니다).
 
     - 사이징: 스탑 거리(stop_atr_mult x ATR)에서의 손실이 max_loss가 되도록 레버리지, 6x 캡
     - use_stop=False면 같은 사이징을 유지한 채 시간 청산만 사용

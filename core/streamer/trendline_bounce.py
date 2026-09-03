@@ -88,15 +88,15 @@ class TrendlineBounceStreamer(BaseStreamer):
 
     def _touch(self, symbol: str, name: str, tracker: _TouchTracker, candle: Candle,
               atr: float) -> bool:
-        """해당 선의 이번 봉 터치 여부 + 트래커 갱신. 인디케이터는 decide 후 업데이트되므로
-        선값은 직전 봉 기준 — 기울기로 1봉 외삽해 현재 봉의 선값을 얻는다."""
+        """해당 선의 이번 봉 터치 여부 + 트래커 갱신. 인디케이터가 decide_action보다 먼저
+        업데이트되므로 get_latest()는 이미 이번 봉 인덱스로 외삽된 선값이다 — 별도 외삽이
+        필요 없다 (PivotTrendlineIndicator.update()가 갱신 시점의 인덱스로 계산한다)."""
         ind = self.indicators[symbol].get(name)
         if ind is None:
             return False
         line = ind.get_latest()
         if line is None:
             return False
-        line += ind.slope
         if name == "RES":
             touched = candle.high >= line - self.eps * atr and candle.close < line
         else:
