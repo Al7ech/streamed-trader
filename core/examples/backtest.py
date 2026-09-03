@@ -27,13 +27,14 @@ if __name__ == "__main__":
     #    레버리지가 ~1.6x에 머무는 값을 쓴다.
     params = dict(window=72 * 60, m_entry=4.0, m_exit=3.0,
                   fee_ratio=0.0004, max_loss=0.005)
-    streamer = KeltnerStreamer(symbol=symbol, **params)
+    streamer = KeltnerStreamer(symbols=[symbol], **params)
 
-    # 3. 백테스트 실행
-    backtester = FastBacktester(streamer, candles)
+    # 3. 백테스트 실행. 멀티심볼 엔진은 심볼별 캔들 리스트를 받는다 — 단일 심볼 전략은
+    #    자기 심볼 하나짜리 dict만 넘기면 그대로 동작한다.
+    backtester = FastBacktester(streamer, {symbol: candles})
     init_margin = backtester.status.total_margin()
     metadata = {
-        "symbol": symbol,
+        "symbols": [symbol],
         "interval": interval,
         "start": start_date.isoformat(),
         "end": end_date.isoformat(),
@@ -47,7 +48,7 @@ if __name__ == "__main__":
     # 4. 결과 출력
     print(f"Max Leverage: {report.max_leverage}")
     # 런 JSON의 summary와 같은 규칙: 실현이 일어난 체결만, 수수료 차감 후로 승패를 가른다.
-    closes = [t for t in report.trades if t.status.position * t.quantity < 0]
+    closes = [t for t in report.trades if t.status.position_for(t.symbol).position * t.quantity < 0]
     win_trades = sum(1 for t in closes if t.wnl - t.fee > 0)
     lose_trades = sum(1 for t in closes if t.wnl - t.fee < 0)
     trades = win_trades + lose_trades

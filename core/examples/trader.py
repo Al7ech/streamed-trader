@@ -36,11 +36,11 @@ async def main():
     if not API_KEY or not API_SECRET:
         raise ValueError("API_KEY and API_SECRET must be set in environment variables or .env file")
 
-    SYMBOL = os.getenv("SYMBOL", None)
+    SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "").split(",") if s.strip()]
     INTERVAL = os.getenv("INTERVAL", None)
 
-    if not SYMBOL or not INTERVAL:
-        raise ValueError("SYMBOL and INTERVAL must be set in environment variables or .env file")
+    if not SYMBOLS or not INTERVAL:
+        raise ValueError("SYMBOLS and INTERVAL must be set in environment variables or .env file")
 
     # Result recording. Writes to <RESULT_PATH>/live/ in the same format the backtester
     # produces, so a live run and a backtest can be compared in the visualiser.
@@ -59,13 +59,13 @@ async def main():
         m_exit=float(os.getenv("M_EXIT", 3.0)),
         max_loss=float(os.getenv("MAX_LOSS", 0.005)),
     )
-    streamer = KeltnerStreamer(SYMBOL, **params)
+    streamer = KeltnerStreamer(SYMBOLS, **params)
 
-    # Create trader and executor
+    # Create trader and executor. Traded symbols come from streamer.symbols — no separate
+    # symbol/symbols argument here.
     trader = BinanceTrader(
         api_key=API_KEY,
         api_secret=API_SECRET,
-        symbol=SYMBOL,
         interval=INTERVAL,
         streamer=streamer,
         dry_run=DRY_RUN,

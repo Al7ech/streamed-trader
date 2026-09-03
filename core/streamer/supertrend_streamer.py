@@ -1,4 +1,5 @@
 import logging
+from typing import List
 
 from core.backtest.status import Status
 from core.streamer.action import Action
@@ -24,9 +25,9 @@ class SupertrendStreamer(BaseStreamer):
                  multiplier: float = 3.0,
                  max_loss: float = 0.08,
                  fee_ratio: float = 0.0004):
-        super().__init__({
+        super().__init__([symbol], {symbol: {
             "ST": SupertrendIndicator(atr_window, multiplier),
-        })
+        }})
         self.symbol = symbol
         self.max_loss = max_loss
         self.fee_ratio = fee_ratio
@@ -36,25 +37,27 @@ class SupertrendStreamer(BaseStreamer):
             f"SupertrendStreamer initialized with params: [atr_window={atr_window},"
             f"multiplier={multiplier},max_loss={max_loss}]")
 
-    def decide_action(self, candle: Candle, status: Status) -> Action:
-        st = self.indicators["ST"]
+    def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
+        st = self.indicators[symbol]["ST"]
         line = st.get_latest()
         direction = st.get_direction(-1)
         if line is None or direction is None:
-            return Action(0)
+            return []
+
+        position = status.position_for(symbol).position
 
         # 이미 추세 방향 포지션이면 유지
-        if status.position > 0 and direction == 1:
-            return Action(0)
-        if status.position < 0 and direction == -1:
-            return Action(0)
+        if position > 0 and direction == 1:
+            return []
+        if position < 0 and direction == -1:
+            return []
 
         price = candle.close
         dist = abs(price - line)
         if dist <= 0:
-            return Action(0)
+            return []
 
         lev = min(6.0, self.max_loss * price / dist)
         target_qty = trunc_by_sign(
             direction * status.total_margin() / (price * (1 / lev + self.fee_ratio)), 3)
-        return Action(target_qty - status.position)
+        return [Action(symbol, target_qty - position)]

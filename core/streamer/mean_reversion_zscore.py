@@ -1,4 +1,5 @@
 import logging
+from typing import List
 
 from core.backtest.status import Status
 from core.streamer.action import Action
@@ -31,10 +32,10 @@ class MeanReversionZScoreStreamer(BaseStreamer):
                  max_loss: float = 0.08,
                  fee_ratio: float = 0.0004,
                  use_stop: bool = True):
-        super().__init__({
+        super().__init__([symbol], {symbol: {
             "MA": MovingAverage(window),
             "STD": RollingStd(window),
-        })
+        }})
         self.symbol = symbol
         self.entry_z = entry_z
         self.timeout_candles = timeout_candles
@@ -51,37 +52,39 @@ class MeanReversionZScoreStreamer(BaseStreamer):
             f"MeanReversionZScoreStreamer initialized with params: [window={window},"
             f"entry_z={entry_z},timeout_candles={timeout_candles},max_loss={max_loss}]")
 
-    def decide_action(self, candle: Candle, status: Status) -> Action:
-        ma = self.indicators["MA"].get_latest()
-        std = self.indicators["STD"].get_latest()
+    def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
+        ind = self.indicators[symbol]
+        ma = ind["MA"].get_latest()
+        std = ind["STD"].get_latest()
         price = candle.close
+        position = status.position_for(symbol).position
 
-        if status.position != 0:
+        if position != 0:
             self._timeout_remaining -= 1
 
             if self.use_stop:
-                if status.position > 0 and candle.low <= self._stop_price:
-                    return Action(-status.position)
-                if status.position < 0 and self._stop_price <= candle.high:
-                    return Action(-status.position)
+                if position > 0 and candle.low <= self._stop_price:
+                    return [Action(symbol, -position)]
+                if position < 0 and self._stop_price <= candle.high:
+                    return [Action(symbol, -position)]
 
             if ma is not None and std is not None and std > 0:
                 z = (price - ma) / std
-                if status.position > 0 and z >= 0:
-                    return Action(-status.position)
-                if status.position < 0 and z <= 0:
-                    return Action(-status.position)
+                if position > 0 and z >= 0:
+                    return [Action(symbol, -position)]
+                if position < 0 and z <= 0:
+                    return [Action(symbol, -position)]
 
             if self._timeout_remaining <= 0:
-                return Action(-status.position)
-            return Action(0)
+                return [Action(symbol, -position)]
+            return []
 
         if ma is None or std is None or std <= 0:
-            return Action(0)
+            return []
 
         z = (price - ma) / std
         if abs(z) < self.entry_z:
-            return Action(0)
+            return []
 
         sign = -1 if z > 0 else 1  # 이탈의 역방향 (fade)
         stop_frac = self.entry_z * std / price
@@ -90,4 +93,4 @@ class MeanReversionZScoreStreamer(BaseStreamer):
 
         self._timeout_remaining = self.timeout_candles
         self._stop_price = price * (1 - sign * stop_frac)
-        return Action(qty)
+        return [Action(symbol, qty)]

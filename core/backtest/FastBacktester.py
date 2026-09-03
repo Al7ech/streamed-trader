@@ -7,8 +7,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from tqdm import tqdm
 
+from core.backtest.candle_merge import merge_candle_timeline
+from core.backtest.metrics import build_multi_symbol_buy_and_hold_curve, forward_fill_nan
 from core.backtest.SingleThreadedBacktester import SingleThreadedBacktester
-from core.backtest.metrics import build_buy_and_hold_curve
 from core.backtest.report import Report
 from core.backtest.result_writer import write_run_json, write_series_shards
 from core.backtest.status import Status
@@ -21,10 +22,10 @@ from core.streamer.indicator.base_indicator import BaseIndicator, VectorizedIndi
 class ArrayIndicator(BaseIndicator):
     """Cursor-backed view over a precomputed indicator series.
 
-    ``cursor`` is the number of candles already applied and ``seq[i]`` is the value after i+1
-    updates, so the cursor encodes the ingest ordering: an ``updates_before_decide=False``
-    indicator sits at cursor == i during candle i and ``get_latest()`` excludes candle i, while
-    a flagged one is advanced to i+1 first so ``get_latest()`` includes it. Either way this
+    ``cursor`` is the number of candles (of the owning symbol's **own** series) already applied,
+    and ``seq[i]`` is the value after i+1 updates. An ``updates_before_decide=False`` indicator
+    sits at cursor == j during that symbol's j-th own candle and ``get_latest()`` excludes it,
+    while a flagged one is advanced to j+1 first so ``get_latest()`` includes it. Either way this
     matches what a loop-updated indicator on the same side of ``decide_action`` would return.
 
     ``history_size`` is mirrored from the original indicator so a read deeper than the loop
@@ -65,132 +66,210 @@ class ArrayIndicator(BaseIndicator):
 
 
 class FastBacktester(SingleThreadedBacktester):
-    """Drop-in faster ``SingleThreadedBacktester``.
+    """Drop-in faster ``SingleThreadedBacktester``, generalized to multiple symbols.
 
-    ``VectorizedIndicator``s are precomputed in one shot from numpy candle arrays and swapped
-    for :class:`ArrayIndicator` shims during the run; plain ``BaseIndicator``s keep being
-    updated candle-by-candle exactly like the reference implementation, so both kinds can be
-    mixed freely. The trade accounting (``_trade``) is inherited unchanged.
+    ``VectorizedIndicator``s are precomputed in one shot **per symbol** from that symbol's own
+    numpy candle arrays and swapped for :class:`ArrayIndicator` shims during the run; plain
+    ``BaseIndicator``s keep being updated candle-by-candle exactly like the reference
+    implementation, so both kinds can be mixed freely. The trade accounting (``_trade``) is
+    inherited unchanged.
+
+    Candles from every symbol are still merged into one chronological event timeline (see
+    :func:`core.backtest.candle_merge.merge_candle_timeline`) — the vectorization is entirely
+    about how each symbol's own indicator series and equity contribution are computed, not about
+    skipping the merge.
     """
 
     def run(self, start_time: Optional[int] = None, end_time: Optional[int] = None,
             metadata: Optional[Dict] = None, save_series: bool = False,
             has_ohlc: bool = True) -> Report:
-        indicator_names = list(self.streamer.indicators.keys())
-        column_groups = {name: self.streamer.indicators[name].scale_group for name in indicator_names}
+        symbols = self.streamer.symbols
+        indicator_names: List[str] = []
+        seen = set()
+        for symbol in symbols:
+            for name in self.streamer.indicators.get(symbol, {}):
+                if name not in seen:
+                    seen.add(name)
+                    indicator_names.append(name)
+        column_groups: Dict[str, str] = {}
+        for name in indicator_names:
+            for symbol in symbols:
+                ind = self.streamer.indicators.get(symbol, {}).get(name)
+                if ind is not None:
+                    column_groups[name] = ind.scale_group
+                    break
+
         streamer_name = type(self.streamer).__name__
         run_id = f"{streamer_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         init_margin = self.status.total_margin()
         # 첫 거래 이전 구간의 자본을 되살리려면 진입 시점의 실제 상태가 필요하다.
-        # init_margin(= margin + 미실현)과 달리 이건 세 성분을 따로 들고 있어야 한다.
         entry_margin = self.status.margin
-        entry_position = self.status.position
-        entry_avg_price = self.status.avg_price
-        interval_ms = (self.candles[1].start_time - self.candles[0].start_time
-                       if len(self.candles) >= 2 else 0)
+        entry_positions: Dict[str, Tuple[float, float]] = {
+            sym: (p.position, p.avg_price) for sym, p in self.status.positions.items()}
+        interval_ms = self._interval_ms()
 
-        # start/end filtering as one slice instead of per-candle checks
-        end_times_all = np.fromiter((c.end_time for c in self.candles), dtype=np.int64,
-                                    count=len(self.candles))
-        lo = int(np.searchsorted(end_times_all, start_time, side="left")) if start_time else 0
-        hi = int(np.searchsorted(end_times_all, end_time, side="right")) if end_time else len(self.candles)
-        candles = self.candles[lo:hi]
-        n = len(candles)
+        # 심볼별 슬라이스 + numpy 배열. start/end 필터는 병합 이벤트 시각 기준 필터와 동치다 —
+        # 한 이벤트의 모든 후보 캔들이 같은 end_time을 공유하므로, 심볼별로 미리 잘라내도
+        # 참조 구현이 이벤트 단위로 자르는 것과 같은 부분집합이 남는다.
+        sliced_candles: Dict[str, List[Candle]] = {}
+        arrays: Dict[str, Dict[str, np.ndarray]] = {}
+        for symbol in symbols:
+            candles = self.candles_by_symbol.get(symbol, [])
+            end_times_all = np.fromiter((c.end_time for c in candles), dtype=np.int64,
+                                        count=len(candles))
+            lo = int(np.searchsorted(end_times_all, start_time, side="left")) if start_time else 0
+            hi = (int(np.searchsorted(end_times_all, end_time, side="right"))
+                 if end_time else len(candles))
+            sub = candles[lo:hi]
+            n_sym = len(sub)
+            sliced_candles[symbol] = sub
+            arrays[symbol] = {
+                "open": np.fromiter((c.open for c in sub), np.float64, n_sym),
+                "high": np.fromiter((c.high for c in sub), np.float64, n_sym),
+                "low": np.fromiter((c.low for c in sub), np.float64, n_sym),
+                "close": np.fromiter((c.close for c in sub), np.float64, n_sym),
+                "volume": np.fromiter((c.volume for c in sub), np.float64, n_sym),
+            }
 
-        open_arr = np.fromiter((c.open for c in candles), dtype=np.float64, count=n)
-        high_arr = np.fromiter((c.high for c in candles), dtype=np.float64, count=n)
-        low_arr = np.fromiter((c.low for c in candles), dtype=np.float64, count=n)
-        close_arr = np.fromiter((c.close for c in candles), dtype=np.float64, count=n)
-        volume_arr = np.fromiter((c.volume for c in candles), dtype=np.float64, count=n)
-        end_times = end_times_all[lo:hi]
-
-        # split indicators: vectorized ones become array shims, the rest stay loop-updated
+        # split indicators per symbol: vectorized ones become array shims, the rest stay loop-updated
         original_indicators = self.streamer.indicators
-        run_indicators: Dict = {}
-        precomputed: Dict[str, np.ndarray] = {}
-        live: Dict[str, BaseIndicator] = {}
-        for name, indicator in original_indicators.items():
-            if isinstance(indicator, VectorizedIndicator):
-                seq = indicator.precompute_series(open_arr, high_arr, low_arr, close_arr, volume_arr)
-                precomputed[name] = seq
-                shim = ArrayIndicator(seq, indicator.window, indicator.history_size)
-                shim.updates_before_decide = indicator.updates_before_decide
-                run_indicators[name] = shim
-            else:
-                live[name] = indicator
-                run_indicators[name] = indicator
+        run_indicators: Dict[str, Dict] = {symbol: {} for symbol in symbols}
+        precomputed: Dict[str, Dict[str, np.ndarray]] = {symbol: {} for symbol in symbols}
+        live: Dict[str, Dict[str, BaseIndicator]] = {symbol: {} for symbol in symbols}
+        before_names: Dict[str, set] = {}
+        for symbol in symbols:
+            before_names[symbol] = {name for name, ind in original_indicators.get(symbol, {}).items()
+                                    if ind.updates_before_decide}
+            a = arrays[symbol]
+            for name, indicator in original_indicators.get(symbol, {}).items():
+                if isinstance(indicator, VectorizedIndicator):
+                    seq = indicator.precompute_series(a["open"], a["high"], a["low"], a["close"],
+                                                       a["volume"])
+                    precomputed[symbol][name] = seq
+                    shim = ArrayIndicator(seq, indicator.window, indicator.history_size)
+                    shim.updates_before_decide = indicator.updates_before_decide
+                    run_indicators[symbol][name] = shim
+                else:
+                    live[symbol][name] = indicator
+                    run_indicators[symbol][name] = indicator
 
-        # the originals are the authority for the flag; shims mirror it above
-        before_names = {name for name, ind in original_indicators.items()
-                        if ind.updates_before_decide}
+        # merged event timeline over the (already sliced) per-symbol candle lists
+        events = list(merge_candle_timeline(sliced_candles))
+        n_events = len(events)
+        event_times = np.fromiter((t for t, _ in events), dtype=np.int64, count=n_events)
+
+        # 심볼별로 "자기 몇 번째 캔들이 어느 이벤트 인덱스에 있는지" — ArrayIndicator 커서
+        # 진행과 종가/지표 값을 이벤트 그리드에 흩뿌리는 데 둘 다 쓰인다.
+        event_index_by_symbol: Dict[str, List[int]] = {symbol: [] for symbol in symbols}
+        for i, (_, batch) in enumerate(events):
+            for symbol, _ in batch:
+                event_index_by_symbol[symbol].append(i)
+
+        # 종가를 이벤트 그리드에 흩뿌리고 직전값으로 채운다 — 자본 곡선 재구성과 buy & hold
+        # 기준선 양쪽에 쓰인다 (그 심볼의 캔들이 없는 이벤트는 최신 알려진 종가로 시가평가).
+        close_on_grid: Dict[str, np.ndarray] = {}
+        ohlc_on_grid: Dict[str, Dict[str, np.ndarray]] = {}
+        for symbol in symbols:
+            idxs = np.asarray(event_index_by_symbol[symbol], dtype=np.int64)
+            a = arrays[symbol]
+            grid_close = np.full(n_events, np.nan, dtype=np.float64)
+            if len(idxs) > 0:
+                grid_close[idxs] = a["close"]
+            close_on_grid[symbol] = forward_fill_nan(grid_close)
+            if has_ohlc:
+                oh: Dict[str, np.ndarray] = {}
+                for k in ("open", "high", "low", "close"):
+                    g = np.full(n_events, np.nan, dtype=np.float64)
+                    if len(idxs) > 0:
+                        g[idxs] = a[k]
+                    # 실제 구멍을 그대로 둔다 (직전값으로 채우지 않는다) — 그 심볼의 캔들이
+                    # 없는 이벤트에서는 OHLC를 null로 남겨 프론트가 그 구간을 건너뛰게 한다.
+                    oh[k] = g
+                ohlc_on_grid[symbol] = oh
 
         write_output = metadata is not None
-        collect_live_series = write_output and save_series and bool(live)
-        live_series: Dict[str, List[Optional[float]]] = {name: [] for name in live}
-        live_items = list(live.items())
+        collect_live_series = write_output and save_series and any(live[s] for s in symbols)
+        live_series_on_grid: Dict[str, Dict[str, List[Optional[float]]]] = {
+            symbol: {name: [None] * n_events for name in live[symbol]} for symbol in symbols
+        } if collect_live_series else {}
 
         trades: List[Trade] = []
         max_leverage = 0.0
-        # (candle idx, post-trade margin/position/avg_price) marks for equity reconstruction
-        trade_marks: List[Tuple[int, float, float, float]] = []
+        # (event idx, post-trade margin, {symbol: (position, avg_price)}) marks for equity
+        # reconstruction — a fill only changes one symbol's position, but reconstructing equity
+        # for the segment needs every symbol's state, so the full snapshot is kept each time.
+        trade_marks: List[Tuple[int, float, Dict[str, Tuple[float, float]]]] = []
 
         status = self.status
-        decide = self.streamer.update_candle
-        live_before = [ind for name, ind in live.items() if name in before_names]
-        live_after = [ind for name, ind in live.items() if name not in before_names]
-        shims_before = [ind for name, ind in run_indicators.items()
-                        if isinstance(ind, ArrayIndicator) and name in before_names]
-        shims_after = [ind for name, ind in run_indicators.items()
-                       if isinstance(ind, ArrayIndicator) and name not in before_names]
-
+        before_indicators = {
+            symbol: [ind for name, ind in run_indicators[symbol].items()
+                    if name in before_names[symbol]]
+            for symbol in symbols
+        }
+        after_indicators = {
+            symbol: [ind for name, ind in run_indicators[symbol].items()
+                    if name not in before_names[symbol]]
+            for symbol in symbols
+        }
         self.streamer.indicators = run_indicators
         try:
-            for i, candle in enumerate(tqdm(candles, desc="Backtesting", unit="candle",
-                                            file=sys.stdout)):
-                price = candle.close
+            for event_idx, (event_time, batch) in enumerate(
+                    tqdm(events, desc="Backtesting", unit="event", file=sys.stdout)):
+                event_candles: Dict[str, Candle] = {}
+                for symbol, candle in batch:
+                    event_candles[symbol] = candle
+                    status.last_close[symbol] = candle.close
 
-                # 시가평가를 먼저 한다. before-indicator가 reference/라이브와 **같은** 거래 전
-                # 스냅샷을 보게 하려면 이 순서여야 한다 (SingleThreadedBacktester는
-                # update_unrealised_pnl 뒤에 before-indicator를 돌린다). 예전에는 반대라서
-                # status를 읽는 before-indicator가 직전 캔들 종가 기준 미실현을 봤다.
-                status.unrealised_pnl = (status.position * (price - status.avg_price)
-                                         if status.position != 0.0 else 0.0)
+                # 시가평가를 먼저 한다 (before-indicator가 거래 전 스냅샷을 보게 하려면 이 순서).
+                for symbol, pos_state in status.positions.items():
+                    if pos_state.position != 0.0 and symbol in status.last_close:
+                        status.update_unrealised_pnl(symbol, status.last_close[symbol])
+                event_equity = status.total_margin()
 
-                # opt-in indicators ingest this candle before the decision sees them
-                cursor = i + 1
-                for shim in shims_before:
-                    shim.cursor = cursor
-                for indicator in live_before:
-                    indicator.update(candle, status)
+                # 강제청산: 시가평가 자본이 0 이하면 파산. 지표 갱신은 파산 여부와 무관하게
+                # 계속된다 — 건너뛰는 것은 스트리머의 결정 호출뿐이다 (reference와 동일).
+                bankrupt = event_equity <= 0.0
+                actions: List[Action] = []
+                for symbol in symbols:
+                    candle = event_candles.get(symbol)
+                    if candle is None:
+                        continue
 
-                # 강제청산: 시가평가 자본이 0 이하 = 파산 (reference와 같은 조건).
-                # flat이면 미실현이 0이라 margin <= 0 과 같고 Action(-0) == Action(0) 이므로
-                # "파산 후에는 스트리머를 부르지 않는다"가 된다 — reference와 동일하다.
-                if status.margin + status.unrealised_pnl <= 0.0:
-                    action = Action(-status.position)
-                else:
-                    action = decide(candle, status)
+                    # ArrayIndicator.update()는 자기 cursor를 1 증가시킬 뿐이라, 그 심볼의
+                    # 이벤트마다 정확히 한 번씩만 불러도 "자기 몇 번째 캔들까지 반영했는지"가
+                    # 맞게 유지된다 — live(루프) 지표와 같은 호출 하나로 충분하다.
+                    for indicator in before_indicators[symbol]:
+                        indicator.update(candle, status)
 
-                if collect_live_series:
-                    # collected between the two update groups, so each value is the one
-                    # decide_action saw regardless of which side it was fed on
-                    for name, indicator in live_items:
-                        live_series[name].append(indicator.get_latest())
+                    if bankrupt:
+                        position = status.position_for(symbol).position
+                        symbol_actions = [Action(symbol, -position)] if position != 0.0 else []
+                    else:
+                        symbol_actions = self.streamer.update_candle(symbol, candle, status)
 
-                # indicators see the same pre-trade status decide_action saw for this candle
-                for indicator in live_after:
-                    indicator.update(candle, status)
-                for shim in shims_after:
-                    shim.cursor = cursor
+                    if collect_live_series:
+                        for name, indicator in live[symbol].items():
+                            live_series_on_grid[symbol][name][event_idx] = indicator.get_latest()
 
-                if action.quantity != 0:
+                    for indicator in after_indicators[symbol]:
+                        indicator.update(candle, status)
+
+                    actions.extend(symbol_actions)
+
+                for action in actions:
+                    if action.quantity == 0:
+                        continue
+                    price = status.last_close.get(action.symbol)
+                    if price is None:
+                        continue
                     prev_status = copy.deepcopy(status)
                     wnl, fee = self._trade(action, price)
                     leverage = status.update_leverage()
                     if leverage > max_leverage:
                         max_leverage = leverage
                     trades.append(Trade(
-                        timestamp=candle.end_time,
+                        timestamp=event_time,
+                        symbol=action.symbol,
                         quantity=action.quantity,
                         price=price,
                         wnl=wnl,
@@ -198,36 +277,44 @@ class FastBacktester(SingleThreadedBacktester):
                         status=prev_status,
                         leverage=leverage,
                     ))
-                    trade_marks.append((i, status.margin, status.position, status.avg_price))
+                    trade_marks.append((event_idx, status.margin,
+                                        {s: (p.position, p.avg_price)
+                                        for s, p in status.positions.items()}))
         finally:
             self.streamer.indicators = original_indicators
 
-        equity_curve = self._build_equity_curve(end_times, close_arr, trade_marks,
-                                                entry_margin, entry_position, entry_avg_price)
-        benchmark_curve = build_buy_and_hold_curve(end_times, close_arr, init_margin)
+        equity_curve = self._build_equity_curve(event_times, close_on_grid, trade_marks,
+                                                entry_margin, entry_positions)
+        benchmark_curve = build_multi_symbol_buy_and_hold_curve(
+            event_times, close_on_grid, init_margin)
         report = Report(trades, max_leverage, self.status, equity_curve, benchmark_curve)
 
         if write_output:
             backtest_dir = self._prepare_backtest_dir()
             shards = []
             if save_series:
-                columns = self._build_series_columns(indicator_names, precomputed, live_series, n,
-                                                     before_names)
-                # pre-trade equity at each candle — unlike indicator columns this belongs to its
-                # own candle, so no decide-time shift
-                columns["balance"] = np.fromiter((v for _, v in equity_curve),
-                                                 dtype=np.float64, count=n)
-                ohlc = ({"open": open_arr, "high": high_arr, "low": low_arr, "close": close_arr}
-                        if has_ohlc else None)
-                shards = write_series_shards(backtest_dir, run_id, end_times, ohlc, columns,
-                                             interval_ms)
+                symbol_columns: Dict[str, Dict[str, Optional[Dict[str, object]]]] = {}
+                for symbol in symbols:
+                    idxs = event_index_by_symbol[symbol]
+                    cols = self._build_symbol_series_columns(
+                        indicator_names, precomputed[symbol], live_series_on_grid.get(symbol, {}),
+                        len(sliced_candles[symbol]), n_events, idxs, before_names[symbol])
+                    symbol_columns[symbol] = {
+                        "indicators": cols,
+                        "ohlc": ohlc_on_grid.get(symbol) if has_ohlc else None,
+                    }
+                balance = np.fromiter((v for _, v in equity_curve), dtype=np.float64,
+                                      count=n_events)
+                shards = write_series_shards(backtest_dir, run_id, event_times, balance,
+                                             symbol_columns, interval_ms, has_ohlc)
             meta = dict(metadata)
             meta.setdefault("streamer", streamer_name)
             meta["run_at"] = datetime.now(timezone.utc).isoformat()
             meta["init_margin"] = init_margin
-            meta["candle_count"] = n
+            meta["candle_count"] = n_events
             meta.setdefault("interval_ms", interval_ms)
             write_run_json(backtest_dir, run_id, report, meta, shards,
+                           symbols=symbols,
                            columns=indicator_names + ["balance"],
                            column_groups={**column_groups, "balance": "balance"},
                            has_ohlc=has_ohlc, interval_ms=interval_ms, init_margin=init_margin)
@@ -240,66 +327,74 @@ class FastBacktester(SingleThreadedBacktester):
         return backtest_dir
 
     @staticmethod
-    def _build_equity_curve(end_times: np.ndarray, close_arr: np.ndarray,
-                            trade_marks: List[Tuple[int, float, float, float]],
-                            entry_margin: float, entry_position: float,
-                            entry_avg_price: float) -> List[Tuple[int, float]]:
-        """Rebuild the per-candle equity curve vectorized.
+    def _build_equity_curve(event_times: np.ndarray, close_on_grid: Dict[str, np.ndarray],
+                            trade_marks: List[Tuple[int, float, Dict[str, Tuple[float, float]]]],
+                            entry_margin: float,
+                            entry_positions: Dict[str, Tuple[float, float]]
+                            ) -> List[Tuple[int, float]]:
+        """Rebuild the per-event equity curve vectorized.
 
-        Between trades margin/position/avg_price are constant, so each segment is just
-        ``margin + position * (close - avg_price)``. The reference records equity *before*
-        the trade at a trade candle, so the state from trade k applies to candles
-        (idx_k, idx_{k+1}].
+        Between trades margin and every symbol's (position, avg_price) are constant, so each
+        segment is ``margin + Σ_sym position_sym * (close_sym[seg] - avg_price_sym)``. The
+        reference records equity *before* the trade at a trade event, so the state from trade k
+        applies to events (idx_k, idx_{k+1}].
 
-        첫 거래 이전 구간은 **진입 시점의 실제 상태**로 시드한다. flat이라고 가정하면
-        ``run()``을 같은 인스턴스로 두 번 부르거나 포지션을 들고 시작할 때 그 구간이 상수로
-        찍히고, 거기서 파생되는 max_drawdown/sharpe/balance 컬럼까지 함께 틀어진다.
+        첫 거래 이전 구간은 **진입 시점의 실제 상태**로 시드한다 (``run()``을 같은 인스턴스로
+        두 번 부르거나 포지션을 들고 시작할 때를 위해).
         """
-        n = len(end_times)
+        n = len(event_times)
         if n == 0:
             return []
         equity = np.empty(n, dtype=np.float64)
         seg_start = 0
-        margin, position, avg_price = entry_margin, entry_position, entry_avg_price
-        for idx, m, p, a in trade_marks:
+        margin = entry_margin
+        positions = entry_positions
+        for idx, m, pos_snapshot in trade_marks:
             seg_end = idx + 1
-            if position != 0.0:
-                equity[seg_start:seg_end] = margin + position * (close_arr[seg_start:seg_end] - avg_price)
-            else:
-                equity[seg_start:seg_end] = margin
+            equity[seg_start:seg_end] = margin
+            for sym, (pos, avg) in positions.items():
+                if pos != 0.0:
+                    equity[seg_start:seg_end] += pos * (close_on_grid[sym][seg_start:seg_end] - avg)
             seg_start = seg_end
-            margin, position, avg_price = m, p, a
+            margin, positions = m, pos_snapshot
         if seg_start < n:
-            if position != 0.0:
-                equity[seg_start:] = margin + position * (close_arr[seg_start:] - avg_price)
-            else:
-                equity[seg_start:] = margin
-        return list(zip(end_times.tolist(), equity.tolist()))
+            equity[seg_start:] = margin
+            for sym, (pos, avg) in positions.items():
+                if pos != 0.0:
+                    equity[seg_start:] += pos * (close_on_grid[sym][seg_start:] - avg)
+        return list(zip(event_times.tolist(), equity.tolist()))
 
     @staticmethod
-    def _build_series_columns(indicator_names: List[str], precomputed: Dict[str, np.ndarray],
-                              live_series: Dict[str, List[Optional[float]]], n: int,
-                              before_names: Optional[set] = None) -> Dict:
-        """Assemble decide-time indicator columns.
+    def _build_symbol_series_columns(indicator_names: List[str], precomputed_sym: Dict[str, np.ndarray],
+                                     live_series_sym: Dict[str, List[Optional[float]]],
+                                     n_sym: int, n_events: int, event_indices_sym: List[int],
+                                     before_names_sym: set) -> Dict[str, object]:
+        """한 심볼의 지표 컬럼을 결정 시점 값으로 조립해 이벤트 그리드에 흩뿌린다.
 
-        ``precomputed[name][i]`` is the value after i+1 updates. An ``updates_before_decide``
-        indicator was already advanced when the streamer ran, so its decide-time value at candle
-        i is ``seq[i]`` — used as-is. Everything else was still one candle behind, so its column
-        is shifted one candle right. Live (loop) columns were collected at decide time already
-        and are correct for both groups.
+        ``precomputed_sym[name][j]``는 그 심볼의 j+1번째 캔들 반영 후 값이다. before-그룹
+        지표는 이미 그 캔들까지 반영된 채로 결정을 봤으므로 그대로 쓰고, 나머지는 결정 시점에
+        한 캔들 뒤처져 있었으므로 한 칸 밀어 넣는다 — 참조/단일심볼 FastBacktester와 같은 규칙.
+        live(루프) 컬럼은 결정 시점에 이미 이벤트 그리드 위에서 수집됐다.
         """
-        before_names = before_names or set()
-        columns: Dict = {}
+        idxs = np.asarray(event_indices_sym, dtype=np.int64) if event_indices_sym else None
+        columns: Dict[str, object] = {}
         for name in indicator_names:
-            if name in precomputed:
-                if name in before_names:
-                    columns[name] = precomputed[name]
+            if name in precomputed_sym:
+                seq = precomputed_sym[name]
+                if name in before_names_sym:
+                    sym_col = seq
                 else:
-                    shifted = np.empty(n, dtype=np.float64)
-                    if n > 0:
+                    shifted = np.empty(n_sym, dtype=np.float64)
+                    if n_sym > 0:
                         shifted[0] = np.nan
-                        shifted[1:] = precomputed[name][:-1]
-                    columns[name] = shifted
+                        shifted[1:] = seq[:-1]
+                    sym_col = shifted
+                grid = np.full(n_events, np.nan, dtype=np.float64)
+                if idxs is not None and n_sym > 0:
+                    grid[idxs] = sym_col
+                columns[name] = grid
+            elif name in live_series_sym:
+                columns[name] = live_series_sym[name]
             else:
-                columns[name] = live_series[name]
+                columns[name] = [None] * n_events
         return columns

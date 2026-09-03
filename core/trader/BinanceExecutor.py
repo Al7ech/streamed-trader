@@ -132,14 +132,14 @@ class BinanceExecutor:
         future = self.executor.submit(self._execute_order_with_retry, order_request)
         return future
 
-    def execute_action(self, action: Action, symbol: str) -> Future[OrderResult]:
+    def execute_action(self, action: Action) -> Future[OrderResult]:
         """
-        Execute a trading action as a market order.
-        
+        Execute a trading action as a market order. ``action.symbol``이 대상 심볼이다 —
+        Action이 자기 심볼을 들고 다니므로 별도 symbol 인자를 받지 않는다.
+
         Args:
             action: Trading action from streamer
-            symbol: Trading symbol
-            
+
         Returns:
             Future object that will contain the OrderResult
         """
@@ -155,7 +155,7 @@ class BinanceExecutor:
         quantity = abs(action.quantity)
 
         order_request = OrderRequest(
-            symbol=symbol,
+            symbol=action.symbol,
             side=side,
             order_type=OrderType.MARKET,
             quantity=quantity

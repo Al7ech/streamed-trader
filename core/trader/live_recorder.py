@@ -23,10 +23,11 @@ import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from core.backtest.metrics import build_buy_and_hold_curve
+from core.backtest.indicator_columns import collect_indicator_columns
+from core.backtest.metrics import build_multi_symbol_buy_and_hold_curve
 from core.backtest.report import Report
-from core.backtest.result_writer import ShardWriter, read_shard, write_run_json
-from core.backtest.status import Status
+from core.backtest.result_writer import SCHEMA_VERSION, ShardWriter, read_shard, write_run_json
+from core.backtest.status import PositionState, Status
 from core.backtest.trade import Trade
 from core.streamer import BaseStreamer
 from core.streamer import Candle
@@ -35,11 +36,9 @@ from core.streamer import Candle
 # 수 MB라 매 캔들 다시 쓰면 하루 수 GB가 되므로 기본값을 시간 단위로 둔다.
 DEFAULT_SHARD_FLUSH_EVERY = 60
 
-#: metadata.last_status 로 저장/복원하는 Status 필드.
-_STATUS_FIELDS = ("avg_price", "unrealised_pnl", "margin", "position", "leverage")
 
-
-def default_run_id(streamer: BaseStreamer, symbol: str, interval: str, dry_run: bool) -> str:
+def default_run_id(streamer: BaseStreamer, symbols: List[str], interval: str,
+                   dry_run: bool) -> str:
     """재기동해도 같은 런에 이어쓰기 위한 **고정** run_id.
 
     백테스트 run_id(``<Streamer>_<YYYYmmdd_HHMMSS>``)와 절대 겹치면 안 된다 — 프론트의 파일
@@ -48,9 +47,13 @@ def default_run_id(streamer: BaseStreamer, symbol: str, interval: str, dry_run: 
 
     드라이런과 라이브를 나누는 것도 필수다. 드라이런 자본은 합성값(1e6)이고 라이브는 실제
     지갑 잔고라, 한 곡선에 섞이면 아무 의미가 없어진다.
+
+    심볼은 **정렬해서** 이어붙인다 — 설정 파일에 나열된 순서가 바뀌어도(같은 심볼 집합이면)
+    같은 run_id를 얻어야 재기동 시 새 런으로 갈라지지 않는다.
     """
     mode = "dry" if dry_run else "live"
-    return f"{mode}_{type(streamer).__name__}_{symbol.upper()}_{interval}"
+    joined = "-".join(sorted(s.upper() for s in symbols))
+    return f"{mode}_{type(streamer).__name__}_{joined}_{interval}"
 
 
 class LiveRecorder:
@@ -78,18 +81,18 @@ class LiveRecorder:
         os.makedirs(self.dir_path, exist_ok=True)
 
         self._streamer = streamer
+        self.symbols: List[str] = list(streamer.symbols)
         self._status = status
         self._interval_ms = interval_ms
         self._has_ohlc = has_ohlc
         self._shard_flush_every = max(1, shard_flush_every)
 
-        self._indicator_names = list(streamer.indicators.keys())
-        self._column_groups = {name: ind.scale_group
-                               for name, ind in streamer.indicators.items()}
+        self._indicator_names, self._column_groups = collect_indicator_columns(streamer)
         self._columns = self._indicator_names + ["balance"]
 
         self._equity: List[Tuple[int, float]] = []
-        self._closes: List[float] = []
+        self._closes_by_symbol: Dict[str, List[Optional[float]]] = {
+            s: [] for s in self.symbols}
         self._trades: List[Trade] = []
         self._max_leverage = 0.0
         self._candles_since_shard_flush = 0
@@ -126,29 +129,34 @@ class LiveRecorder:
 
     # ------------------------------------------------------------------ 기록
 
-    def record_candle(self, candle: Candle, status: Status) -> None:
-        """마감된 캔들 하나를 적재한다.
+    def record_candle(self, symbol: str, candle: Candle, status: Status) -> None:
+        """마감된 캔들 하나를 적재한다. ``symbol``은 이 캔들이 마감된 심볼이다.
 
         ``SingleThreadedBacktester.run``의 기록 지점과 1:1로 대응한다 — 호출자는 반드시
         ``decide_action`` 직후이자 after-indicator 갱신 **전에** 불러야 한다. 그래야 모든
-        지표 컬럼이 그 결정이 실제로 본 값이 된다.
+        지표 컬럼이 그 결정이 실제로 본 값이 된다. 또한 호출자는 이 시점 이전에
+        ``status.last_close[symbol]``을 이 캔들의 종가로 갱신해 둬야 한다 — 벤치마크 곡선이
+        그 값으로 다른 심볼들의 "가장 최근에 알려진 종가"를 함께 채우기 때문이다.
         """
         # 자본과 종가는 **항상 같이** 늘어나야 한다. _downsample_equity가 길이로 stride를
         # 정하므로 어긋나면 equity와 benchmark의 인덱스 짝이 조용히 밀린다.
-        self._equity.append((candle.end_time, status.total_margin()))
-        self._closes.append(candle.close)
+        equity = status.total_margin()
+        self._equity.append((candle.end_time, equity))
+        for s in self.symbols:
+            self._closes_by_symbol[s].append(status.last_close.get(s))
 
-        values = {name: ind.get_latest() for name, ind in self._streamer.indicators.items()}
-        values["balance"] = status.total_margin()
-        self._shard_writer.add(candle, values)
+        values = {name: ind.get_latest()
+                 for name, ind in self._streamer.indicators.get(symbol, {}).items()}
+        self._shard_writer.add(candle.end_time, equity, {symbol: (candle, values)})
         self._candles_since_shard_flush += 1
 
-    def record_trade(self, timestamp: int, quantity: float, price: float,
+    def record_trade(self, symbol: str, timestamp: int, quantity: float, price: float,
                      wnl: float, fee: float, pre_status: Status, leverage: float) -> None:
         """체결 하나를 적재한다. ``pre_status``는 **거래 전** 스냅샷이어야 한다."""
         self._max_leverage = max(self._max_leverage, leverage)
         self._trades.append(Trade(
             timestamp=timestamp,
+            symbol=symbol,
             quantity=quantity,
             price=price,
             wnl=wnl,
@@ -166,11 +174,12 @@ class LiveRecorder:
             self._shard_writer.checkpoint()
             self._candles_since_shard_flush = 0
 
-        benchmark = build_buy_and_hold_curve([t for t, _ in self._equity], self._closes,
-                                             self._init_margin)
+        benchmark = build_multi_symbol_buy_and_hold_curve(
+            [t for t, _ in self._equity], self._closes_by_symbol, self._init_margin)
         report = Report(self._trades, self._max_leverage, self._status, self._equity, benchmark)
         write_run_json(self.dir_path, self.run_id, report, self._build_metadata(checkpointing),
                        self._shard_writer.shards,
+                       symbols=self.symbols,
                        columns=self._columns,
                        column_groups={**self._column_groups, "balance": "balance"},
                        has_ohlc=self._has_ohlc, interval_ms=self._interval_ms,
@@ -205,7 +214,7 @@ class LiveRecorder:
     # ------------------------------------------------------------------ 내부
 
     def _new_shard_writer(self) -> ShardWriter:
-        return ShardWriter(self.dir_path, self.run_id, self._columns,
+        return ShardWriter(self.dir_path, self.run_id, self.symbols, self._indicator_names,
                            self._has_ohlc, self._interval_ms)
 
     def _run_json_path(self, run_id: str) -> str:
@@ -223,12 +232,18 @@ class LiveRecorder:
             return None
 
     def _is_compatible(self, doc: Dict) -> bool:
-        """이어써도 되는 런인지 — 지표 컬럼과 전략/심볼 설정이 그대로여야 한다."""
+        """이어써도 되는 런인지 — 지표 컬럼과 전략/심볼 설정이 그대로여야 한다.
+
+        ``schema_version``도 검사한다: v4에서 샤드의 물리적 모양이 바뀌었으므로(평평한
+        ohlc/indicators -> symbols 아래 중첩) 그 이전 버전 런은 다른 설정이 전부 일치해도
+        이어쓰지 않는다 — v1-v3 샤드를 v4 코드로 재개하려 들면 형식이 안 맞아 깨진다.
+        """
         series = doc.get("series") or {}
         meta = doc.get("metadata") or {}
         checks = [
+            ("schema_version", doc.get("schema_version"), SCHEMA_VERSION),
             ("columns", series.get("columns"), self._columns),
-            ("symbol", meta.get("symbol"), self._metadata.get("symbol")),
+            ("symbols", meta.get("symbols"), self._metadata.get("symbols")),
             ("interval", meta.get("interval"), self._metadata.get("interval")),
             ("params", meta.get("params"), self._metadata.get("params")),
             ("streamer", meta.get("streamer"), self._metadata.get("streamer")),
@@ -253,13 +268,21 @@ class LiveRecorder:
 
         saved_status = meta.get("last_status")
         if isinstance(saved_status, dict):
-            self.resumed_status = Status(**{k: float(v) for k, v in saved_status.items()
-                                            if k in _STATUS_FIELDS})
+            positions = {
+                sym: PositionState(avg_price=float(p.get("avg_price", 0.0)),
+                                   position=float(p.get("position", 0.0)),
+                                   unrealised_pnl=float(p.get("unrealised_pnl", 0.0)))
+                for sym, p in (saved_status.get("positions") or {}).items()
+            }
+            self.resumed_status = Status(margin=float(saved_status.get("margin", 0.0)),
+                                         positions=positions,
+                                         leverage=float(saved_status.get("leverage", 0.0)))
 
         shards = series.get("shards") or []
         self._restore_curves(shards)
-        self._shard_writer = ShardWriter.resume(self.dir_path, self.run_id, self._columns,
-                                                self._has_ohlc, self._interval_ms, shards)
+        self._shard_writer = ShardWriter.resume(self.dir_path, self.run_id, self.symbols,
+                                                self._indicator_names, self._has_ohlc,
+                                                self._interval_ms, shards)
 
         # 저장된 metadata를 베이스로 삼아 label 같은 프론트 소유 필드를 보존한다.
         restart_count = int(meta.get("restart_count", 0) or 0) + 1
@@ -283,42 +306,54 @@ class LiveRecorder:
         """
         trades = []
         for d in raw:
+            symbol = d.get("symbol", "")
             trades.append(Trade(
                 timestamp=int(d["timestamp"]),
+                symbol=symbol,
                 quantity=float(d["quantity"]),
                 price=float(d["price"]),
                 wnl=float(d["wnl"]),
                 fee=float(d["fee"]),
-                status=Status(position=float(d.get("position", 0.0)),
-                              margin=float(d.get("margin", 0.0))),
+                status=Status(margin=float(d.get("margin", 0.0)),
+                              positions={symbol: PositionState(position=float(d.get("position", 0.0)))}),
                 leverage=float(d.get("leverage", 0.0)),
             ))
         return trades
 
     def _restore_curves(self, shards: List[Dict]) -> None:
-        """샤드에서 자본 곡선과 종가를 되살린다.
+        """샤드에서 자본 곡선과 심볼별 종가를 되살린다.
 
         런 JSON의 ``equity``는 2000점으로 다운샘플된 값이라 쓰면 안 된다 — 그걸로 복원하면
         재기동할 때마다 곡선이 한 번 더 솎여서 계속 열화된다. 샤드의 ``balance`` 컬럼이
         백테스터가 equity_curve에 넣는 값과 정확히 같은 원본이다.
+
+        ``balance``가 null인 행은 워밍업이거나 자본이 정확히 0(파산)인 경우라 통째로
+        건너뛴다. 반면 한 심볼의 종가만 null인 행은 그 심볼의 캔들이 그 이벤트에 마감하지
+        않은 정상적인 ragged-series 구멍이므로, equity를 유지한 채 그 심볼의 자리에만
+        None을 채워 넣는다 — build_multi_symbol_buy_and_hold_curve가 내부적으로 앞선
+        값으로 채운다.
         """
         for entry in shards:
             shard = read_shard(self.dir_path, entry.get("file", ""))
             if not shard:
                 continue
             times = shard.get("time") or []
-            balances = (shard.get("indicators") or {}).get("balance") or []
-            closes = (shard.get("ohlc") or {}).get("close") or []
+            balances = shard.get("balance") or []
+            symbol_shards = shard.get("symbols") or {}
+            closes_by_symbol = {
+                s: ((symbol_shards.get(s) or {}).get("ohlc") or {}).get("close") or []
+                for s in self.symbols
+            }
             for i, t in enumerate(times):
-                if i >= len(balances) or i >= len(closes):
+                if i >= len(balances):
                     break
-                balance, close = balances[i], closes[i]
-                # _clean_value가 falsy를 null로 눕히므로 balance가 null인 행은 워밍업이거나
-                # 자본이 정확히 0(파산)인 경우다. 둘 다 종가와 짝을 맞춰 통째로 건너뛴다.
-                if balance is None or close is None:
+                balance = balances[i]
+                if balance is None:
                     continue
                 self._equity.append((int(t), float(balance)))
-                self._closes.append(float(close))
+                for s in self.symbols:
+                    col = closes_by_symbol[s]
+                    self._closes_by_symbol[s].append(col[i] if i < len(col) else None)
 
     def _build_metadata(self, reread_label: bool = False) -> Dict:
         meta = dict(self._metadata)
@@ -327,7 +362,15 @@ class LiveRecorder:
         meta["candle_count"] = len(self._equity)
         # 계좌 상태를 같이 남긴다. 드라이런은 합성 자본이라 재기동하면 초기값으로 돌아가는데,
         # 자본 곡선은 이어붙으므로 복원하지 않으면 재기동 지점에서 곡선이 튄다.
-        meta["last_status"] = {f: getattr(self._status, f) for f in _STATUS_FIELDS}
+        meta["last_status"] = {
+            "margin": self._status.margin,
+            "leverage": self._status.leverage,
+            "positions": {
+                sym: {"avg_price": p.avg_price, "position": p.position,
+                     "unrealised_pnl": p.unrealised_pnl}
+                for sym, p in self._status.positions.items()
+            },
+        }
         if self._equity:
             meta.setdefault("start", _iso(self._equity[0][0]))
             meta["end"] = _iso(self._equity[-1][0])

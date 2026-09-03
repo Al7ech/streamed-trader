@@ -1,4 +1,5 @@
 import logging
+from typing import List
 
 from core.backtest.status import Status
 from core.streamer.action import Action
@@ -62,7 +63,7 @@ class TrendlineBounceStreamer(BaseStreamer):
             indicators["RES"] = PivotTrendlineIndicator(pivot_k, mode="high")
         if lines in ("sup", "both"):
             indicators["SUP"] = PivotTrendlineIndicator(pivot_k, mode="low")
-        super().__init__(indicators)
+        super().__init__([symbol], {symbol: indicators})
         self.symbol = symbol
         self.eps = eps
         self.min_touch = min_touch
@@ -85,10 +86,11 @@ class TrendlineBounceStreamer(BaseStreamer):
             f"min_touch={min_touch},hold_candles={hold_candles},side={side},lines={lines},"
             f"max_loss={max_loss}]")
 
-    def _touch(self, name: str, tracker: _TouchTracker, candle: Candle, atr: float) -> bool:
+    def _touch(self, symbol: str, name: str, tracker: _TouchTracker, candle: Candle,
+              atr: float) -> bool:
         """해당 선의 이번 봉 터치 여부 + 트래커 갱신. 인디케이터는 decide 후 업데이트되므로
         선값은 직전 봉 기준 — 기울기로 1봉 외삽해 현재 봉의 선값을 얻는다."""
-        ind = self.indicators.get(name)
+        ind = self.indicators[symbol].get(name)
         if ind is None:
             return False
         line = ind.get_latest()
@@ -102,30 +104,32 @@ class TrendlineBounceStreamer(BaseStreamer):
         tracker.update(touched, ind.pair_id)
         return touched and tracker.count >= self.min_touch
 
-    def decide_action(self, candle: Candle, status: Status) -> Action:
-        atr = self.indicators["ATR"].get_latest()
+    def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
+        atr = self.indicators[symbol]["ATR"].get_latest()
         if atr is None or atr <= 0:
-            return Action(0)
+            return []
 
         # 터치 상태는 포지션 여부와 무관하게 매 봉 갱신한다.
-        res_entry = self._touch("RES", self._res_touches, candle, atr)
-        sup_entry = self._touch("SUP", self._sup_touches, candle, atr)
+        res_entry = self._touch(symbol, "RES", self._res_touches, candle, atr)
+        sup_entry = self._touch(symbol, "SUP", self._sup_touches, candle, atr)
 
-        if status.position != 0:
+        position = status.position_for(symbol).position
+
+        if position != 0:
             self._hold_remaining -= 1
 
             if self.use_stop:
-                if status.position > 0 and candle.low <= self._stop_price:
-                    return Action(-status.position)
-                if status.position < 0 and self._stop_price <= candle.high:
-                    return Action(-status.position)
+                if position > 0 and candle.low <= self._stop_price:
+                    return [Action(symbol, -position)]
+                if position < 0 and self._stop_price <= candle.high:
+                    return [Action(symbol, -position)]
 
             if self._hold_remaining <= 0:
-                return Action(-status.position)
-            return Action(0)
+                return [Action(symbol, -position)]
+            return []
 
         if res_entry == sup_entry:  # 무신호 또는 양쪽 동시 터치(상충) — 스킵
-            return Action(0)
+            return []
 
         if self.side == "bounce":
             sign = 1 if sup_entry else -1
@@ -139,4 +143,4 @@ class TrendlineBounceStreamer(BaseStreamer):
 
         self._hold_remaining = self.hold_candles
         self._stop_price = price * (1 - sign * stop_frac)
-        return Action(qty)
+        return [Action(symbol, qty)]

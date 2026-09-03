@@ -21,13 +21,14 @@ class PositionAgeIndicator(BaseIndicator):
 
     scale_group = "age"
 
-    def __init__(self):
+    def __init__(self, symbol: str):
         super().__init__(1)
+        self._symbol = symbol
         self.values = deque(maxlen=2)
         self._age = 0
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
-        if status is not None and status.position != 0.0:
+        if status is not None and status.position_for(self._symbol).position != 0.0:
             self._age += 1
         else:
             self._age = 0
