@@ -182,7 +182,7 @@ class SingleThreadedBacktester:
                     position = self.status.position_for(symbol).position
                     symbol_actions = [Action(symbol, -position)] if position != 0.0 else []
                 else:
-                    symbol_actions = self.streamer.update_candle(symbol, candle, self.status)
+                    symbol_actions = self.streamer.decide_action(symbol, candle, self.status)
 
                 if shard_writer is not None:
                     # recorded right after decide_action, once every indicator for this symbol

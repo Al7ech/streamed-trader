@@ -814,7 +814,7 @@ class BinanceTrader:
 
         # 교차 심볼 전략은 다른 심볼을 겨냥하는 액션도 반환할 수 있다 — 이후 처리는 각
         # 액션의 action.symbol을 그대로 따라간다.
-        actions = self.streamer.update_candle(symbol, candle, self.status)
+        actions = self.streamer.decide_action(symbol, candle, self.status)
 
         # 백테스터와 **같은 자리**에서 기록한다: 지표가 이미 전부 갱신된 직후, decide_action이
         # 반환한 바로 뒤. 그래서 모든 컬럼이 결정이 실제로 본 값이다.

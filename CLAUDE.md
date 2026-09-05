@@ -337,9 +337,9 @@ those two scripts default to WARNING.
 - `BaseStreamer` (ABC) is multi-symbol and **cross-symbol aware**: `__init__(symbols,
   indicators)` takes the list of symbols it trades and `indicators: Dict[str, Dict[str,
   BaseIndicator]]` — one indicator instance per `(symbol, name)` pair (never shared across
-  symbols, since each instance carries its own series state). It exposes `update_candle(symbol,
-  candle, status) -> List[Action]`, which delegates to the abstract `decide_action(symbol, candle,
-  status) -> List[Action]`. `symbol` identifies whose candle just closed and triggered the call,
+  symbols, since each instance carries its own series state). It exposes the abstract
+  `decide_action(symbol, candle, status) -> List[Action]`, called by all three engines once a
+  symbol's indicators are updated. `symbol` identifies whose candle just closed and triggered the call,
   but `self.indicators` holds every traded symbol's state, so an implementation can read other
   symbols' indicators too and return `Action`s (each carrying its own `.symbol`) for symbols other
   than the trigger — this is what makes pairs/relative-strength/rotation strategies possible. A
@@ -371,7 +371,7 @@ those two scripts default to WARNING.
   indicator **name** only, shared across symbols).
 - **Ordering matters**: all three engines (`SingleThreadedBacktester`, `FastBacktester`,
   `BinanceTrader._handle_candle`) always update **every** indicator for a symbol with its closed
-  candle *before* calling `streamer.decide_action`/`update_candle` for that symbol, so
+  candle *before* calling `streamer.decide_action` for that symbol, so
   `get_latest()` includes the candle being decided on and `get_index(-2)` is the previous one —
   the current candle's OHLCV is also available directly as the `candle` argument, and every
   strategy uses it. The `Status` passed to both `update` and `decide_action` is still the
@@ -567,7 +567,7 @@ against the full traded-symbol set rather than a single symbol.
   separate user-data listener task, already handled by deep-copying `Status` before an order is
   dispatched (see the "Fills" bullet under "Live run output" above).
   On each *closed* kline it builds a `Candle`, calls the streamer with that candle's symbol
-  (`streamer.update_candle(symbol, candle, status) -> List[Action]` — the returned actions may
+  (`streamer.decide_action(symbol, candle, status) -> List[Action]` — the returned actions may
   target other symbols too, for cross-symbol strategies), updates that symbol's indicators, and
   fires registered action/error callbacks (`add_action_callback`/`add_error_callback`).
   `_ensure_continuity`/`_fetch_missing_candles` detect and backfill gaps **per symbol** (each

@@ -247,7 +247,7 @@ class FastBacktester(SingleThreadedBacktester):
                         position = status.position_for(symbol).position
                         symbol_actions = [Action(symbol, -position)] if position != 0.0 else []
                     else:
-                        symbol_actions = self.streamer.update_candle(symbol, candle, status)
+                        symbol_actions = self.streamer.decide_action(symbol, candle, status)
 
                     if collect_live_series:
                         for name, indicator in live[symbol].items():

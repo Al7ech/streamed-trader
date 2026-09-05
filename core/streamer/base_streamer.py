@@ -26,9 +26,6 @@ class BaseStreamer(ABC):
         self.symbols = symbols
         self.indicators = indicators
 
-    def update_candle(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
-        return self.decide_action(symbol, candle, status)
-
     @abstractmethod
     def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
         """

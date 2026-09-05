@@ -24,7 +24,7 @@ Asyncio trader that trades every symbol in `streamer.symbols` concurrently:
   `BinanceCandleFetcher`, one symbol at a time) before going live, asserting each fetched range is
   exactly what was expected. All symbols share the same interval-boundary `end_time` so their
   windows stay aligned with each other even though the fetches themselves are sequential.
-- On each **closed** kline: builds a `Candle`, calls `streamer.update_candle(symbol, candle,
+- On each **closed** kline: builds a `Candle`, calls `streamer.decide_action(symbol, candle,
   status)` (returns a list of `Action`s — which may target symbols other than the one that
   triggered the call, for cross-symbol strategies), then updates that symbol's indicators with the
   same pre-trade `Status`, then executes each action — the same ordering the backtester uses, so
