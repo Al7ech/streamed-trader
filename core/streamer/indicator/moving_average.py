@@ -4,7 +4,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from core.backtest.status import Status
+from core.engine.status import Status
 from core.streamer.candle import Candle
 from core.streamer.indicator.base_indicator import NumericIndicator
 

@@ -9,7 +9,7 @@
 언제든 죽는다(도커 ``restart: always``). 그래서 이 클래스는 두 가지를 더 한다:
 
 1. **체크포인트** — 캔들마다 런 JSON을, 주기적으로/체결 시점에 현재 월 샤드를 다시 쓴다.
-   쓰기는 전부 원자적이라(:func:`core.backtest.result_writer._write_json`) 중간에 죽어도
+   쓰기는 전부 원자적이라(:func:`core.engine.result_writer._write_json`) 중간에 죽어도
    직전 상태가 온전하다.
 2. **재개** — 기동 시 같은 ``run_id``의 런 JSON과 샤드를 읽어 자본 곡선/체결/누적 지표를
    복원하고 이어쓴다. 재기동마다 새 파일이 생기면 곡선이 조각나 백테스트와 비교할 수 없다.
@@ -23,13 +23,13 @@ import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from core.backtest import order_book
-from core.backtest.indicator_columns import collect_indicator_columns
-from core.backtest.metrics import build_multi_symbol_buy_and_hold_curve
-from core.backtest.report import Report
-from core.backtest.result_writer import SCHEMA_VERSION, ShardWriter, read_shard, write_run_json
-from core.backtest.status import PositionState, Status
-from core.backtest.trade import Trade
+from core.engine import order_book
+from core.engine.indicator_columns import collect_indicator_columns
+from core.engine.metrics import build_multi_symbol_buy_and_hold_curve
+from core.engine.report import Report
+from core.engine.result_writer import SCHEMA_VERSION, ShardWriter, read_shard, write_run_json
+from core.engine.status import PositionState, Status
+from core.engine.trade import Trade
 from core.streamer import BaseStreamer
 from core.streamer import Candle
 

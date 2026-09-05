@@ -19,7 +19,7 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Tuple
 
-from core.backtest.status import Status
+from core.engine.status import Status
 from core.streamer.action import Action, ActionType
 from core.streamer.candle import Candle
 

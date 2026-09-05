@@ -1,6 +1,6 @@
 from typing import Optional
 
-from core.backtest.status import Status
+from core.engine.status import Status
 from core.streamer.candle import Candle
 from core.streamer.indicator.base_indicator import NumericIndicator
 

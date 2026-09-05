@@ -6,14 +6,14 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from tqdm import tqdm
 
-from core.backtest import order_book
-from core.backtest.candle_merge import merge_candle_timeline
-from core.backtest.metrics import build_multi_symbol_buy_and_hold_curve, forward_fill_nan
+from core.engine import order_book
+from core.engine.candle_merge import merge_candle_timeline
+from core.engine.metrics import build_multi_symbol_buy_and_hold_curve, forward_fill_nan
 from core.backtest.SingleThreadedBacktester import SingleThreadedBacktester
-from core.backtest.report import Report
-from core.backtest.result_writer import write_run_json, write_series_shards
-from core.backtest.status import Status
-from core.backtest.trade import Trade
+from core.engine.report import Report
+from core.engine.result_writer import write_run_json, write_series_shards
+from core.engine.status import Status
+from core.engine.trade import Trade
 from core.streamer import Action
 from core.streamer import ActionType
 from core.streamer.candle import Candle
@@ -70,7 +70,7 @@ class FastBacktester(SingleThreadedBacktester):
     is inherited unchanged.
 
     Candles from every symbol are still merged into one chronological event timeline (see
-    :func:`core.backtest.candle_merge.merge_candle_timeline`) — the vectorization is entirely
+    :func:`core.engine.candle_merge.merge_candle_timeline`) — the vectorization is entirely
     about how each symbol's own indicator series and equity contribution are computed, not about
     skipping the merge.
     """

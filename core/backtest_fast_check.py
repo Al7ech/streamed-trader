@@ -36,7 +36,7 @@ import numpy as np
 
 from core.backtest.FastBacktester import ArrayIndicator, FastBacktester
 from core.backtest.SingleThreadedBacktester import SingleThreadedBacktester
-from core.backtest.status import PositionState, Status
+from core.engine.status import PositionState, Status
 from core.binance_candle_fetcher.vision_fetcher import BinanceVisionFetcher
 from core.logging_config import setup_logging
 from core.streamer.action import Action, ActionType

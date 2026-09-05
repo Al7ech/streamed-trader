@@ -1,6 +1,6 @@
 from typing import List
 
-from core.backtest.status import Status
+from core.engine.status import Status
 from core.streamer.action import Action
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.candle import Candle

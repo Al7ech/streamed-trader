@@ -1,7 +1,7 @@
 from typing import List, Optional, Tuple
 
-from core.backtest.status import Status
-from core.backtest.trade import Trade
+from core.engine.status import Status
+from core.engine.trade import Trade
 
 
 class Report:

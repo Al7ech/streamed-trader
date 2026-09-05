@@ -5,7 +5,7 @@
 ``WARNING`` 이상은 파이썬의 ``logging.lastResort`` 핸들러로 빠져 **레벨명도 로거명도
 타임스탬프도 없는 맨 메시지**만 stderr에 찍혔다. 결과의 신뢰도를 좌우하는 두 경고 —
 월 청크의 데이터 구멍(:mod:`core.candle_fetcher.base`)과 파산 지점에서 잘린
-Sharpe(:mod:`core.backtest.metrics`) — 가 하필 가장 알아보기 어려운 형태로 나왔다.
+Sharpe(:mod:`core.engine.metrics`) — 가 하필 가장 알아보기 어려운 형태로 나왔다.
 
 모든 진입점(``core/examples/*.py``, ``core/*_check.py``)은 다른 일을 하기 전에
 :func:`setup_logging`을 부른다.

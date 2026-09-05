@@ -23,8 +23,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from boltons.fileutils import atomic_save
 
-from core.backtest.metrics import compute_max_drawdown, compute_sharpe
-from core.backtest.report import Report
+from core.engine.metrics import compute_max_drawdown, compute_sharpe
+from core.engine.report import Report
 
 # 2: added the top-level "benchmark" block (buy & hold curve) + summary.benchmark_profit_pct.
 # 3: added trades[].position (거래 **전** 포지션). 라이브 런은 재기동 시 자기 run JSON을 다시
@@ -97,7 +97,7 @@ class ShardWriter:
     """Streams per-event OHLC + indicator values into month-bucketed columnar JSON shards.
 
     한 "이벤트"는 하나 이상의 심볼이 같은 시각에 마감한 캔들들의 묶음이다 (멀티심볼 병합
-    타임라인의 단위, :func:`core.backtest.candle_merge.merge_candle_timeline` 참고). 이번
+    타임라인의 단위, :func:`core.engine.candle_merge.merge_candle_timeline` 참고). 이번
     이벤트에 캔들이 없는 심볼은 그 행에서 OHLC/지표가 전부 null이 된다.
 
     Only the current month's columns are held in memory; a shard file is flushed whenever the

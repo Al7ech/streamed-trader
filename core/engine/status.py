@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # 런타임 임포트는 순환을 만든다 (order_book이 Status를 쓴다)
-    from core.backtest.order_book import OpenOrder
+    from core.engine.order_book import OpenOrder
 
 
 @dataclass

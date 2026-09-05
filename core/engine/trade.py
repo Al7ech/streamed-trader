@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
-from core.backtest.status import Status
+from core.engine.status import Status
 
 
 @dataclass

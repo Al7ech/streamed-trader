@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import Dict, List
 
-from core.backtest.status import Status
+from core.engine.status import Status
 from core.streamer.action import Action
 from core.streamer.candle import Candle
 from core.streamer.indicator.base_indicator import BaseIndicator

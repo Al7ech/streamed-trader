@@ -1,6 +1,6 @@
 from typing import List
 
-from core.backtest.status import Status
+from core.engine.status import Status
 from core.streamer import BaseStreamer, Candle, Action
 from core.streamer.indicator import MovingAverage
 from core.utils import trunc_by_sign
