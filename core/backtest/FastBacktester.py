@@ -16,7 +16,7 @@ from core.backtest.status import Status
 from core.backtest.trade import Trade
 from core.streamer import Action
 from core.streamer.candle import Candle
-from core.streamer.indicator.base_indicator import BaseIndicator, VectorizedIndicator
+from core.streamer.indicator.base_indicator import BaseIndicator
 
 
 class ArrayIndicator(BaseIndicator):
@@ -68,11 +68,11 @@ class ArrayIndicator(BaseIndicator):
 class FastBacktester(SingleThreadedBacktester):
     """Drop-in faster ``SingleThreadedBacktester``, generalized to multiple symbols.
 
-    ``VectorizedIndicator``s are precomputed in one shot **per symbol** from that symbol's own
-    numpy candle arrays and swapped for :class:`ArrayIndicator` shims during the run; plain
-    ``BaseIndicator``s keep being updated candle-by-candle exactly like the reference
-    implementation, so both kinds can be mixed freely. The trade accounting (``_trade``) is
-    inherited unchanged.
+    Indicators that define ``precompute_series`` are precomputed in one shot **per symbol** from
+    that symbol's own numpy candle arrays and swapped for :class:`ArrayIndicator` shims during the
+    run; plain ``BaseIndicator``s without it keep being updated candle-by-candle exactly like the
+    reference implementation, so both kinds can be mixed freely. The trade accounting (``_trade``)
+    is inherited unchanged.
 
     Candles from every symbol are still merged into one chronological event timeline (see
     :func:`core.backtest.candle_merge.merge_candle_timeline`) — the vectorization is entirely
@@ -139,9 +139,9 @@ class FastBacktester(SingleThreadedBacktester):
         for symbol in symbols:
             a = arrays[symbol]
             for name, indicator in original_indicators.get(symbol, {}).items():
-                if isinstance(indicator, VectorizedIndicator):
-                    seq = indicator.precompute_series(a["open"], a["high"], a["low"], a["close"],
-                                                       a["volume"])
+                precompute = getattr(indicator, "precompute_series", None)
+                if precompute is not None:
+                    seq = precompute(a["open"], a["high"], a["low"], a["close"], a["volume"])
                     precomputed[symbol][name] = seq
                     shim = ArrayIndicator(seq, indicator.window, indicator.history_size)
                     run_indicators[symbol][name] = shim

@@ -2,7 +2,7 @@
 
 Runs both backtesters over the same cached candles and asserts identical trades, final
 margin, max leverage and equity curve. Also exercises the mixed path by wrapping one
-indicator so it loses its VectorizedIndicator type and must be loop-updated, and a set of
+indicator so it loses its `precompute_series` override and must be loop-updated, and a set of
 multi-symbol cases (overlapping/staggered symbols, cross-symbol actions, shared-margin forced
 liquidation across symbols).
 
@@ -44,7 +44,7 @@ from core.utils import trunc_by_sign
 
 
 class LoopOnlyIndicator(BaseIndicator):
-    """Hides the VectorizedIndicator type of the wrapped indicator, forcing the loop path."""
+    """Hides the wrapped indicator's `precompute_series` override, forcing the loop path."""
 
     def __init__(self, inner: BaseIndicator):
         super().__init__(inner.window)

@@ -1,4 +1,4 @@
-from .base_indicator import BaseIndicator, VectorizedIndicator
+from .base_indicator import BaseIndicator
 from .moving_average import MovingAverage
 
-__all__ = ['BaseIndicator', 'VectorizedIndicator', 'MovingAverage']
+__all__ = ['BaseIndicator', 'MovingAverage']

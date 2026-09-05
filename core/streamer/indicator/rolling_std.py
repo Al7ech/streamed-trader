@@ -6,10 +6,10 @@ import pandas as pd
 
 from core.backtest.status import Status
 from core.streamer.candle import Candle
-from core.streamer.indicator.base_indicator import VectorizedIndicator
+from core.streamer.indicator.base_indicator import BaseIndicator
 
 
-class RollingStd(VectorizedIndicator):
+class RollingStd(BaseIndicator):
     """
     Rolling sample standard deviation (ddof=1) of close over `window` candles.
     """

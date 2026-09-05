@@ -6,10 +6,10 @@ import pandas as pd
 
 from core.backtest.status import Status
 from core.streamer.candle import Candle
-from core.streamer.indicator.base_indicator import VectorizedIndicator
+from core.streamer.indicator.base_indicator import BaseIndicator
 
 
-class MinDonchianIndicator(VectorizedIndicator):
+class MinDonchianIndicator(BaseIndicator):
     def __init__(self, window: int):
         super().__init__(window)
         self.min_deque = deque(maxlen=window)
@@ -45,7 +45,7 @@ class MinDonchianIndicator(VectorizedIndicator):
         return pd.Series(low).rolling(self.window).min().to_numpy()
 
 
-class MaxDonchianIndicator(VectorizedIndicator):
+class MaxDonchianIndicator(BaseIndicator):
     def __init__(self, window: int):
         super().__init__(window)
         self.max_deque = deque(maxlen=window)

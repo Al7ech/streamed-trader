@@ -137,9 +137,10 @@ when the process is launched with cwd = `core/`.
    plus the sum of every symbol's unrealised PnL) falls to zero or below.
 
    `backtest/FastBacktester.py` is the drop-in fast version the entry scripts use: it precomputes
-   every `VectorizedIndicator` **per symbol** as a numpy array (swapped in as a cursor-backed
-   `ArrayIndicator` shim whose cursor advances only on events where that symbol appears, not on
-   the shared event index), keeps plain `BaseIndicator`s loop-updated, rebuilds the equity curve
+   every indicator that defines `precompute_series` **per symbol** as a numpy array (swapped in
+   as a cursor-backed `ArrayIndicator` shim whose cursor advances only on events where that
+   symbol appears, not on the shared event index), keeps plain `BaseIndicator`s without it
+   loop-updated, rebuilds the equity curve
    vectorized (a per-symbol forward-filled close matrix dot the per-segment position vector,
    generalizing the single-symbol piecewise-constant trick), and bulk-writes shards after the
    loop. `SingleThreadedBacktester` stays as the reference implementation; parity between the two
@@ -329,16 +330,18 @@ those two scripts default to WARNING.
   stay a plain `BaseIndicator` — `indicator/position_age.py` is the canonical example (it's told
   which symbol it belongs to at construction, since it reads `status.position_for(self._symbol)`
   directly rather than only through `decide_action`).
-  `VectorizedIndicator` (subclass ABC) additionally requires
+  An indicator can additionally define
   `precompute_series(open, high, low, close, volume) -> np.ndarray` (element i = `get_latest()`
-  after i+1 updates, NaN during warm-up), which `FastBacktester` uses to compute each symbol's
-  whole series at once (against that symbol's **own** OHLCV arrays) — `update()` must still work
-  for the live trader. `MovingAverage`, `MinDonchianIndicator`/`MaxDonchianIndicator`
-  (monotonic-deque min/max over a window), `ATRIndicator`, `RollingStd` and the `volume_stats`
-  indicators are vectorized; `ADXIndicator`, `SupertrendIndicator`, `PivotTrendlineIndicator`,
-  `TakerImbalanceIndicator` and `PositionAgeIndicator` are path-dependent or status-aware and stay
-  plain `BaseIndicator`s (correct everywhere, just on the loop path). Both kinds mix freely within
-  one strategy.
+  after i+1 updates, NaN during warm-up); `FastBacktester` detects it by attribute presence
+  (`getattr(indicator, "precompute_series", None)`, no separate class involved) and uses it to
+  compute each symbol's whole series at once (against that symbol's **own** OHLCV arrays) —
+  `update()` must still work for the live trader. `MovingAverage`,
+  `MinDonchianIndicator`/`MaxDonchianIndicator` (monotonic-deque min/max over a window),
+  `ATRIndicator`, `RollingStd` and the `volume_stats` indicators define it; `ADXIndicator`,
+  `SupertrendIndicator`, `PivotTrendlineIndicator`, `TakerImbalanceIndicator` and
+  `PositionAgeIndicator` are path-dependent or status-aware and stay plain `BaseIndicator`s
+  without it (correct everywhere, just on the loop path). Both kinds mix freely within one
+  strategy.
 - Each indicator's `scale_group` (default `"price"`) tells the frontend which chart pane to plot
   it on; indicators sharing a group share a pane and price scale (this grouping is keyed by
   indicator **name** only, shared across symbols).

@@ -2,8 +2,6 @@ from abc import ABC, abstractmethod
 from collections import deque
 from typing import Optional
 
-import numpy as np
-
 from core.backtest.status import Status
 from core.streamer.candle import Candle
 
@@ -34,7 +32,6 @@ class BaseIndicator(ABC):
     #: constructor when a strategy parameter can drive the read depth past it.
     history_size: int = 8192
 
-    # TODO: baseIndicator는 get_* abstract method만 제공하고, update는 별도의 StreamedIndicator에서 제공
     def __init__(self, window: int, history_size: Optional[int] = None):
         self.window = window
         if history_size is not None:
@@ -103,27 +100,14 @@ class BaseIndicator(ABC):
         """
         return self.get_index(-1)
 
-
-class VectorizedIndicator(BaseIndicator):
-    """
-    Indicator that can additionally precompute its whole series from candle arrays at once.
-
-    Subclasses must still implement `update()` so they keep working in the live trader and the
-    reference backtester; `precompute_series` is the fast path used by FastBacktester.
-
-    `precompute_series` receives no `status`: the account state depends on the trades the
-    strategy makes, which is a feedback loop that can't be precomputed. An indicator that
-    reads `status` must therefore be a plain `BaseIndicator` (loop path) instead.
-    """
-
-    @abstractmethod
-    def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
-                          close: np.ndarray, volume: np.ndarray) -> np.ndarray:
-        """
-        Compute the full indicator series for the given candle arrays in one shot.
-
-        Element i of the returned array must equal `get_latest()` after `update()` has been
-        called with candles [0..i] — warm-up positions are NaN (the loop-based indicators
-        return None there).
-        """
-        pass
+    # An indicator may additionally define `precompute_series(open, high, low, close, volume)
+    # -> np.ndarray` to compute its whole series from candle arrays in one shot; `FastBacktester`
+    # detects this by attribute presence (`getattr(indicator, "precompute_series", None)`) and
+    # uses it as the fast path instead of looping `update()`. There is deliberately no default
+    # implementation here — only subclasses that define it opt into vectorization. Element i of
+    # the returned array must equal `get_latest()` after `update()` has been called with candles
+    # [0..i] — warm-up positions are NaN (the loop-based indicators return None there).
+    #
+    # `precompute_series` receives no `status`: the account state depends on the trades the
+    # strategy makes, which is a feedback loop that can't be precomputed. An indicator that reads
+    # `status` must therefore stay loop-only (no `precompute_series`).

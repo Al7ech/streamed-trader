@@ -6,10 +6,10 @@ import pandas as pd
 
 from core.backtest.status import Status
 from core.streamer.candle import Candle
-from core.streamer.indicator.base_indicator import VectorizedIndicator
+from core.streamer.indicator.base_indicator import BaseIndicator
 
 
-class MovingAverage(VectorizedIndicator):
+class MovingAverage(BaseIndicator):
     def __init__(self, window: int, history_size: Optional[int] = None):
         # MovingAverage(1)을 종가 시계열로 재사용하는 전략(MomentumTimeExitStreamer)이 있어
         # 조회 깊이가 파라미터로 정해진다. 그래서 이 지표만 history_size를 열어 둔다.

@@ -6,10 +6,10 @@ import pandas as pd
 
 from core.backtest.status import Status
 from core.streamer.candle import Candle
-from core.streamer.indicator.base_indicator import VectorizedIndicator
+from core.streamer.indicator.base_indicator import BaseIndicator
 
 
-class VolumeMovingAverage(VectorizedIndicator):
+class VolumeMovingAverage(BaseIndicator):
     """
     Rolling mean of candle volume over `window` candles.
     """
@@ -41,7 +41,7 @@ class VolumeMovingAverage(VectorizedIndicator):
         return pd.Series(volume).rolling(self.window).mean().to_numpy()
 
 
-class VolumeRollingStd(VectorizedIndicator):
+class VolumeRollingStd(BaseIndicator):
     """
     Rolling sample standard deviation (ddof=1) of candle volume over `window` candles.
     """

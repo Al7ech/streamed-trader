@@ -99,15 +99,17 @@ Point `core/examples/backtest.py` at your class and run it.
 `BaseIndicator` is a rolling-window indicator updated one candle at a time — implement `update()`
 and `get_index()`. That is all you need for correctness everywhere.
 
-`VectorizedIndicator` additionally implements `precompute_series(open, high, low, close, volume)`,
+An indicator can additionally implement `precompute_series(open, high, low, close, volume)`,
 returning the whole series as a numpy array (element *i* = `get_latest()` after *i+1* updates, NaN
-during warm-up). `FastBacktester` computes those in one shot instead of looping, which is where
-most of its speedup comes from. `update()` must still work — the live trader has no future to
-precompute.
+during warm-up). `FastBacktester` detects the method by attribute presence
+(`getattr(indicator, "precompute_series", None)`) and computes those in one shot instead of
+looping, which is where most of its speedup comes from. `update()` must still work — the live
+trader has no future to precompute.
 
 An indicator that reads `status` **cannot** be vectorized: account state depends on the trades the
-strategy makes, which is a feedback loop. Keep those as plain `BaseIndicator`
-(`indicator/position_age.py` is the example). The two kinds mix freely in one strategy.
+strategy makes, which is a feedback loop. Keep those as plain `BaseIndicator` without
+`precompute_series` (`indicator/position_age.py` is the example). The two kinds mix freely in one
+strategy.
 
 One class attribute tunes an indicator, settable per subclass or per instance:
 
@@ -115,8 +117,8 @@ One class attribute tunes an indicator, settable per subclass or per instance:
 |---|---|---|
 | `scale_group` | `"price"` | Chart pane. `"price"` overlays the candles; any other value gets its own pane, shared by indicators with the same group. |
 
-So there are two independent choices per indicator: which pane it draws on, and whether it is
-vectorized.
+So there are two independent choices per indicator: which pane it draws on, and whether it defines
+`precompute_series`.
 
 ### Bundled examples
 

@@ -6,10 +6,10 @@ import pandas as pd
 
 from core.backtest.status import Status
 from core.streamer.candle import Candle
-from core.streamer.indicator.base_indicator import VectorizedIndicator
+from core.streamer.indicator.base_indicator import BaseIndicator
 
 
-class ATRIndicator(VectorizedIndicator):
+class ATRIndicator(BaseIndicator):
     """
     Simple (non-Wilder) moving average of True Range over `window` candles.
     True Range = max(high-low, |high-prev_close|, |low-prev_close|).
