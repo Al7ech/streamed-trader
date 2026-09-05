@@ -52,7 +52,8 @@ def run_backtest(streamer: BaseStreamer,
     :param fee_ratio: 실제로 부과할 수수료율. None이면 **스트리머의 값을 따라간다**.
     :param slippage_ratio: 조건부 시장가 체결에 얹을 비율. None이면 같은 규칙.
     :param initial_status: 포지션이나 미체결 주문을 들고 시작해야 할 때. 주면 ``init_margin``
-        대신 이 상태로 시작한다.
+        대신 이 상태로 시작한다. **이 객체는 실행 중 변형되고 ``Report.status``가 된다** —
+        두 번 실행할 거라면 각각 새로 만들어 넘겨야 한다.
     :param metadata: 주면 ``<result_path>/backtest/`` 에 런 JSON을 쓴다. ``save_series``까지
         True면 무거운 시계열 샤드도 함께 쓴다. 둘 다 없으면 순수 메모리 실행이다.
     """

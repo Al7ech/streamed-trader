@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 from dotenv import load_dotenv
 
-from core.backtest.FastBacktester import FastBacktester
+from core.engine.backtest import DEFAULT_INIT_MARGIN, run_backtest
 from core.logging_config import setup_logging
 from core.stock_candle_fetcher import nyse_session
 from core.stock_candle_fetcher.massive_fetcher import MassiveStockFetcher
@@ -114,12 +114,11 @@ def main():
     # 6. 파이프라인 통합 — 크래시 없이 도는지만 (파라미터 튜닝은 범위 밖)
     streamer = KeltnerStreamer(symbols=[symbol], window=120, m_entry=2.0, m_exit=0.0,
                                fee_ratio=0.0005, max_loss=0.08)
-    backtester = FastBacktester(streamer, candles)
-    init_margin = backtester.status.total_margin()
-    report = backtester.run()
+    report = run_backtest(streamer, candles)
+    init_margin = DEFAULT_INIT_MARGIN
     # Trade.status는 거래 전 스냅샷이므로 최종 상태를 쓴다 (마지막 거래 손익/수수료 포함)
     final = report.status.total_margin()
-    print(f"[6] FastBacktester OK — {len(report.trades)} trades, "
+    print(f"[6] 백테스트 파이프라인 OK — {len(report.trades)} trades, "
           f"max leverage {report.max_leverage}, "
           f"수익률 {(final / init_margin - 1) * 100:+.2f}% "
           f"(짧은 구간 + 임의 파라미터라 수치 자체는 의미 없음)")

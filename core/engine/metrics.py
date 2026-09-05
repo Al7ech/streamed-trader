@@ -69,7 +69,7 @@ def build_buy_and_hold_curve(times: Sequence[int], closes: Sequence[float],
 def forward_fill_nan(arr: np.ndarray) -> np.ndarray:
     """직전 유효값으로 NaN 구간을 채운다. 선행 NaN은 그대로 남는다.
 
-    FastBacktester가 심볼별 종가를 병합 이벤트 그리드에 흩뿌린 뒤 채워 넣는 데도 재사용한다
+    벡터화 경로가 심볼별 종가를 병합 이벤트 그리드에 흩뿌린 뒤 채워 넣는 데도 재사용한다
     (그 심볼의 캔들이 없는 이벤트는 직전 알려진 종가를 써야 하므로).
     """
     idx = np.where(~np.isnan(arr), np.arange(len(arr)), 0)

@@ -57,7 +57,7 @@ class Recorder(ABC):
 class BacktestRecorder(Recorder):
     """백테스트 한 번의 결과를 메모리에 모은다.
 
-    ``SingleThreadedBacktester.run``이 지역 변수로 들고 있던 것(자본 곡선, 심볼별 종가, 체결
+    예전 백테스터의 ``run``이 지역 변수로 들고 있던 것(자본 곡선, 심볼별 종가, 체결
     목록, 최대 레버리지, ShardWriter)을 대신 소유한다.
 
     :param status: 실행기의 ``Status`` **객체 자체**. ``Report.status``가 최종 상태여야 하고

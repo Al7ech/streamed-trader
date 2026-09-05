@@ -24,7 +24,7 @@ class SupertrendIndicator(NumericIndicator):
     방향은 하나의 래칫 재귀 계산에서 동시에 나오므로 update() 한 곳에서 둘 다 채운다.
 
     래칫이 재귀적(경로 의존)이라 벡터화하지 않는다 — plain NumericIndicator로 두면
-    FastBacktester가 루프 경로로 정확히 업데이트한다.
+    벡터화 경로에서도 루프로 정확히 업데이트된다.
     """
 
     def __init__(self, window: int, multiplier: float):

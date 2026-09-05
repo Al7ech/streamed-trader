@@ -1,6 +1,6 @@
-"""Parity + benchmark check: FastBacktester vs SingleThreadedBacktester (reference).
+"""Parity + benchmark check: run_backtest(vectorized=True) vs vectorized=False (reference).
 
-Runs both backtesters over the same cached candles and asserts identical trades, final
+Runs both engine paths over the same cached candles and asserts identical trades, final
 margin, max leverage and equity curve. Also exercises the mixed path by wrapping one
 indicator so it loses its `precompute_series` override and must be loop-updated, and a set of
 multi-symbol cases (overlapping/staggered symbols, cross-symbol actions, shared-margin forced
@@ -30,14 +30,15 @@ import math
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from core.backtest.FastBacktester import ArrayIndicator, FastBacktester
-from core.backtest.SingleThreadedBacktester import SingleThreadedBacktester
-from core.engine.status import PositionState, Status
 from core.binance_candle_fetcher.vision_fetcher import BinanceVisionFetcher
+from core.engine.backtest import run_backtest
+from core.engine.report import Report
+from core.engine.status import PositionState, Status
+from core.engine.vectorized import ArrayIndicator
 from core.logging_config import setup_logging
 from core.streamer.action import Action, ActionType
 from core.streamer.base_streamer import BaseStreamer
@@ -49,6 +50,23 @@ from core.streamer.keltner_stop_streamer import KeltnerStopStreamer
 from core.streamer.keltner_streamer import KeltnerStreamer
 from core.streamer.mean_reversion_zscore import MeanReversionZScoreStreamer
 from core.utils import trunc_by_sign
+
+
+def run_pair(make_streamer, candles_by_symbol, make_initial_status=None,
+             **kw) -> Tuple[Report, Report]:
+    """같은 입력을 참조 경로와 벡터화 경로로 각각 돌려 (ref, fast) Report를 돌려준다.
+
+    스트리머도 Status도 **인스턴스가 아니라 팩토리**로 받는다. 둘 다 실행 중에 변형되므로
+    (스트리머는 MeanReversionZScoreStreamer의 타임아웃 카운터 같은 자체 상태를, Status는
+    포지션/증거금을) 하나를 공유하면 앞의 실행이 뒤의 시작 상태를 오염시킨다.
+    """
+    ref = run_backtest(make_streamer(), candles_by_symbol, vectorized=False,
+                       initial_status=make_initial_status() if make_initial_status else None,
+                       **kw)
+    fast = run_backtest(make_streamer(), candles_by_symbol, vectorized=True,
+                        initial_status=make_initial_status() if make_initial_status else None,
+                        **kw)
+    return ref, fast
 
 
 class LoopOnlyIndicator(BaseIndicator):
@@ -291,26 +309,21 @@ class RelativeStrengthRotationStreamer(BaseStreamer):
 def check_nonflat_start(candles) -> bool:
     """포지션을 들고 시작해도 두 백테스터의 자본 곡선이 일치하는지.
 
-    FastBacktester는 자본 곡선을 사후에 재구성하는데, 예전에는 첫 거래 이전 구간을 flat이라
-    가정해 상수로 채웠다. reference는 매 캔들 실시간 계산이라 옳고, 이 곡선에서 파생되는
+    벡터화 경로는 자본 곡선을 사후에 재구성하는데, 예전에는 첫 거래 이전 구간을 flat이라
+    가정해 상수로 채웠다. 참조 경로는 매 이벤트 실시간 계산이라 옳고, 이 곡선에서 파생되는
     max_drawdown/sharpe/balance 컬럼까지 함께 틀어졌다.
     """
     sub = candles[:20_000]
     entry_price = sub[0].close
 
-    def seed(bt):
-        bt.status = Status(margin=100_000.0,
-                           positions={"X": PositionState(avg_price=entry_price, position=10.0)})
-        return bt
-
     candles_by_symbol = {"X": sub}
-    ref_bt = seed(SingleThreadedBacktester(KeltnerStreamer(symbols=["X"], window=600), candles_by_symbol))
-    ref_report = ref_bt.run()
-    fast_bt = seed(FastBacktester(KeltnerStreamer(symbols=["X"], window=600), candles_by_symbol))
-    fast_report = fast_bt.run()
+    ref_report, fast_report = run_pair(
+        lambda: KeltnerStreamer(symbols=["X"], window=600), candles_by_symbol,
+        make_initial_status=lambda: Status(
+            margin=100_000.0,
+            positions={"X": PositionState(avg_price=entry_price, position=10.0)}))
 
-    ok = compare_reports("non-flat start", ref_report, ref_bt.status.total_margin(),
-                         fast_report, fast_bt.status.total_margin())
+    ok = compare_reports("non-flat start", ref_report, fast_report)
 
     # 첫 거래 이전 구간이 실제로 존재하고 상수가 아닌지 — 아니면 검사가 무의미하다
     first_trade_idx = next((i for i, (ts, _) in enumerate(ref_report.equity_curve)
@@ -334,10 +347,12 @@ def check_empty_range(candles) -> bool:
     ok = True
     reports = {}
     candles_by_symbol = {"X": candles}
-    for name, cls in (("ref", SingleThreadedBacktester), ("fast", FastBacktester)):
-        bt = cls(KeltnerStreamer(symbols=["X"], window=600), candles_by_symbol)
+    for name, vectorized in (("ref", False), ("fast", True)):
         try:
-            reports[name] = bt.run(start_time=far_future, end_time=far_future + 1000)
+            reports[name] = run_backtest(
+                KeltnerStreamer(symbols=["X"], window=600), candles_by_symbol,
+                vectorized=vectorized,
+                start_time=far_future, end_time=far_future + 1000)
         except Exception as e:
             print(f"  [empty range] FAIL: {name}가 {type(e).__name__}: {e}")
             ok = False
@@ -352,13 +367,9 @@ def check_empty_range(candles) -> bool:
 def check_forced_liquidation(candles) -> bool:
     """손실측 강제청산이 실제로 발화하고, 두 백테스터가 그 지점까지 정확히 일치하는지 (단일 심볼)."""
     candles_by_symbol = {"X": candles}
-    ref_bt = SingleThreadedBacktester(BlowUpStreamer(["X"]), candles_by_symbol)
-    ref_report = ref_bt.run()
-    fast_bt = FastBacktester(BlowUpStreamer(["X"]), candles_by_symbol)
-    fast_report = fast_bt.run()
+    ref_report, fast_report = run_pair(lambda: BlowUpStreamer(["X"]), candles_by_symbol)
 
-    ok = compare_reports("forced liquidation", ref_report, ref_bt.status.total_margin(),
-                         fast_report, fast_bt.status.total_margin())
+    ok = compare_reports("forced liquidation", ref_report, fast_report)
 
     # 침묵이 곧 성공은 아니다 — 경로를 실제로 밟았는지 단언한다.
     if len(ref_report.trades) < 2:
@@ -370,13 +381,13 @@ def check_forced_liquidation(candles) -> bool:
         print(f"  [forced liquidation] FAIL: 청산 시점 자본이 "
               f"{exit_trade.status.total_margin():.2f} > 0 — 전략 청산이지 강제청산이 아니다.")
         ok = False
-    if ref_bt.status.total_margin() > 0:
+    if ref_report.status.total_margin() > 0:
         print(f"  [forced liquidation] FAIL: 파산했어야 하는데 자본이 "
-              f"{ref_bt.status.total_margin():.2f} 남았다.")
+              f"{ref_report.status.total_margin():.2f} 남았다.")
         ok = False
     print(f"[forced liquidation] {'OK' if ok else 'MISMATCH'} — trades={len(ref_report.trades)} "
           f"청산 시점 자본={exit_trade.status.total_margin():.2f} "
-          f"최종 자본={ref_bt.status.total_margin():.2f}")
+          f"최종 자본={ref_report.status.total_margin():.2f}")
     return ok
 
 
@@ -385,39 +396,33 @@ def check_forced_liquidation_multi(candles_a, candles_b) -> bool:
     candles_by_symbol = {"AAA": candles_a, "BBB": candles_b}
     # 실제 시세는 합성 랜덤워크보다 변동성이 낮으므로, 짧은 구간에서도 확실히 터지도록
     # 레버리지를 크게 잡는다 (단일심볼 check_forced_liquidation과 같은 이유).
-    ref_bt = SingleThreadedBacktester(BlowUpStreamer(["AAA", "BBB"], leverage=500.0), candles_by_symbol)
-    ref_report = ref_bt.run()
-    fast_bt = FastBacktester(BlowUpStreamer(["AAA", "BBB"], leverage=500.0), candles_by_symbol)
-    fast_report = fast_bt.run()
+    ref_report, fast_report = run_pair(
+        lambda: BlowUpStreamer(["AAA", "BBB"], leverage=500.0), candles_by_symbol)
 
-    ok = compare_reports("forced liquidation (multi-symbol)", ref_report, ref_bt.status.total_margin(),
-                         fast_report, fast_bt.status.total_margin())
+    ok = compare_reports("forced liquidation (multi-symbol)", ref_report, fast_report)
 
-    if ref_bt.status.total_margin() > 0 or fast_bt.status.total_margin() > 0:
+    if ref_report.status.total_margin() > 0 or fast_report.status.total_margin() > 0:
         print(f"  [forced liquidation (multi-symbol)] FAIL: 파산했어야 하는데 자본이 남았다 — "
-              f"ref={ref_bt.status.total_margin():.2f} fast={fast_bt.status.total_margin():.2f}")
+              f"ref={ref_report.status.total_margin():.2f} fast={fast_report.status.total_margin():.2f}")
         ok = False
-    for name, bt in (("ref", ref_bt), ("fast", fast_bt)):
-        nonflat = {s: p.position for s, p in bt.status.positions.items() if p.position != 0.0}
+    for name, st in (("ref", ref_report.status), ("fast", fast_report.status)):
+        nonflat = {s: p.position for s, p in st.positions.items() if p.position != 0.0}
         if nonflat:
             print(f"  [forced liquidation (multi-symbol)] FAIL: {name}에 청산되지 않은 포지션 "
                   f"{nonflat}")
             ok = False
     print(f"[forced liquidation (multi-symbol)] {'OK' if ok else 'MISMATCH'} — "
-          f"trades={len(ref_report.trades)} 최종 자본={ref_bt.status.total_margin():.2f}")
+          f"trades={len(ref_report.trades)} 최종 자본={ref_report.status.total_margin():.2f}")
     return ok
 
 
 def check_multi_symbol_overlap(candles_a, candles_b) -> bool:
     """완전히 겹치는 두 심볼에서 독립된 결정이 서로에게 새지 않고, 두 엔진이 일치하는지."""
     candles_by_symbol = {"AAA": candles_a, "BBB": candles_b}
-    ref_bt = SingleThreadedBacktester(DualSymbolMomentum(["AAA", "BBB"]), candles_by_symbol)
-    ref_report = ref_bt.run()
-    fast_bt = FastBacktester(DualSymbolMomentum(["AAA", "BBB"]), candles_by_symbol)
-    fast_report = fast_bt.run()
+    ref_report, fast_report = run_pair(
+        lambda: DualSymbolMomentum(["AAA", "BBB"]), candles_by_symbol)
 
-    ok = compare_reports("multi-symbol overlap", ref_report, ref_bt.status.total_margin(),
-                         fast_report, fast_bt.status.total_margin())
+    ok = compare_reports("multi-symbol overlap", ref_report, fast_report)
     symbols_traded = {t.symbol for t in ref_report.trades}
     if symbols_traded != {"AAA", "BBB"}:
         print(f"  [multi-symbol overlap] FAIL: 두 심볼 모두 거래됐어야 하는데 {symbols_traded}")
@@ -429,13 +434,10 @@ def check_multi_symbol_overlap(candles_a, candles_b) -> bool:
 def check_staggered_start(candles_a, candles_b) -> bool:
     """상장 시점이 다른(한 심볼이 늦게 시작하는) 두 심볼에서 크로스심볼 전략과 두 엔진이 일치하는지."""
     candles_by_symbol = {"AAA": candles_a, "BBB": candles_b}
-    ref_bt = SingleThreadedBacktester(RelativeStrengthRotationStreamer(["AAA", "BBB"]), candles_by_symbol)
-    ref_report = ref_bt.run()
-    fast_bt = FastBacktester(RelativeStrengthRotationStreamer(["AAA", "BBB"]), candles_by_symbol)
-    fast_report = fast_bt.run()
+    ref_report, fast_report = run_pair(
+        lambda: RelativeStrengthRotationStreamer(["AAA", "BBB"]), candles_by_symbol)
 
-    ok = compare_reports("staggered start + rotation", ref_report, ref_bt.status.total_margin(),
-                         fast_report, fast_bt.status.total_margin())
+    ok = compare_reports("staggered start + rotation", ref_report, fast_report)
     if not any(t.symbol == "BBB" for t in ref_report.trades):
         print("  [staggered start + rotation] FAIL: 늦게 시작한 심볼(BBB)이 한 번도 거래되지 않았다")
         ok = False
@@ -453,13 +455,9 @@ def check_limit_orders(candles) -> bool:
     by_symbol = {"X": candles}
     close_at = {c.end_time: c.close for c in candles}
 
-    ref_bt = SingleThreadedBacktester(LimitLadderStreamer(["X"]), by_symbol)
-    ref_report = ref_bt.run()
-    fast_bt = FastBacktester(LimitLadderStreamer(["X"]), by_symbol)
-    fast_report = fast_bt.run()
+    ref_report, fast_report = run_pair(lambda: LimitLadderStreamer(["X"]), by_symbol)
 
-    ok = compare_reports("limit orders", ref_report, ref_bt.status.total_margin(),
-                         fast_report, fast_bt.status.total_margin())
+    ok = compare_reports("limit orders", ref_report, fast_report)
 
     limits = [t for t in ref_report.trades if t.order_type == "LIMIT"]
     if not limits:
@@ -473,9 +471,9 @@ def check_limit_orders(candles) -> bool:
     if not delayed:
         print("  [limit orders] FAIL: 제출 봉보다 나중에 체결된 주문이 없다")
         ok = False
-    if ref_bt.status.total_open_orders() != fast_bt.status.total_open_orders():
+    if ref_report.status.total_open_orders() != fast_report.status.total_open_orders():
         print(f"  [limit orders] FAIL: 남은 미체결 주문 수가 다르다 "
-              f"{ref_bt.status.total_open_orders()} != {fast_bt.status.total_open_orders()}")
+              f"{ref_report.status.total_open_orders()} != {fast_report.status.total_open_orders()}")
         ok = False
     print(f"[limit orders] {'OK' if ok else 'MISMATCH'} — trades={len(ref_report.trades)} "
           f"limit={len(limits)} 종가와 다른 체결={len(off_close)} 지연체결={len(delayed)}")
@@ -492,14 +490,9 @@ def check_stop_orders(candles) -> bool:
     ok = True
     reports = {}
     for slippage in (0.0, 0.0005):
-        ref_bt = SingleThreadedBacktester(StopLadderStreamer(["X"]), by_symbol,
-                                          slippage_ratio=slippage)
-        ref_report = ref_bt.run()
-        fast_bt = FastBacktester(StopLadderStreamer(["X"]), by_symbol, slippage_ratio=slippage)
-        fast_report = fast_bt.run()
-        ok &= compare_reports(f"stop orders (slippage={slippage})", ref_report,
-                              ref_bt.status.total_margin(), fast_report,
-                              fast_bt.status.total_margin())
+        ref_report, fast_report = run_pair(lambda: StopLadderStreamer(["X"]), by_symbol,
+                                           slippage_ratio=slippage)
+        ok &= compare_reports(f"stop orders (slippage={slippage})", ref_report, fast_report)
         reports[slippage] = ref_report
 
     stops = [t for t in reports[0.0].trades if t.order_type == "STOP_MARKET"]
@@ -552,53 +545,45 @@ def check_order_expiry(candles) -> bool:
                            price=candle.close * 0.01, expire_after_candles=5)]
 
     by_symbol = {"X": candles}
-    ref_bt = SingleThreadedBacktester(NeverFillStreamer(["X"]), by_symbol)
-    ref_report = ref_bt.run()
-    fast_bt = FastBacktester(NeverFillStreamer(["X"]), by_symbol)
-    fast_report = fast_bt.run()
+    ref_report, fast_report = run_pair(lambda: NeverFillStreamer(["X"]), by_symbol)
 
-    ok = compare_reports("order expiry", ref_report, ref_bt.status.total_margin(),
-                         fast_report, fast_bt.status.total_margin())
+    ok = compare_reports("order expiry", ref_report, fast_report)
     if ref_report.trades or fast_report.trades:
         print(f"  [order expiry] FAIL: 닿을 수 없는 지정가가 체결됐다 "
               f"({len(ref_report.trades)}건)")
         ok = False
-    for name, bt in (("ref", ref_bt), ("fast", fast_bt)):
+    for name, st in (("ref", ref_report.status), ("fast", fast_report.status)):
         # 매 5봉마다 만료되고 다시 걸리므로 장부에는 항상 1건 이하만 남는다.
-        if bt.status.total_open_orders() > 1:
+        if st.total_open_orders() > 1:
             print(f"  [order expiry] FAIL: {name}의 장부에 만료되지 않은 주문이 쌓였다 "
-                  f"({bt.status.total_open_orders()}건)")
+                  f"({st.total_open_orders()}건)")
             ok = False
     print(f"[order expiry] {'OK' if ok else 'MISMATCH'} — 남은 미체결 주문="
-          f"{ref_bt.status.total_open_orders()}")
+          f"{ref_report.status.total_open_orders()}")
     return ok
 
 
 def check_liquidation_cancels_orders(candles_a, candles_b) -> bool:
     """강제청산이 미체결 주문까지 거두는지 (멀티심볼, 증거금 공유 풀)."""
     by_symbol = {"AAA": candles_a, "BBB": candles_b}
-    ref_bt = SingleThreadedBacktester(RestingBlowUpStreamer(["AAA", "BBB"], leverage=500.0),
-                                      by_symbol)
-    ref_report = ref_bt.run()
-    fast_bt = FastBacktester(RestingBlowUpStreamer(["AAA", "BBB"], leverage=500.0), by_symbol)
-    fast_report = fast_bt.run()
+    ref_report, fast_report = run_pair(
+        lambda: RestingBlowUpStreamer(["AAA", "BBB"], leverage=500.0), by_symbol)
 
-    ok = compare_reports("liquidation cancels orders", ref_report, ref_bt.status.total_margin(),
-                         fast_report, fast_bt.status.total_margin())
-    if ref_bt.status.total_margin() > 0:
+    ok = compare_reports("liquidation cancels orders", ref_report, fast_report)
+    if ref_report.status.total_margin() > 0:
         print("  [liquidation cancels orders] FAIL: 파산했어야 하는데 자본이 남았다")
         ok = False
-    for name, bt in (("ref", ref_bt), ("fast", fast_bt)):
-        if bt.status.total_open_orders() != 0:
+    for name, st in (("ref", ref_report.status), ("fast", fast_report.status)):
+        if st.total_open_orders() != 0:
             print(f"  [liquidation cancels orders] FAIL: {name}의 장부에 미체결 주문이 남았다 "
-                  f"({bt.status.total_open_orders()}건)")
+                  f"({st.total_open_orders()}건)")
             ok = False
-        nonflat = {s: p.position for s, p in bt.status.positions.items() if p.position != 0.0}
+        nonflat = {s: p.position for s, p in st.positions.items() if p.position != 0.0}
         if nonflat:
             print(f"  [liquidation cancels orders] FAIL: {name}에 청산되지 않은 포지션 {nonflat}")
             ok = False
     print(f"[liquidation cancels orders] {'OK' if ok else 'MISMATCH'} — "
-          f"trades={len(ref_report.trades)} 최종 자본={ref_bt.status.total_margin():.2f}")
+          f"trades={len(ref_report.trades)} 최종 자본={ref_report.status.total_margin():.2f}")
     return ok
 
 
@@ -643,8 +628,10 @@ def check_history_bound(candles) -> bool:
     return ok
 
 
-def compare_reports(label, ref_report, ref_final, fast_report, fast_final) -> bool:
+def compare_reports(label, ref_report, fast_report) -> bool:
     ok = True
+    ref_final = ref_report.status.total_margin()
+    fast_final = fast_report.status.total_margin()
     if len(ref_report.trades) != len(fast_report.trades):
         print(f"  [{label}] FAIL: trade count {len(ref_report.trades)} != {len(fast_report.trades)}")
         return False
@@ -766,18 +753,15 @@ if __name__ == "__main__":
     all_ok = True
     for label, make_streamer in cases.items():
         candles_by_symbol = {symbol: candles}
-        ref_bt = SingleThreadedBacktester(make_streamer(), candles_by_symbol)
         t0 = time.time()
-        ref_report = ref_bt.run()
+        ref_report = run_backtest(make_streamer(), candles_by_symbol, vectorized=False)
         ref_dt = time.time() - t0
 
-        fast_bt = FastBacktester(make_streamer(), candles_by_symbol)
         t0 = time.time()
-        fast_report = fast_bt.run()
+        fast_report = run_backtest(make_streamer(), candles_by_symbol, vectorized=True)
         fast_dt = time.time() - t0
 
-        ok = compare_reports(label, ref_report, ref_bt.status.total_margin(),
-                             fast_report, fast_bt.status.total_margin())
+        ok = compare_reports(label, ref_report, fast_report)
         all_ok &= ok
         print(f"[{label}] {'OK' if ok else 'MISMATCH'} — trades={len(ref_report.trades)} "
               f"ref={ref_dt:.1f}s fast={fast_dt:.1f}s ({ref_dt / fast_dt:.1f}x)")

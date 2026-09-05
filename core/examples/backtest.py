@@ -1,8 +1,8 @@
 import sys
 from datetime import datetime, timezone
 
-from core.backtest.FastBacktester import FastBacktester
 from core.binance_candle_fetcher.vision_fetcher import BinanceVisionFetcher
+from core.engine.backtest import DEFAULT_INIT_MARGIN, run_backtest
 from core.logging_config import setup_logging
 from core.streamer.keltner_streamer import KeltnerStreamer
 
@@ -31,8 +31,7 @@ if __name__ == "__main__":
 
     # 3. 백테스트 실행. 멀티심볼 엔진은 심볼별 캔들 리스트를 받는다 — 단일 심볼 전략은
     #    자기 심볼 하나짜리 dict만 넘기면 그대로 동작한다.
-    backtester = FastBacktester(streamer, {symbol: candles})
-    init_margin = backtester.status.total_margin()
+    init_margin = DEFAULT_INIT_MARGIN
     metadata = {
         "symbols": [symbol],
         "interval": interval,
@@ -43,7 +42,7 @@ if __name__ == "__main__":
     # 실험 목적 한 줄 라벨: uv run python core/examples/backtest.py "ATR 채널폭 2.0 검증"
     if len(sys.argv) > 1:
         metadata["label"] = sys.argv[1]
-    report = backtester.run(metadata=metadata, save_series=True)
+    report = run_backtest(streamer, {symbol: candles}, metadata=metadata, save_series=True)
 
     # 4. 결과 출력
     print(f"Max Leverage: {report.max_leverage}")

@@ -14,7 +14,7 @@ class ADXIndicator(NumericIndicator):
     DI+/DI- -> DX -> DX의 Wilder smoothing = ADX.
 
     Wilder 재귀는 경로 의존이라 벡터화하지 않는다(plain NumericIndicator,
-    FastBacktester 루프 경로 — Supertrend와 동일 전례). 워밍업은 약 2*window 캔들.
+    벡터화 경로에서도 루프 갱신 — Supertrend와 동일 전례). 워밍업은 약 2*window 캔들.
     """
 
     scale_group = "adx"

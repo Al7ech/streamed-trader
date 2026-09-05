@@ -79,7 +79,7 @@ class Status:
                     fee_ratio: float) -> Tuple[float, float]:
         """체결 하나를 이 Status에 반영한다. 반환값은 (wnl, fee).
 
-        백테스터(``SingleThreadedBacktester._trade``)와 라이브 트레이더의 dry-run 경로가
+        가상 실행기(``SimulatedExecutor._fill``)와 라이브 트레이더의 체결 경로가
         **같은** 회계를 쓰도록 여기 한 곳에만 둔다. 예전에는 dry-run이 자체 근사식을 써서
         부분 청산에서 avg_price를 현재가로 덮어쓰고 margin을 아예 갱신하지 않았다.
 

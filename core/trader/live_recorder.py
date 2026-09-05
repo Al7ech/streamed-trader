@@ -133,7 +133,7 @@ class LiveRecorder:
     def record_candle(self, symbol: str, candle: Candle, status: Status) -> None:
         """마감된 캔들 하나를 적재한다. ``symbol``은 이 캔들이 마감된 심볼이다.
 
-        ``SingleThreadedBacktester.run``의 기록 지점과 1:1로 대응한다 — 호출자는 반드시
+        백테스트의 기록 지점과 1:1로 대응한다 — 호출자는 반드시
         ``decide_action`` 직후이자 after-indicator 갱신 **전에** 불러야 한다. 그래야 모든
         지표 컬럼이 그 결정이 실제로 본 값이 된다. 또한 호출자는 이 시점 이전에
         ``status.last_close[symbol]``을 이 캔들의 종가로 갱신해 둬야 한다 — 벤치마크 곡선이

@@ -53,8 +53,8 @@ class BaseIndicator(ABC):
         return self.read(-1)
 
     # An indicator may additionally define `precompute_series(open, high, low, close, volume)
-    # -> np.ndarray` to compute its whole series from candle arrays in one shot; `FastBacktester`
-    # detects this by attribute presence (`getattr(indicator, "precompute_series", None)`) and
+    # -> np.ndarray` to compute its whole series from candle arrays in one shot; the
+    # vectorized backtest path detects this by attribute presence (`getattr(indicator, "precompute_series", None)`) and
     # uses it as the fast path instead of looping `update()`. There is deliberately no default
     # implementation here — only subclasses that define it opt into vectorization. Element i of
     # the returned array must equal `get_latest()` after `update()` has been called with candles
@@ -87,7 +87,7 @@ class NumericIndicator(BaseIndicator):
     #:
     #: Reads deeper than this are a programming error and raise ``IndexError`` rather than
     #: silently returning ``None``: a silent ``None`` would make the loop path and
-    #: ``FastBacktester``'s ``ArrayIndicator`` (which mirrors this bound) disagree. Reads that
+    #: the vectorized path's ``ArrayIndicator`` (which mirrors this bound) disagree. Reads that
     #: are merely still in warm-up keep returning ``None``.
     #:
     #: The default is far deeper than anything shipped reads (the deepest is
@@ -111,7 +111,7 @@ class NumericIndicator(BaseIndicator):
         재사용한다 — ``history_size``를 ``self``에서 읽지 않고 인자로 받는 이유다.
 
         인덱스는 **음수만** 받는다. 음수가 아니면 루프 경로는 ``values[0]`` = 가장 오래된
-        보관값을, ``FastBacktester``의 ``ArrayIndicator``는 ``seq[cursor]`` = 아직 반영되지
+        보관값을, 벡터화 경로의 ``ArrayIndicator``는 ``seq[cursor]`` = 아직 반영되지
         않은 캔들의 값(= 룩어헤드)을 주므로 둘이 아예 다른 뜻이 된다.
 
         NaN은 ``None``으로 정규화한다. ``precompute_series``는 값이 없는 구간을 NaN으로

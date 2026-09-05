@@ -884,7 +884,7 @@ class BinanceTrader:
                 # 부분 청산에서 avg_price를 현재가로 덮어써 미실현을 날렸고 margin은 아예 갱신하지
                 # 않아서, dry-run 자본이 초기값에 영원히 고정됐다.
                 # 가격은 액션의 **대상 심볼**의 마지막 알려진 종가로 매긴다 — 지금 마감한 캔들의
-                # 종가가 아니다. 교차 심볼 액션이면 둘이 다를 수 있다 (SingleThreadedBacktester
+                # 종가가 아니다. 교차 심볼 액션이면 둘이 다를 수 있다 (백테스트
                 # 와 같은 규칙, status.last_close.get(action.symbol)).
                 price = self.status.last_close.get(action.symbol)
                 if price is None:

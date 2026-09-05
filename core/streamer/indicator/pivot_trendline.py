@@ -16,7 +16,7 @@ class PivotTrendlineIndicator(BaseIndicator):
       속성으로 노출한다. 시리즈 저장이 float 컬럼을 기대하므로 값은 선값만 반환한다.
 
     경로 의존(확정 지연 + 최근 2개 선택)이라 plain BaseIndicator로 둔다
-    (FastBacktester가 루프 경로로 처리).
+    (벡터화 경로에서도 루프로 처리).
     """
 
     scale_group = "price"
