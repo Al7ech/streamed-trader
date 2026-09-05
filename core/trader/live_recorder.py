@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from core.engine import order_book
+from core.engine.recorder import Recorder
 from core.engine.indicator_columns import collect_indicator_columns
 from core.engine.metrics import build_multi_symbol_buy_and_hold_curve
 from core.engine.report import Report
@@ -57,7 +58,7 @@ def default_run_id(streamer: BaseStreamer, symbols: List[str], interval: str,
     return f"{mode}_{type(streamer).__name__}_{joined}_{interval}"
 
 
-class LiveRecorder:
+class LiveRecorder(Recorder):
     """라이브 트레이더의 캔들/체결을 백테스트 포맷으로 적재한다.
 
     백테스터의 ``run()`` 루프가 지역 변수로 들고 있던 것(자본 곡선, 종가, 체결 목록,
@@ -130,50 +131,41 @@ class LiveRecorder:
 
     # ------------------------------------------------------------------ 기록
 
-    def record_candle(self, symbol: str, candle: Candle, status: Status) -> None:
-        """마감된 캔들 하나를 적재한다. ``symbol``은 이 캔들이 마감된 심볼이다.
+    def record_event(self, event_time: int, equity: float,
+                     candles: Dict[str, Candle]) -> None:
+        """이벤트 하나를 적재한다. 라이브 이벤트는 심볼 하나짜리다.
 
-        백테스트의 기록 지점과 1:1로 대응한다 — 호출자는 반드시
-        ``decide_action`` 직후이자 after-indicator 갱신 **전에** 불러야 한다. 그래야 모든
-        지표 컬럼이 그 결정이 실제로 본 값이 된다. 또한 호출자는 이 시점 이전에
-        ``status.last_close[symbol]``을 이 캔들의 종가로 갱신해 둬야 한다 — 벤치마크 곡선이
-        그 값으로 다른 심볼들의 "가장 최근에 알려진 종가"를 함께 채우기 때문이다.
+        엔진의 기록 지점이 백테스트와 1:1로 대응한다 — 모든 지표가 갱신되고 ``decide_action``이
+        반환한 직후이므로, 여기서 읽는 지표 값은 그 결정이 실제로 본 값이다.
         """
         # 자본과 종가는 **항상 같이** 늘어나야 한다. _downsample_equity가 길이로 stride를
         # 정하므로 어긋나면 equity와 benchmark의 인덱스 짝이 조용히 밀린다.
-        equity = status.total_margin()
-        self._equity.append((candle.end_time, equity))
+        self._equity.append((event_time, equity))
         for s in self.symbols:
-            self._closes_by_symbol[s].append(status.last_close.get(s))
+            self._closes_by_symbol[s].append(self._status.last_close.get(s))
 
-        values = {name: ind.get_latest()
-                 for name, ind in self._streamer.indicators.get(symbol, {}).items()}
-        self._shard_writer.add(candle.end_time, equity, {symbol: (candle, values)})
+        symbol_data = {
+            symbol: (candle, {name: ind.get_latest() for name, ind
+                              in self._streamer.indicators.get(symbol, {}).items()})
+            for symbol, candle in candles.items()
+        }
+        self._shard_writer.add(event_time, equity, symbol_data)
         self._candles_since_shard_flush += 1
 
-    def record_trade(self, symbol: str, timestamp: int, quantity: float, price: float,
-                     wnl: float, fee: float, pre_status: Status, leverage: float,
-                     order_type: str = "MARKET",
-                     submitted_at: Optional[int] = None) -> None:
-        """체결 하나를 적재한다. ``pre_status``는 **거래 전** 스냅샷이어야 한다.
+    def record_trade(self, trade: Trade) -> None:
+        """체결 하나를 적재하고 **즉시** 체크포인트한다.
 
-        :param order_type: 이 체결을 낳은 주문 종류 (``ActionType``의 값).
-        :param submitted_at: 그 주문이 제출된 시각(ms). None이면 ``timestamp``와 같다고 본다 —
-            MARKET은 결정과 체결이 같은 캔들이지만, 지정가/조건부 주문은 몇 봉 전이다.
+        라이브 체결은 이벤트 바깥(유저 데이터 스트림)에서도 도착하므로 이벤트 끝의 flush를
+        기다릴 수 없다. 이걸 빼면 크래시 시 체결은 남았는데 그 체결을 낳은 캔들 구간의
+        시계열이 통째로 없는, 앞뒤가 맞지 않는 런이 남는다.
         """
-        self._max_leverage = max(self._max_leverage, leverage)
-        self._trades.append(Trade(
-            timestamp=timestamp,
-            symbol=symbol,
-            quantity=quantity,
-            price=price,
-            wnl=wnl,
-            fee=fee,
-            status=pre_status,
-            leverage=leverage,
-            order_type=order_type,
-            submitted_at=submitted_at if submitted_at is not None else timestamp,
-        ))
+        self._max_leverage = max(self._max_leverage, trade.leverage)
+        self._trades.append(trade)
+        self.flush(force=True)
+
+    def end_event(self, event_time: int) -> None:
+        """이벤트 끝. 런 JSON은 매번, 샤드는 주기가 됐을 때만 다시 쓴다."""
+        self.flush()
 
     # ------------------------------------------------------------------ 영속화
 

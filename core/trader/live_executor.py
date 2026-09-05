@@ -1,0 +1,613 @@
+"""실제 거래소에 주문을 내고 계좌 상태를 거래소 값으로 유지하는 실행기.
+
+:class:`~core.engine.executor.SimulatedExecutor`와 대비되는 지점이 이 모듈의 요점이다:
+
+- **체결이 비동기로 도착한다.** ``submit``은 주문을 보내고 :class:`OrderDispatch`만 돌려준다.
+  실제 체결은 나중에 유저 데이터 스트림(``ORDER_TRADE_UPDATE``)으로 오고, 그때 ``on_trade``
+  싱크로 흘러간다. 그래서 결정 시점의 거래 전 스냅샷을 client order id로 보관해 뒀다가
+  체결이 왔을 때 짝짓는다.
+- **``status``는 거래소가 정답이다.** ``ACCOUNT_UPDATE``가 margin/포지션을 덮고, 미체결 장부는
+  ``ORDER_TRADE_UPDATE``가 동기화한다. 여기서 ``apply_fill``을 부르지 않는다.
+- **미체결 주문을 시뮬레이션하지 않는다.** ``match_resting``은 no-op이고, 강제청산도 거래소가
+  한다 (``force_liquidation``이 항상 False).
+
+유저 데이터 소켓의 **수명주기**는 :class:`~core.trader.BinanceTrader.BinanceTrader`가 들고
+있고, 받은 메시지만 :meth:`LiveExecutor.on_user_data`로 넘어온다.
+"""
+
+import asyncio
+import copy
+import logging
+import math
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Dict, List, Optional, Set, Tuple
+
+from core.engine import order_book
+from core.engine.executor import Dispatch, Executor
+from core.engine.order_book import OpenOrder
+from core.engine.status import Status
+from core.engine.trade import Trade
+from core.streamer.action import Action, ActionType
+from core.streamer.candle import Candle
+from core.trader.BinanceExecutor import BinanceExecutor, OrderResult
+
+#: 선물 정산(마진) 자산 후보. 심볼에서 접미사로 떼어내 잔고 항목을 찾는다.
+#: 긴 것부터 검사해야 USDT/USDC 같은 4자리가 USD류 접두와 헷갈리지 않는다.
+MARGIN_ASSETS = ("FDUSD", "BUSD", "USDT", "USDC", "BNB", "BTC", "ETH")
+
+#: 주문이 종결된 것으로 보는 ORDER_TRADE_UPDATE 상태들. CANCELED/EXPIRED도 부분 체결된
+#: 수량이 남아 있을 수 있으므로 여기 포함된다.
+_TERMINAL_ORDER_STATES = ("FILLED", "CANCELED", "EXPIRED", "REJECTED")
+_TRACKED_ORDER_STATES = _TERMINAL_ORDER_STATES + ("PARTIALLY_FILLED",)
+_ACK_ORDER_STATE = "NEW"
+
+#: 결정 수량과 실제 체결 수량의 허용 괴리. 실행기가 step size로 양자화하지 않아 생긴다.
+_QUANTITY_DIVERGENCE_TOLERANCE = 0.01
+
+#: 종결 이벤트를 못 받은 항목이 무한히 쌓이지 않도록 하는 상한. 넘으면 가장 오래된 것부터 버린다.
+_MAX_OPEN_ORDER_AGGREGATES = 256
+_MAX_PENDING_DECISIONS = 256
+
+_logger = logging.getLogger(__name__)
+
+
+def suffix_margin_asset(symbol: str) -> str:
+    """심볼의 정산(마진) 자산. 잔고 목록에서 우리 자산 항목을 찾는 데 쓴다.
+
+    예전 구현은 ``symbol[3:]``이라 base가 3글자인 심볼에서만 우연히 맞았다. ``AVAXUSDT`` →
+    ``"XUSDT"``, ``1000PEPEUSDT`` → ``"0PEPEUSDT"`` 가 되어 어떤 잔고 항목에도 매치되지 않았고,
+    그 결과 ``status.margin``이 ``0.0``에 고정됐다.
+    """
+    for asset in MARGIN_ASSETS:
+        if symbol.endswith(asset) and len(symbol) > len(asset):
+            return asset
+    _logger.warning(f"{symbol}의 정산 자산을 알 수 없다 — USDT로 가정한다. "
+                    f"알려진 자산: {MARGIN_ASSETS}")
+    return "USDT"
+
+
+def resolve_margin_asset(symbols: List[str]) -> str:
+    """모든 심볼이 정산되는 단일 자산.
+
+    ``Status.margin``이 전 심볼이 공유하는 증거금 풀 스칼라 하나뿐이므로, 한 트레이더가 다루는
+    심볼은 전부 같은 자산으로 정산돼야만 회계가 성립한다 — 여기서 그 전제를 검증한다.
+    """
+    assets = {sym: suffix_margin_asset(sym) for sym in symbols}
+    unique = set(assets.values())
+    if len(unique) > 1:
+        mismatched = ", ".join(f"{s}->{a}" for s, a in assets.items())
+        raise ValueError(
+            f"심볼들이 서로 다른 정산 자산으로 해석된다 ({mismatched}) — "
+            f"Status.margin은 전 심볼 공유 풀이라 모든 심볼이 같은 자산이어야 한다.")
+    return next(iter(unique))
+
+
+@dataclass
+class _PendingDecision:
+    """주문을 내보내기 직전의 스냅샷. 나중에 도착할 체결 이벤트와 짝짓는다."""
+    timestamp: int          # 결정 캔들의 end_time
+    quantity: float
+    pre_status: Status      # 주문을 보내기 **전에** 뜬 깊은 복사
+    symbol: str = ""
+    order_type: str = "MARKET"
+    resting: bool = False   # True면 캔들 경계에서 버리지 않는다 (몇 봉 뒤 체결이 정상)
+
+
+@dataclass
+class _OrderAggregate:
+    """한 주문의 부분 체결들을 합쳐 하나의 Trade로 만들기 위한 누적기."""
+    order_id: int
+    side: str
+    symbol: str
+    cum_qty: float = 0.0    # z
+    avg_price: float = 0.0  # ap
+    wnl: float = 0.0        # Σ rp (수수료 차감 전 실현손익 — 백테스트 wnl과 같은 정의)
+    fee: float = 0.0        # Σ n, 마진 자산 기준
+    fee_other: float = 0.0  # BNB 등 다른 자산으로 부과된 수수료
+    last_trade_ms: int = 0  # T
+
+
+class OrderDispatch(Dispatch):
+    """거래소에 보낸 주문 하나. :meth:`wait`가 결과를 기다리고 실패를 자체 처리한다."""
+
+    def __init__(self, action: Action, future,
+                 on_error: Callable[[Exception], Awaitable[None]]):
+        self.action = action
+        self._future = future
+        self._on_error = on_error
+        self._logger = logging.getLogger(__name__)
+
+    async def wait(self, timeout: float) -> None:
+        # concurrent.futures.Future라서 .result()는 **블로킹**이다 — 코루틴 안에서 부르면
+        # 유저 데이터 스트림을 포함한 이벤트 루프 전체가 멈춘다. wrap_future로 감싼다.
+        try:
+            result: Optional[OrderResult] = await asyncio.wait_for(
+                asyncio.wrap_future(self._future), timeout=timeout)
+        except Exception as e:
+            self._logger.error(f"Error waiting for order result: {e}")
+            await self._on_error(e)
+            return
+
+        # 실행기는 재시도 소진 후 예외 대신 success=False를 **반환**한다. 여기서 확인하지
+        # 않으면 영구 거부된 주문이 아무 흔적 없이 지나가고 전략이 거래소와 어긋난다.
+        if result is None or not result.success:
+            error = RuntimeError(
+                f"order failed: {getattr(result, 'error', 'no result')} (action={self.action})")
+            self._logger.error(str(error))
+            await self._on_error(error)
+
+
+class LiveExecutor(Executor):
+    """실제 바이낸스 선물 계좌에 대고 주문을 실행한다.
+
+    :param order_client: 저수준 주문 클라이언트 (스레드풀 + 재시도).
+    :param on_error: 주문 실패/처리 오류를 흘려보낼 곳.
+    :param on_metadata: 런 메타데이터에 남길 사실을 흘려보낼 곳 (수수료 자산 불일치 등).
+    """
+
+    def __init__(self, order_client: BinanceExecutor, status: Status, symbols: List[str],
+                 margin_asset: str,
+                 on_trade: Optional[Callable[[Trade], None]] = None,
+                 on_error: Optional[Callable[[Exception], Awaitable[None]]] = None,
+                 on_metadata: Optional[Callable[[str, object], None]] = None):
+        super().__init__(status, on_trade)
+        self._orders = order_client
+        self.symbols = list(symbols)
+        self._symbol_set: Set[str] = set(self.symbols)
+        self.margin_asset = margin_asset
+        self._on_error = on_error or self._default_on_error
+        self.on_metadata = on_metadata or (lambda key, value: None)
+        self.client = None  # AsyncClient — start()에서 붙는다
+
+        #: 키는 (심볼, client order id). 심볼만으로는 심볼당 in-flight 결정이 하나로 제한되고,
+        #: 무엇보다 몇 봉 뒤에 체결되는 미체결 주문을 짝지을 수 없다.
+        self._pending_decision: Dict[Tuple[str, str], _PendingDecision] = {}
+        #: 키에 심볼이 들어가는 이유: 주문 ID가 계좌 안에서 심볼을 가로질러 유일하다는 보장이 없다.
+        self._order_agg: Dict[Tuple[str, int], _OrderAggregate] = {}
+        self._client_order_seq = 0
+        self._warned_fee_asset = False
+
+    async def _default_on_error(self, error: Exception) -> None:
+        self.logger.error(f"LiveExecutor error: {error}")
+
+    def attach_client(self, client) -> None:
+        """계좌/주문 조회에 쓸 ``AsyncClient``를 붙인다 (트레이더 기동 시)."""
+        self.client = client
+
+    # ------------------------------------------------------- Executor 인터페이스
+
+    def begin_event(self, event_time: int, candles: Dict[str, Candle]) -> None:
+        """지난 캔들의 시장가 결정 중 체결 이벤트를 못 받은 것을 버린다.
+
+        그대로 두면 이번 캔들의 체결에 엉뚱한 거래 전 스냅샷이 붙는다. 미체결(지정가/조건부)
+        주문은 몇 봉 뒤에 체결되는 게 정상이므로 버리면 안 된다 — 그 항목은 주문이 종결될 때
+        지워진다. 시장가 결정만 그 캔들 안에 결과가 나와야 한다.
+
+        액션은 다른 심볼을 겨냥할 수 있으므로(교차 심볼 전략) pending은 **대상 심볼** 기준으로
+        키가 잡혀 있다 — 여기서는 이번 이벤트에 등장한 심볼 몫만 지운다.
+        """
+        for key in [k for k, p in self._pending_decision.items()
+                    if k[0] in candles and not p.resting]:
+            self.logger.warning(
+                f"체결되지 않은 이전 결정을 버린다 (symbol={key[0]}): "
+                f"{self._pending_decision.pop(key)}")
+
+    def submit(self, action: Action, event_time: int) -> Optional[Dispatch]:
+        """액션을 거래소로 보낸다. 실제 체결은 나중에 유저 데이터 스트림으로 온다."""
+        if action.order_type is ActionType.CANCEL:
+            # 장부는 여기서 바로 비운다. 거래소의 CANCELED 이벤트가 오면 _sync_open_order가
+            # 한 번 더 지우려 하지만 이미 없으므로 무해하다.
+            cancelled = order_book.cancel_orders(self.status, action.symbol, action.client_id)
+            if cancelled:
+                self.logger.info("주문 취소: symbol=%s client_id=%s (%d건)",
+                                 action.symbol, action.client_id or "*", len(cancelled))
+            return self._dispatch(action)
+
+        if action.quantity == 0:
+            return None
+
+        # 지정가/조건부는 client_id가 곧 취소 키이므로 전략의 것을 그대로 쓰고, 시장가는 여기서
+        # 하나 지어 붙인다 — 체결 이벤트를 이 결정과 정확히 짝짓기 위해서다.
+        if action.client_id is None:
+            action.client_id = self._new_client_order_id()
+
+        # 거래 전 스냅샷은 주문을 내보내기 **전에** 떠야 한다. Dispatch를 await하는 동안 이벤트
+        # 루프가 양보되어, 그 사이 체결/계정 갱신 이벤트가 self.status를 이미 바꿔놓을 수 있다.
+        self._remember_decision(_PendingDecision(
+            timestamp=event_time,
+            quantity=action.quantity,
+            pre_status=copy.deepcopy(self.status),
+            symbol=action.symbol,
+            order_type=action.order_type.value,
+            resting=action.is_resting,
+        ), action.symbol, action.client_id)
+
+        return self._dispatch(action)
+
+    def _dispatch(self, action: Action) -> OrderDispatch:
+        # reference_price는 조건부 주문을 STOP_MARKET / TAKE_PROFIT_MARKET 중 어느 쪽으로
+        # 보낼지 고르는 데 쓴다 — 거래소는 트리거가 현재가의 반대쪽에 있는 주문을 거부한다.
+        future = self._orders.execute_action(
+            action, reference_price=self.status.last_close.get(action.symbol))
+        return OrderDispatch(action, future, self._on_error)
+
+    def _new_client_order_id(self) -> str:
+        """시장가 주문에 붙일 client order id. 거래소 규격(``^[.A-Z:/a-z0-9_-]{1,36}$``) 이내."""
+        self._client_order_seq += 1
+        return f"st-{self._client_order_seq}"
+
+    def _remember_decision(self, pending: _PendingDecision, symbol: str,
+                           client_order_id: str) -> None:
+        """미체결 주문은 몇 시간씩 살 수 있어서 캔들 단위로 비울 수 없으므로, 대신 상한을 두고
+        가장 오래된 것부터 버린다 (``_order_agg``와 같은 정책)."""
+        if len(self._pending_decision) >= _MAX_PENDING_DECISIONS:
+            stale = next(iter(self._pending_decision))
+            self.logger.warning(f"짝지어지지 않은 결정을 버린다: {stale}")
+            self._pending_decision.pop(stale, None)
+        self._pending_decision[(symbol, client_order_id)] = pending
+
+    # ------------------------------------------------------- 계좌 상태 적재
+
+    async def load_account(self) -> None:
+        """거래소 지갑/포지션으로 ``status``를 채운다."""
+        self.logger.info("Loading futures wallet status...")
+        account_info = await self.client.futures_account()
+        if "error" in account_info:
+            raise RuntimeError(f"Failed to get account info: {account_info['error']}")
+
+        # walletBalance를 쓴다 — marginBalance는 walletBalance + unrealizedProfit 이고
+        # status.total_margin()이 margin + unrealised_pnl 이라서, 아래에서 미실현을 따로
+        # 넣는 순간 미실현이 두 번 세어진다. 스트림의 `wb`와도 이쪽이 같은 뜻이다.
+        margin_balance = 0.0
+        for asset in account_info["assets"]:
+            if asset["asset"] == self.margin_asset:
+                margin_balance = float(asset.get("walletBalance", 0.0))
+                break
+        self.status.margin = margin_balance
+
+        positions_by_symbol = {p["symbol"]: p for p in account_info.get("positions", [])}
+        for symbol in self.symbols:
+            pos = self.status.position_for(symbol)
+            info = positions_by_symbol.get(symbol)
+            pos.avg_price = float(info.get("entryPrice", 0.0)) if info else 0.0
+            pos.unrealised_pnl = float(info.get("unrealizedProfit", 0.0)) if info else 0.0
+            pos.position = float(info.get("positionAmt", 0.0)) if info else 0.0
+        # 레버리지는 전 심볼을 다 채운 뒤 한 번만 계산한다 — 심볼별로 부르면 아직 값을 채우지
+        # 않은 다른 심볼 때문에 중간값이 잘못 계산된다.
+        self.status.update_leverage()
+        self.logger.info(f"successfully loaded status: {self.status}")
+
+    async def load_open_orders(self) -> None:
+        """거래소의 미체결 주문을 ``status.open_orders``로 끌어온다.
+
+        프로세스가 죽어 있어도 걸어둔 손절은 거래소에서 계속 살아 있으므로, 이걸 안 하면
+        전략이 "손절이 없다"고 보고 하나 더 걸어 이중으로 청산된다.
+        """
+        try:
+            raw = await self.client.futures_get_open_orders()
+        except Exception as e:
+            # 치명적이지 않다 — 장부가 비어 보일 뿐이고, 이후 ORDER_TRADE_UPDATE로 채워진다.
+            # 다만 그 사이 전략이 손절을 중복으로 걸 수 있으므로 조용히 넘기면 안 된다.
+            self.logger.error("미체결 주문을 불러오지 못했다: %s", e, exc_info=True)
+            return
+
+        self.status.open_orders = {}
+        loaded = 0
+        for o in raw:
+            symbol = o.get("symbol", "")
+            if symbol not in self._symbol_set:
+                continue
+            order = self._order_from_exchange(o)
+            if order is None:
+                continue
+            self.status.open_orders_for(symbol).append(order)
+            loaded += 1
+        if loaded:
+            self.logger.info("거래소의 미체결 주문 %d건을 불러왔다: %s", loaded,
+                             {s: len(v) for s, v in self.status.open_orders.items() if v})
+
+    def _order_from_exchange(self, o: Dict) -> Optional[OpenOrder]:
+        """거래소 주문 표현(REST의 open order, 또는 ORDER_TRADE_UPDATE의 ``o``)을 OpenOrder로.
+
+        REST와 스트림이 필드 이름을 다르게 쓰므로 (``origQty``/``q``, ``type``/``o`` …) 둘 다
+        받는다. 이 엔진이 모르는 주문 타입(트레일링 스탑 등, 사람이 앱에서 낸 것)은 None을
+        돌려 장부에 넣지 않는다 — 체결 판정 규칙이 없는 주문을 들고 있어봐야 오해만 낳는다.
+        """
+        raw_type = o.get("type") or o.get("o") or ""
+        if raw_type in ("LIMIT", "STOP", "TAKE_PROFIT"):
+            order_type = ActionType.LIMIT
+        elif raw_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            order_type = ActionType.STOP_MARKET
+        else:
+            return None
+
+        side = o.get("side") or o.get("S") or ""
+        try:
+            qty = float(o.get("origQty", o.get("q", 0.0)) or 0.0)
+            price = float(o.get("price", o.get("p", 0.0)) or 0.0)
+            trigger = float(o.get("stopPrice", o.get("sp", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if qty <= 0:
+            return None
+
+        quantity = -qty if side == "SELL" else qty
+        reference = self.status.last_close.get(o.get("symbol") or o.get("s") or "")
+        trigger_above = trigger >= reference if (reference and trigger) else quantity > 0
+        return OpenOrder(
+            symbol=o.get("symbol") or o.get("s") or "",
+            quantity=quantity,
+            order_type=order_type,
+            price=price or None,
+            trigger_price=trigger or None,
+            trigger_above=bool(trigger_above),
+            reduce_only=bool(o.get("reduceOnly", o.get("R", False))),
+            client_id=o.get("clientOrderId") or o.get("c") or None,
+            created_at=int(o.get("time", o.get("T", 0)) or 0),
+            exchange_order_id=str(o.get("orderId", o.get("i", "")) or ""),
+        )
+
+    def reconcile_resumed(self, saved: Optional[Status]) -> None:
+        """재개한 런이 기억하는 포지션/미체결 주문을 거래소의 실제 값과 대조한다.
+
+        되살리지는 않는다 — 라이브에서는 거래소가 정답이고 ``status``는 이미 거래소 값이다.
+        여기서 하는 일은 사람이 알아챌 수 있게 남기는 것뿐이다. 프로세스가 죽어 있는 동안
+        청산/ADL이 일어났거나, 앱에서 수동으로 포지션을 건드렸거나, 마지막 주문의 체결
+        이벤트를 못 받고 죽었을 수 있다.
+        """
+        if saved is None:
+            return
+
+        mismatched = {
+            symbol: (saved.position_for(symbol).position,
+                     self.status.position_for(symbol).position)
+            for symbol in self.symbols
+            if not math.isclose(saved.position_for(symbol).position,
+                                self.status.position_for(symbol).position,
+                                rel_tol=1e-9, abs_tol=1e-12)
+        }
+        if mismatched:
+            self.logger.warning(
+                "재개한 런의 포지션이 거래소와 다르다 (저장 -> 실제): %s. 멈춰 있는 동안 "
+                "청산/ADL이나 수동 주문이 있었을 수 있다. 거래소 값으로 계속한다", mismatched)
+        else:
+            self.logger.info("재개한 런의 포지션이 거래소와 일치한다: %s",
+                             {s: self.status.position_for(s).position for s in self.symbols})
+
+        # 미체결 주문 대조가 오히려 더 중요하다: 프로세스가 죽어 있는 동안에도 거래소에 걸어둔
+        # 손절 주문은 계속 살아 있고 체결될 수 있다.
+        saved_ids = {(o.symbol, o.client_id) for book in saved.open_orders.values()
+                     for o in book}
+        actual_ids = {(o.symbol, o.client_id) for book in self.status.open_orders.values()
+                      for o in book}
+        gone, unknown = saved_ids - actual_ids, actual_ids - saved_ids
+        if not gone and not unknown:
+            if actual_ids:
+                self.logger.info("재개한 런의 미체결 주문이 거래소와 일치한다 (%d건)",
+                                 len(actual_ids))
+            return
+        self.logger.warning(
+            "재개한 런의 미체결 주문이 거래소와 다르다 — 저장됐지만 거래소에 없음: %s / "
+            "거래소에만 있음: %s. 멈춰 있는 동안 체결·취소됐거나 이 프로세스가 모르는 주문이다. "
+            "거래소 값으로 계속한다", sorted(gone) or "없음", sorted(unknown) or "없음")
+
+    # ------------------------------------------------------- 유저 데이터 스트림
+
+    async def on_user_data(self, data: dict) -> None:
+        """유저 데이터 스트림 메시지 하나를 처리한다 (트레이더가 라우팅해 준다)."""
+        event_type = data.get("e")
+        if event_type == "ACCOUNT_UPDATE":
+            await self._process_account_update(data)
+        elif event_type == "ORDER_TRADE_UPDATE":
+            await self._process_order_trade_update(data)
+
+    async def _process_account_update(self, data: dict) -> None:
+        """ACCOUNT_UPDATE로 margin/포지션을 갱신한다.
+
+        ACCOUNT_UPDATE는 **변경된 항목만** 싣는다 (Binance 명세). 우리 자산/심볼이 없는
+        이벤트(다른 심볼의 주문, 잔고만 움직인 이벤트)에서 status를 0으로 덮어쓰면 안 된다 —
+        마진이 0이 되면 모든 스트리머의 사이징이 붕괴하고, 포지션이 0이 되면 다음 종가 캔들에
+        flat으로 보여 재진입해 **실제 거래소 포지션이 2배**가 된다.
+        """
+        try:
+            account_data = data.get("a") or {}
+            updated: List[str] = []
+
+            # margin — 해당 자산 항목이 있을 때만 (전 심볼 공유 자산 하나뿐)
+            for m in (account_data.get("B") or []):
+                if m.get("a") == self.margin_asset:
+                    self.status.margin = float(m.get("wb", 0.0))
+                    updated.append("margin")
+                    break
+
+            # exclude m=FUNDING_FEE
+            if account_data.get("m", None) == "ORDER":
+                # 우리가 다루는 심볼 항목만. 한 이벤트가 여러 심볼의 포지션을 동시에 실어 올 수
+                # 있으므로 끝까지 훑는다 (첫 매치에서 break하지 않는다).
+                position_updated = False
+                for position in (account_data.get("P") or []):
+                    pos_symbol = position.get("s", "")
+                    if pos_symbol not in self._symbol_set:
+                        continue
+                    pos = self.status.position_for(pos_symbol)
+                    pos.avg_price = float(position.get("ep", 0.0))
+                    pos.position = float(position.get("pa", 0.0))
+                    pos.unrealised_pnl = float(position.get("up", 0.0))
+                    position_updated = True
+                if position_updated:
+                    updated.append("position")
+                    self.status.update_leverage()
+
+            # 실제로 뭔가 반영됐을 때만 INFO. 이 핸들러는 우리 자산/심볼 항목이 없으면 status를
+            # 건드리지 않는 게 설계인데, 그런 이벤트에서도 찍으면 아무것도 바뀌지 않은 줄이
+            # 로그의 대부분을 차지한다.
+            if updated:
+                self.logger.info("Status updated from account (%s): %s",
+                                 "+".join(updated), self.status)
+            else:
+                self.logger.debug("ACCOUNT_UPDATE에 %s/%s 항목이 없어 status를 유지한다 (m=%s)",
+                                  self.margin_asset, self.symbols, account_data.get("m"))
+        except Exception as e:
+            # 호출자(트레이더의 유저 소켓 리스너)가 logger.exception으로 스택트레이스를 남긴다.
+            self.logger.error("Error processing account update: %s", e)
+            raise
+
+    async def _process_order_trade_update(self, data: dict) -> None:
+        """체결을 주문 단위로 합쳐 하나의 ``Trade``로 만든다.
+
+        ``status`` 자체는 ACCOUNT_UPDATE가 거래소 값으로 갱신하므로 여기서는 건드리지 않는다
+        (두 곳에서 쓰면 어느 쪽이 정답인지 모호해진다).
+
+        **주문 단위로 합치는** 이유: 거래소는 한 주문을 여러 번에 나눠 채울 수 있는데 부분
+        체결마다 Trade를 만들면 "액션 하나 = 체결 하나"인 백테스트와 모양이 달라진다.
+        """
+        try:
+            order_data = data.get("o") or {}
+            order_symbol = order_data.get("s", "")
+            if order_symbol not in self._symbol_set:
+                return
+            order_status = order_data.get("X", "")
+
+            # 거래소 장부의 진실을 그대로 따라간다: NEW면 미체결로 등록, 종결이면 제거.
+            self._sync_open_order(order_data, order_status)
+
+            if order_status not in _TRACKED_ORDER_STATES:
+                return
+
+            order_id = int(order_data.get("i", 0) or 0)
+            key = (order_symbol, order_id)
+            if key not in self._order_agg:
+                if len(self._order_agg) >= _MAX_OPEN_ORDER_AGGREGATES:
+                    # 종결 이벤트를 못 받은 주문들이다. 가장 오래된 것부터 버린다
+                    # (dict는 삽입 순서를 유지한다).
+                    stale_key = next(iter(self._order_agg))
+                    self.logger.warning(f"종결되지 않은 주문 집계를 버린다: {stale_key}")
+                    self._order_agg.pop(stale_key, None)
+                self._order_agg[key] = _OrderAggregate(order_id, order_data.get("S", ""),
+                                                       order_symbol)
+            agg = self._order_agg[key]
+
+            # rp/n/T는 실제 체결이 일어난 이벤트(x=TRADE)에서만 의미가 있다. 상태 전이만
+            # 알리는 이벤트에서 더하면 손익과 수수료가 부풀려진다.
+            if order_data.get("x", "") == "TRADE":
+                agg.wnl += float(order_data.get("rp", 0.0) or 0.0)
+                commission = float(order_data.get("n", 0.0) or 0.0)
+                fee_asset = order_data.get("N") or self.margin_asset
+                if fee_asset == self.margin_asset:
+                    agg.fee += commission
+                else:
+                    # BNB 수수료 할인을 켜면 n이 BNB 단위로 온다. 마진 자산 손익에 그대로 더하면
+                    # wnl - fee 가 오염되므로 분리해서 담고 한 번만 경고한다.
+                    agg.fee_other += commission
+                    if not self._warned_fee_asset:
+                        self._warned_fee_asset = True
+                        self.logger.warning(
+                            f"수수료가 마진 자산이 아닌 {fee_asset}(으)로 부과됐다 — "
+                            f"기록되는 fee에서 제외된다 (metadata.fee_asset_mismatch 참고)")
+                        self.on_metadata("fee_asset_mismatch", fee_asset)
+
+            # z(누적 체결 수량)와 ap(평균 체결가)는 항상 주문 전체 기준의 최신값이다.
+            agg.cum_qty = float(order_data.get("z", 0.0) or 0.0)
+            agg.avg_price = float(order_data.get("ap", 0.0) or 0.0)
+            agg.last_trade_ms = int(order_data.get("T", 0) or 0) or agg.last_trade_ms
+
+            filled = -agg.cum_qty if agg.side == "SELL" else agg.cum_qty
+            self.logger.info(
+                f"order {order_status.lower()}: [quantity={filled},avg_price={agg.avg_price}]")
+
+            if order_status not in _TERMINAL_ORDER_STATES:
+                return  # 아직 진행 중 — 종결될 때 하나의 Trade로 합쳐 기록한다
+
+            self._order_agg.pop(key, None)
+            client_order_id = order_data.get("c") or ""
+            if agg.cum_qty > 0:
+                self._emit_fill(agg, filled, client_order_id)
+            else:
+                # 한 건도 안 채워지고 취소/거절된 주문 — 짝지을 체결이 영영 없으므로 스냅샷을
+                # 붙들고 있을 이유가 없다.
+                self._pending_decision.pop((order_symbol, client_order_id), None)
+        except Exception as e:
+            self.logger.error("Error processing order trade update: %s", e)
+            raise
+
+    def _sync_open_order(self, order_data: Dict, order_status: str) -> None:
+        """ORDER_TRADE_UPDATE를 ``status.open_orders``에 반영한다.
+
+        거래소가 주문을 접수하면(NEW) 장부에 넣고, 종결되면(체결/취소/만료/거절) 뺀다.
+        ``PARTIALLY_FILLED``은 아직 살아 있으므로 그대로 둔다 — 이 엔진은 부분 체결을
+        모델링하지 않지만, 장부에서 지워버리면 남은 수량이 보이지 않게 된다.
+        """
+        symbol = order_data.get("s", "")
+        client_id = order_data.get("c") or None
+        book = self.status.open_orders_for(symbol)
+
+        if order_status == _ACK_ORDER_STATE:
+            if any(o.client_id == client_id for o in book):
+                return  # 이미 등록됨 (재연결 후 중복 이벤트 등)
+            order = self._order_from_exchange(order_data)
+            if order is not None:
+                book.append(order)
+                self.logger.info("미체결 주문 등록: %s", order)
+            return
+
+        if order_status in _TERMINAL_ORDER_STATES:
+            removed = [o for o in book if o.client_id == client_id]
+            if removed:
+                self.status.open_orders[symbol] = [o for o in book if o.client_id != client_id]
+                self.logger.info("미체결 주문 해제 (%s): client_id=%s", order_status.lower(),
+                                 client_id)
+
+    def _emit_fill(self, agg: _OrderAggregate, quantity: float,
+                   client_order_id: str = "") -> None:
+        """종결된 주문 하나를 ``Trade``로 만들어 ``on_trade``로 흘려보낸다.
+
+        짝짓기 키는 거래소가 그대로 돌려주는 ``c``(clientOrderId)다 — 심볼만으로 짝지으면
+        몇 봉 뒤에 체결되는 미체결 주문을 원래 결정과 이을 수 없다.
+        """
+        pending = self._pending_decision.pop((agg.symbol, client_order_id), None)
+
+        if pending is None:
+            # 청산/ADL/앱에서 낸 수동 주문/재기동 직후 남은 체결 등. 실제 자본을 움직이므로
+            # 기록은 하되, 거래 전 스냅샷이 없어 현재 status로 대신한다 — ACCOUNT_UPDATE가
+            # 이미 반영된 뒤일 수 있어 승패 분류가 틀릴 수 있다.
+            self.logger.warning(
+                f"결정과 짝지어지지 않은 체결 (order_id={agg.order_id}, qty={quantity}) — "
+                f"거래 전 스냅샷을 근사한다")
+            pre_status = copy.deepcopy(self.status)
+            timestamp = agg.last_trade_ms
+        else:
+            if pending.quantity * quantity <= 0:
+                self.logger.warning(
+                    f"체결 수량 {quantity} 이 직전 결정 {pending.quantity} 과 방향이 다르다")
+            elif abs(quantity - pending.quantity) > \
+                    abs(pending.quantity) * _QUANTITY_DIVERGENCE_TOLERANCE:
+                # 실행기가 step size로 양자화하지 않아서 생기는, 예상된 종류의 차이다. 다만
+                # 대조하는 곳이 없으면 실제 괴리가 얼마인지 로그에서 알 수 없다.
+                self.logger.warning(
+                    "체결 수량이 결정과 %.2f%% 어긋났다: 결정 %s → 체결 %s "
+                    "(step size 양자화 미적용, order_id=%s)",
+                    abs(quantity - pending.quantity) / abs(pending.quantity) * 100,
+                    pending.quantity, quantity, agg.order_id)
+            pre_status = pending.pre_status
+            if pending.resting:
+                # 미체결 주문은 결정이 몇 봉 전이므로, 결정 캔들에 버킷하면 오히려 틀리다 —
+                # **실제 체결 시각**을 쓴다. 백테스트는 체결을 감지한 봉의 마감 시각을 쓰므로
+                # 둘이 최대 한 봉 어긋날 수 있다.
+                timestamp = agg.last_trade_ms or pending.timestamp
+            else:
+                # 체결 시각(T)이 아니라 **결정 캔들의 마감 시각**을 쓴다. T는 캔들 경계보다
+                # 수백 ms 뒤라, 집계 뷰(1h/1d)에서 원인이 된 캔들과 다른 버킷에 떨어질 수 있다.
+                timestamp = pending.timestamp
+
+        self.on_trade(Trade(
+            timestamp=timestamp,
+            symbol=agg.symbol,
+            quantity=quantity,
+            price=agg.avg_price,
+            wnl=agg.wnl,
+            fee=agg.fee,
+            status=pre_status,
+            leverage=self.status.update_leverage(),
+            order_type=pending.order_type if pending is not None else ActionType.MARKET.value,
+            submitted_at=pending.timestamp if pending is not None else timestamp,
+        ))

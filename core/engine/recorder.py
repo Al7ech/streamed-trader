@@ -111,6 +111,18 @@ class BacktestRecorder(Recorder):
         return self._shard_writer.close() if self._shard_writer is not None else []
 
 
+class NullRecorder(Recorder):
+    """아무것도 남기지 않는 레코더. 기록이 꺼진 라이브 실행처럼 엔진은 돌려야 하지만 결과를
+    적재할 필요가 없을 때 쓴다 — 매번 ``if recorder`` 로 감싸지 않기 위한 것이다."""
+
+    def record_event(self, event_time: int, equity: float,
+                     candles: Dict[str, Candle]) -> None:
+        pass
+
+    def record_trade(self, trade: Trade) -> None:
+        pass
+
+
 def ensure_backtest_dir(result_path: str) -> str:
     """``<result_path>/backtest/``를 만들고 그 경로를 돌려준다."""
     backtest_dir = os.path.join(result_path, "backtest")
