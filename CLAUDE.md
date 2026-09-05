@@ -7,20 +7,29 @@ repository.
 
 An algorithmic trading system for Binance USD-M Futures with two independent halves:
 
-- `core/` — Python engine: historical candle fetching, two multi-symbol-capable backtesters (a
-  reference implementation and a vectorized fast path — see "Data flow" below for how symbols'
-  candles are merged into one event timeline), a pluggable, cross-symbol-aware streamer/indicator
-  strategy framework with market, limit and conditional (stop/take-profit) orders, and an asyncio live trader/executor that is also multi-symbol (see "Live
-  trading").
+- `core/` — Python engine. Backtesting and live trading are **one domain**: a single trading
+  engine (`core/engine/`) holds the order-of-operations, and backtest / dry run / live differ only
+  in which candle source, executor and recorder are plugged into it (see "The trading engine"
+  below). Around that: historical candle fetching, a pluggable, cross-symbol-aware
+  streamer/indicator strategy framework with market, limit and conditional (stop/take-profit)
+  orders, and an asyncio live trader (see "Live trading").
 - `visualise/` — a Create React App frontend that reads the JSON files the backtester writes and
   renders them with `lightweight-charts`. It has no backend of its own; the user picks the `asset/`
   directory with the File System Access API and everything is parsed client-side. **Does not yet
   render multi-symbol runs** — see "Backtest output format" below.
 
 There is no automated test suite (no `pytest`/`unittest` files in `core/`, only the default CRA
-`react-scripts test` in `visualise/`). `core/backtest_fast_check.py` is the de-facto correctness
-check: it asserts `FastBacktester` and `SingleThreadedBacktester` produce identical trades, final
-margin, max leverage and equity curve.
+`react-scripts test` in `visualise/`). Two hand-rolled check scripts are the de-facto correctness
+checks:
+
+- `core/backtest_fast_check.py` — asserts the vectorized and reference backtest paths
+  (`run_backtest(vectorized=True/False)`) produce identical trades, final margin, max leverage and
+  equity curve, over 16 cases including cross-symbol strategies, forced liquidation, resting
+  orders and a non-flat start.
+- `core/live_check.py` — covers the live path, which the parity check cannot reach (it needs a
+  socket and an exchange). Fakes both, and asserts the candle producer's continuity/backfill rules,
+  the live executor's account/fill handling, and that **a dry run produces exactly the trades a
+  backtest of the same candles does**.
 
 ## Commands
 
@@ -36,7 +45,8 @@ uv sync
 ```bash
 uv run python core/examples/backtest.py              # backtest over a hardcoded date range/symbol/strategy
 uv run python core/examples/backtest.py "label"       # optional one-line experiment label stored in the run JSON
-uv run python core/backtest_fast_check.py             # parity: FastBacktester vs SingleThreadedBacktester
+uv run python core/backtest_fast_check.py             # parity: vectorized vs reference backtest path
+uv run python core/live_check.py                      # live path: producer, executor, dry-run == backtest
 uv run python core/fetch_stock_check.py               # US equity fetcher smoke test (needs MASSIVE_API_KEY)
 uv run streamed-trader                                # live/dry-run trader using .env configuration
 ```
@@ -77,20 +87,19 @@ npm run build
 `[tool.hatch.build.targets.wheel] packages = ["core"]`) makes it installable with `uv sync` (which
 does an editable install of the `core` package into `.venv`). Every module imports its siblings
 with the full absolute path rooted at `core`, e.g. `from core.streamer.keltner_streamer import
-KeltnerStreamer`, `from core.backtest.status import Status` — this resolves via the installed
+KeltnerStreamer`, `from core.engine.status import Status` — this resolves via the installed
 package regardless of current working directory, so scripts can be run as `uv run python
 core/<script>.py` from anywhere in the repo (no more cwd-inside-`core/` requirement). The
 distribution name in `pyproject.toml` is `streamed-trader`, but the importable top-level
 package is still `core`.
 
 The two CLI entry points live in `core/examples/` (`backtest.py`, `trader.py`) specifically to
-avoid name collisions with the `core/backtest/` and `core/trader/` packages — a top-level
-`core/backtest.py` module and a `core/backtest/` package can't both be `core.backtest`.
+avoid name collisions with the `core/engine/` and `core/trader/` packages.
 
 Default paths like `BaseCandleFetcher(save_path="../asset/")` and
-`SingleThreadedBacktester(result_path="../asset/")` are relative to the *current working
-directory*, not the script location — so they only land in the repo-root `asset/` (gitignored)
-when the process is launched with cwd = `core/`.
+`run_backtest(result_path="../asset/")` are relative to the *current working directory*, not the
+script location — so they only land in the repo-root `asset/` (gitignored) when the process is
+launched with cwd = `core/`.
 
 ### Data flow: fetch → cache → backtest → visualise
 
@@ -120,37 +129,85 @@ when the process is launched with cwd = `core/`.
    ends. It returns `List[Candle]` only. `binance_candle_fetcher/candle_storage.py` is an older
    CSV(.gz) load/save path for the same `Candle` objects.
 
-3. **Backtest.** The backtesters are multi-symbol: `backtest/SingleThreadedBacktester.py` takes
-   `Dict[str, List[Candle]]` (one ragged list per symbol — symbols don't need to start/end at the
-   same time) and merges them via `backtest/candle_merge.merge_candle_timeline` into one
-   chronological stream of **events**, where an event bundles every symbol whose candle closes at
-   that exact timestamp. Within an event, symbols are processed in `streamer.symbols` order:
-   mark-to-market → before-indicators → `decide_action` → record → after-indicators, and a
-   strategy's `decide_action` can read every symbol's indicator state and return `Action`s for
-   symbols other than the one that triggered the call (see "Streamer/indicator strategy
-   framework" below) — a same-event action targeting another symbol fills at that symbol's
-   `Status.last_close`, frozen before any symbol in the event is processed, so cross-symbol fills
-   are deterministic regardless of `streamer.symbols` order. `Status.apply_fill` is updated per
-   symbol; `margin` is one pool shared across all symbols (matches Binance cross margin). It also
-   force-liquidates — flattening *every* open position, since the shared pool means one symbol's
-   loss can force-close the rest — when mark-to-market equity (`Status.total_margin()`, margin
-   plus the sum of every symbol's unrealised PnL) falls to zero or below.
+3. **Backtest.** `engine/backtest.run_backtest(streamer, candles_by_symbol, ...)` is the entry
+   point. It is multi-symbol: it takes `Dict[str, List[Candle]]` (one ragged list per symbol —
+   symbols don't need to start/end at the same time) and `BacktestCandleProducer` merges them via
+   `engine/candle_merge.merge_candle_timeline` into one chronological stream of **events**, where
+   an event bundles every symbol whose candle closes at that exact timestamp. The per-event
+   ordering is `TradingEngine.process_event`'s (see "The trading engine" below).
 
-   `backtest/FastBacktester.py` is the drop-in fast version the entry scripts use: it precomputes
-   every indicator that defines `precompute_series` **per symbol** as a numpy array (swapped in
-   as a cursor-backed `ArrayIndicator` shim whose cursor advances only on events where that
-   symbol appears, not on the shared event index), keeps plain `BaseIndicator`s without it
-   loop-updated, rebuilds the equity curve
-   vectorized (a per-symbol forward-filled close matrix dot the per-segment position vector,
-   generalizing the single-symbol piecewise-constant trick), and bulk-writes shards after the
-   loop. `SingleThreadedBacktester` stays as the reference implementation; parity between the two
-   (including multi-symbol cases — overlapping symbols, a staggered-start symbol, cross-symbol
-   actions, forced liquidation across symbols) is asserted by `backtest_fast_check.py`.
+   `vectorized=True` (the default) precomputes every indicator that defines `precompute_series`
+   **per symbol** as a numpy array (swapped in as a cursor-backed `ArrayIndicator` shim whose
+   cursor advances only on events where that symbol appears, not on the shared event index), keeps
+   plain `BaseIndicator`s without it loop-updated, and rebuilds the equity curve vectorized (a
+   per-symbol forward-filled close matrix dot the per-segment position vector). `vectorized=False`
+   is the reference path: indicators are loop-updated and equity is recorded per event. Both run
+   the **same** `TradingEngine`, so only the indicator and equity computation differ; parity
+   between them (including multi-symbol cases — overlapping symbols, a staggered-start symbol,
+   cross-symbol actions, forced liquidation across symbols, resting orders) is asserted by
+   `backtest_fast_check.py`.
 
 4. **Visualise.** `visualise/` reads the run JSON and shards client-side — it does not talk to
    Binance or the Python code at all.
 
-### Backtest output format (`core/backtest/result_writer.py`)
+### The trading engine (`core/engine/`)
+
+Backtest, dry run and live are **one domain**. The order-of-operations exists exactly once, in
+`engine/engine.py`; the three modes differ only in which parts are plugged in:
+
+| | CandleProducer | Executor | Recorder |
+|---|---|---|---|
+| backtest | `BacktestCandleProducer` | `SimulatedExecutor` | `BacktestRecorder` / `VectorizedRecorder` |
+| dry run | `LiveCandleProducer` | **`SimulatedExecutor`** | `LiveRecorder` |
+| live | `LiveCandleProducer` | `LiveExecutor` | `LiveRecorder` |
+
+Dry run and backtest share the executor **class**, not merely equivalent code. Dry run exists to be
+compared against a backtest, so the fill rules, accounting and resting-order book have to be one
+copy — before this, `_fill` and `_submit_book_action` were hand-copied into the live trader and
+kept in sync by attention alone.
+
+**The engine is fully synchronous.** `process_event` is a generator: an order that needs an
+exchange round-trip is `yield`ed as a `Dispatch`, and the caller decides what to do with it. The
+backtest just drains the generator (`SimulatedExecutor` never produces a `Dispatch`, so nothing is
+yielded and there is no `await` overhead in the hot loop); `run_async` awaits between yields, which
+preserves live's "confirm order N before sending N+1" ordering. The sync/async split is therefore
+8 lines (`run` / `run_async`) plus the producer implementations — nothing else in the codebase has
+to know.
+
+`process_event(event_time, candles)` — the contract every mode goes through:
+
+```
+0. executor.begin_event()          # live: drop unmatched market decisions from the last candle
+1. freeze status.last_close[symbol] for every symbol in the event
+2. executor.match_resting()        # fills happen here (sim only; live's exchange does it)
+3. executor.mark_to_market()       # -> equity for this event
+4. executor.force_liquidation()    # sim: equity <= 0 -> cancel_all + flatten every symbol
+5. per symbol: update indicators -> decide_action (or flatten if bankrupt)
+6. recorder.record_event()
+7. per action: executor.submit()   # CANCEL/register/fill, or dispatch to the exchange
+8. recorder.end_event()
+```
+
+Matching is at step 2, ahead of `decide_action`, because on a real exchange a resting order fills
+before the bar closes — put it after and the strategy decides while believing it still holds a
+position its stop already closed. Step 3 is where the equity point comes from, which is why a
+MARKET fill's state applies from the *next* event while a resting fill's applies from this one.
+
+**Fills flow through a sink, not a return value** (`executor.on_trade`). The simulated executor
+calls it synchronously right after `apply_fill`; the live executor calls it when
+`ORDER_TRADE_UPDATE` arrives, possibly hours later. This is the one place the sync/async asymmetry
+of "when does a fill happen" is erased, and it is why the engine never sees a `Trade` at all.
+
+**Recorders read indicator values themselves** (off `streamer.indicators`) rather than receiving
+them, so a run that does not save series never pays for walking every indicator each event.
+`VectorizedRecorder` exploits the same seam differently: its `effective_from` for the equity
+rebuild is just its `record_event` counter, since resting fills arrive before that call and market
+fills after it.
+
+Live never merges symbols — `LiveCandleProducer` yields one `{symbol: candle}` event per closed
+candle, and the `streamer.symbols` loop filters the rest out naturally.
+
+### Backtest output format (`core/engine/result_writer.py`)
 
 `SCHEMA_VERSION = 5` (v5 added `trades[].order_type` and `trades[].submitted_at`, so a stop fill
 is distinguishable from a market exit after the fact and a resting order's decision time survives
@@ -193,9 +250,9 @@ multi-symbol run JSON fields** — this is core-engine-only support so far; see 
   is a shared pool) sit at the shard's top level; a `symbols` key nests each traded symbol's own
   `ohlc`/`indicators`, **columnar** (parallel arrays) so column keys aren't repeated per event. A
   symbol absent from a given event (ragged series, staggered start) gets `null` across the board
-  for that row — the existing warm-up-null convention, no new sentinel. `SingleThreadedBacktester`
-  streams these out through `ShardWriter` (only the current month is in memory); `FastBacktester`
-  bulk-writes them via `write_series_shards` after the loop. The frontend loads them lazily per
+  for that row — the existing warm-up-null convention, no new sentinel. The reference backtest path
+  and the live recorder stream these out through `ShardWriter` (only the current month is in
+  memory); the vectorized path bulk-writes them via `write_series_shards` after the loop. The frontend loads them lazily per
   viewport.
 
 `run_id` is `<StreamerClassName>_<YYYYmmdd_HHMMSS>`. `series.column_groups` carries each
@@ -220,10 +277,10 @@ buffer reset, since a live process rewrites one month's shard for weeks.
 
 **`LiveRecorder`/`BinanceTrader` are multi-symbol**, trading every symbol in `streamer.symbols`
 concurrently over one multiplexed kline socket (see "Live trading" below) and writing the same
-multi-symbol `Status`/shard shapes described above — `LiveRecorder.record_candle(symbol, candle,
-status)` is called once per symbol's own candle close (live events are not merged/batched across
-symbols the way backtest events are), with a single-key `{symbol: (candle, values)}` dict, which
-already matches `ShardWriter.add`'s existing ragged-series contract with no changes needed there.
+multi-symbol `Status`/shard shapes described above — `LiveRecorder.record_event` is called once per
+symbol's own candle close (live events are not merged/batched across symbols the way backtest
+events are), with a single-key `{symbol: candle}` dict, which already matches `ShardWriter.add`'s
+existing ragged-series contract with no changes needed there.
 
 - **`run_id` is stable across restarts**: `<live|dry>_<Streamer>_<SYM1-SYM2-...>_<INTERVAL>`
   (symbols sorted and hyphen-joined so config order doesn't fork the run; override with
@@ -248,15 +305,16 @@ already matches `ShardWriter.add`'s existing ragged-series contract with no chan
   continues, putting a jump back to the initial value at each restart — which would make a resumed
   dry-run curve useless for the backtest comparison this all exists for. Live never uses it:
   `futures_account()` and `ACCOUNT_UPDATE` are the truth there.
-- **Recording points mirror the backtester exactly.** `record_candle` is called between the two
-  indicator-update groups in `_handle_candle` — the same seam `ShardWriter.add` occupies in
-  `SingleThreadedBacktester.run` — so every plotted column is the value the decision actually saw.
-  Moving it after the `after_indicators` loop would shift every default indicator one candle
-  relative to a backtest, breaking the one comparison this feature exists for.
+- **Recording points mirror the backtest exactly** — because they are literally the same call.
+  `TradingEngine.process_event` invokes `recorder.record_event` right after `decide_action`
+  returns, once every indicator for that symbol is already updated, so every plotted column is the
+  value the decision actually saw. There is no longer a separate live recording seam that could
+  drift out of step.
 - **Resting orders.** Dry-run keeps its own book in `Status.open_orders` and fills it with the same
-  `order_book.match_symbol` the backtesters use, called from `_handle_candle` at the same seam
-  (before the indicator update and `decide_action`) — so a dry run over some candles produces
-  exactly the trades a backtest of those candles does, stop fills included. `metadata.last_status`
+  `order_book.match_symbol` the backtest uses — in fact the same `SimulatedExecutor` object — at
+  the same seam (before the indicator update and `decide_action`), so a dry run over some candles
+  produces exactly the trades a backtest of those candles does, stop fills included
+  (`core/live_check.py` asserts this). `metadata.last_status`
   carries the serialized book, so a restart does not silently drop a stop the strategy believes is
   armed. Live never simulates: orders go to the exchange, `status.open_orders` is hydrated at
   startup from `futures_get_open_orders()` and then kept in sync by `ORDER_TRADE_UPDATE` (`NEW`
@@ -270,8 +328,8 @@ already matches `ShardWriter.add`'s existing ragged-series contract with no chan
   `ORDER_TRADE_UPDATE`, aggregated per `(symbol, order_id)` into one `Trade` (`price` = `ap`,
   `quantity` = signed `z`, `wnl` = Σ`rp`, `fee` = Σ`n`) and emitted on a terminal order state —
   `CANCELED`/`EXPIRED` with `z > 0` included, since those are real fills. The pre-trade `Status`
-  snapshot is deep-copied *before* the order is dispatched, because `_on_action` awaits the order
-  future and `ACCOUNT_UPDATE` can overwrite `self.status` during that await. For a **market** fill
+  snapshot is deep-copied *before* the order is dispatched, because `OrderDispatch.wait()` awaits
+  the order future and `ACCOUNT_UPDATE` can overwrite `status` during that await. For a **market** fill
   `Trade.timestamp` is the decision candle's `end_time`, not the fill's `T`, so trades bucket with
   the candle that caused them on aggregated views; for a **resting** fill it is the real fill time
   (`T`), because the decision was bars earlier and bucketing it there would be actively wrong —
@@ -293,7 +351,7 @@ already matches `ShardWriter.add`'s existing ragged-series contract with no chan
   intrabar fills from the bar's OHLC under the fixed assumptions listed in "Resting orders" above,
   while the exchange matched against the real tick path, so a bar that touched both a stop and a
   limit can resolve differently; `BinanceExecutor.execute_action` does not quantize to step size,
-  so the filled quantity can differ from the requested action (`_record_live_fill` warns past
+  so the filled quantity can differ from the requested action (`LiveExecutor._emit_fill` warns past
   `_QUANTITY_DIVERGENCE_TOLERANCE`, 1%, so the size of that drift is visible rather than
   merely expected); prefeed candles are not recorded, so live indicator columns have no
   NaN warm-up prefix; `update_unrealised_pnl` marks with last price while the exchange marks with
@@ -347,8 +405,8 @@ those two scripts default to WARNING.
   returns `[Action(self.symbols[0], qty)]` or `[]`.
 - Indicators come in two types. `BaseIndicator` (ABC) is a loop-updated rolling-window indicator:
   `update(candle, status=None)` ingests one candle plus the *pre-trade* `Status` snapshot — the
-  same one `decide_action` saw for that candle (the live trader's `_prefeed_indicators` passes
-  `None`, so status-aware indicators must treat `None` as warm-up); `get_index(idx)`/`get_latest()`
+  same one `decide_action` saw for that candle (`TradingEngine.warmup` passes `None`, so
+  status-aware indicators must treat `None` as warm-up); `get_index(idx)`/`get_latest()`
   read back past values (`-1` = latest, `-2` = previous, ...). An indicator that reads `status`
   cannot be vectorized (account state is a feedback loop of the strategy's own trades) and must
   stay a plain `BaseIndicator` — `indicator/position_age.py` is the canonical example (it's told
@@ -356,7 +414,8 @@ those two scripts default to WARNING.
   directly rather than only through `decide_action`).
   An indicator can additionally define
   `precompute_series(open, high, low, close, volume) -> np.ndarray` (element i = `get_latest()`
-  after i+1 updates, NaN during warm-up); `FastBacktester` detects it by attribute presence
+  after i+1 updates, NaN during warm-up); the vectorized backtest path detects it by attribute
+  presence
   (`getattr(indicator, "precompute_series", None)`, no separate class involved) and uses it to
   compute each symbol's whole series at once (against that symbol's **own** OHLCV arrays) —
   `update()` must still work for the live trader. `MovingAverage`,
@@ -369,9 +428,9 @@ those two scripts default to WARNING.
 - Each indicator's `scale_group` (default `"price"`) tells the frontend which chart pane to plot
   it on; indicators sharing a group share a pane and price scale (this grouping is keyed by
   indicator **name** only, shared across symbols).
-- **Ordering matters**: all three engines (`SingleThreadedBacktester`, `FastBacktester`,
-  `BinanceTrader._handle_candle`) always update **every** indicator for a symbol with its closed
-  candle *before* calling `streamer.decide_action` for that symbol, so
+- **Ordering matters**: `TradingEngine.process_event` — the single loop backtest, dry run and live
+  all go through — always updates **every** indicator for a symbol with its closed candle *before*
+  calling `streamer.decide_action` for that symbol, so
   `get_latest()` includes the candle being decided on and `get_index(-2)` is the previous one —
   the current candle's OHLCV is also available directly as the `candle` argument, and every
   strategy uses it. The `Status` passed to both `update` and `decide_action` is still the
@@ -380,7 +439,7 @@ those two scripts default to WARNING.
   backtesters record the series right after `decide_action` returns, once every indicator is
   already updated, so every plotted column is the value the decision actually saw.
 
-  In `FastBacktester`, each symbol's `ArrayIndicator` shims are just called via the same
+  In the vectorized path, each symbol's `ArrayIndicator` shims are just called via the same
   `.update()` as everything else — every appearance of that symbol in the merged event stream
   advances their `cursor` by one before the decision reads it, so no manual index bookkeeping is
   needed even though the shared merged-event index and a symbol's own candle-index don't coincide
@@ -443,17 +502,16 @@ those two scripts default to WARNING.
   runs** (multiple price panes, per-symbol trade markers, `summary.by_symbol`) — that's unbuilt
   follow-up work; only the core engine and output schema support multiple symbols today.
 
-### Resting orders (`core/backtest/order_book.py`)
+### Resting orders (`core/engine/order_book.py`)
 
 `Action` can request an order that is **not** filled on the decision candle: a `LIMIT` at a price,
 or a `STOP_MARKET` at a trigger. Those live in `Status.open_orders: Dict[str, List[OpenOrder]]`
 until they fill, expire, or are cancelled — open orders really are account state on an exchange,
 and putting them on `Status` means `decide_action(symbol, candle, status)` needs no signature
 change to read them (`status.open_orders_for(symbol)`; cancel via `Action.cancel`, never by
-mutating the list). `order_book.py` holds the one copy of the matching rules, shared by
-`SingleThreadedBacktester`, `FastBacktester` and the live trader's dry-run path — if those three
-diverged, dry-run would stop being comparable to a backtest, which is the only reason dry-run
-exists.
+mutating the list). `order_book.py` holds the one copy of the matching rules, and
+`SimulatedExecutor` is the one caller — backtest and dry run are the *same object*, so they cannot
+diverge. That matters because dry run exists to be comparable to a backtest.
 
 **Fill rules** (`match_symbol`), against one closed candle `(o, h, l, c)`:
 
@@ -468,8 +526,9 @@ exists.
 | STOP_MARKET, not `trigger_above` | `o <= T` | `o` |
 | | else `l <= T` | `T` |
 
-`slippage_ratio` (a constructor argument on both backtesters, resolved from the streamer by the
-same rule as `fee_ratio`, default `0.0`) is applied **only to STOP_MARKET**, in the adverse
+`slippage_ratio` (an argument to `run_backtest` and `SimulatedExecutor`, resolved from the
+streamer by the same rule as `fee_ratio` — see `engine/executor.resolve_slippage_ratio`, default
+`0.0`) is applied **only to STOP_MARKET**, in the adverse
 direction. LIMIT fills at your price or better by definition, and MARKET is left alone so existing
 backtests are bit-identical.
 
@@ -488,32 +547,22 @@ Assumptions that a candle cannot verify, all deliberate:
 - **Forced liquidation cancels the whole book** (`cancel_all`) along with flattening every symbol;
   otherwise a stop left resting would open a ghost position on a bankrupt account.
 
-**Where matching sits in the event** — this ordering is the load-bearing part:
+**Where matching sits in the event** is step 2 of `TradingEngine.process_event` (see "The trading
+engine" above) — ahead of `decide_action`, because on a real exchange a resting order fills before
+the bar closes. That has a consequence for the vectorized equity rebuild: a MARKET fill happens
+*after* the equity point is recorded so its state applies from the next event index, while a
+resting fill happens *before* it so its state applies from this one. `VectorizedRecorder` gets that
+for free — its `record_event` counter *is* the `effective_from`, since resting fills reach
+`record_trade` before that call and market fills after it.
 
-```
-1. freeze status.last_close[symbol] for every symbol in the event
-2. match resting orders against each symbol's candle  ← fills happen here
-3. mark-to-market every position; append the equity point
-4. bankruptcy check → cancel_all + flatten every symbol
-5. per symbol: update indicators → decide_action → record the shard row
-6. action loop: CANCEL → cancel; LIMIT/STOP_MARKET → register; MARKET → fill at last_close
-```
+Live never simulates any of this: `LiveExecutor.match_resting` is a no-op and the exchange owns the
+book, hydrated at startup from `futures_get_open_orders()` and kept in sync by
+`ORDER_TRADE_UPDATE`.
 
-Matching is at step 2, ahead of `decide_action`, because on a real exchange a resting order fills
-before the bar closes — put it after and the strategy decides while believing it still holds a
-position its stop already closed. That has a consequence for `FastBacktester`'s vectorized equity
-rebuild: a MARKET fill happens *after* the equity point is recorded so its state applies from
-`idx + 1`, while a resting fill happens *before* it so its state applies from `idx` itself. Each
-entry in `trade_marks` therefore carries an explicit `effective_from` instead of the old implicit
-`idx + 1`, and `_build_equity_curve` slices on that.
+### Position & PnL accounting (`core/engine/status.py`, `trade.py`, `report.py`)
 
-`SingleThreadedBacktester` owns the shared helpers (`_fill`, `_match_resting_orders`,
-`_submit_book_action`) and `FastBacktester` inherits them, so both engines cannot drift apart.
-
-### Position & PnL accounting (`core/backtest/status.py`, `trade.py`, `report.py`)
-
-`Status` is the single shared representation of account state used by *both* the backtester and
-the live `BinanceTrader`, modelling one **shared cross-margin pool** (`margin`, a bare scalar)
+`Status` is the single shared representation of account state, **owned by the executor**
+(`executor.status`) and modelling one **shared cross-margin pool** (`margin`, a bare scalar)
 across per-symbol positions (`positions: Dict[str, PositionState]`, each holding `avg_price`,
 `position`, `unrealised_pnl`) — matching how Binance USD-M cross margin actually works: a loss on
 one symbol draws down the same pool a profit on another symbol credits. `status.position_for(
@@ -527,15 +576,13 @@ runs that event) — it's what lets a cross-symbol action price a non-trigger sy
 math — and it derives realised PnL by **pro-rating `unrealised_pnl`**, which is only correct when
 that field is marked at the fill price. For a market fill that is automatic (the fill price *is*
 the close the engine just marked at); for a resting fill at a trigger or limit price it is not, so
-every fill path (`SingleThreadedBacktester._fill`, inherited by `FastBacktester`, and both of the
-live trader's fill sites) calls `update_unrealised_pnl(symbol, price)` immediately before
-`apply_fill`. On the market path that recomputes the same value and changes nothing; on the
-resting path, omitting it silently books the wrong realised PnL. `apply_fill` itself models
-opening, pyramiding (same-direction add), partial close, full close, and
-direction-flip on that symbol's `PositionState`, crediting/debiting the shared `margin`;
-`SingleThreadedBacktester._trade` is a thin wrapper over it (inherited unchanged by
-`FastBacktester`), and `BinanceTrader`'s dry-run path calls it directly, so dry-run equity tracks
-a backtest of the same candles exactly. A `Trade` is an immutable record of one fill (with its
+`SimulatedExecutor._fill` — the **one** fill path for backtest and dry run alike — calls
+`update_unrealised_pnl(symbol, price)` immediately before `apply_fill`. On the market path that
+recomputes the same value and changes nothing; on the resting path, omitting it silently books the
+wrong realised PnL. `apply_fill` itself models opening, pyramiding (same-direction add), partial
+close, full close, and direction-flip on that symbol's `PositionState`, crediting/debiting the
+shared `margin`. Live never calls it — the exchange's `ACCOUNT_UPDATE` is the truth there.
+A `Trade` is an immutable record of one fill (with its
 `symbol`) plus a deep-copied pre-trade `Status`; its `wnl` is realised PnL **before** the fee,
 which is carried separately in `fee`. It also carries `order_type` (the `ActionType` value that
 produced it) and `submitted_at` — for a market fill that equals `timestamp`, but a resting order is
@@ -550,82 +597,100 @@ can never disagree with the streamer about what it trades), every traded symbol'
 over **one** multiplexed kline socket, and `ORDER_TRADE_UPDATE`/`ACCOUNT_UPDATE` handling matches
 against the full traded-symbol set rather than a single symbol.
 
-- `BinanceTrader` is asyncio-based: it opens one futures kline websocket — a
+`BinanceTrader` is assembly and lifecycle only (~400 lines). It builds the four engine pieces,
+opens the sockets and shuts everything down; the trading logic itself is in `core/engine/`. The
+one asyncio seam left in it is the user-data socket's lifecycle — the messages themselves go
+straight to `executor.on_user_data(...)`.
+
+- **`live_candle_producer.py` — where candles come from.** One futures kline websocket, a
   `futures_multiplex_socket` carrying every symbol's `continuousKline` stream (built as
-  `<symbol>_<contract_type>@continuousKline_<interval>` per symbol, the same stream
-  `kline_futures_socket` subscribes to under the hood for one symbol) — and, unless `dry_run`, one
-  futures user-data websocket, both via `ReliableWebsocket` (a thin wrapper around python-binance's
-  `ReconnectingWebsocket` that recovers from a dropped `recv()` by closing/reconnecting the
-  delegate, logging both the failure and the recovery with a running `reconnects` count —
-  a reconnect an hour and a reconnect a minute are very different operationally, and only
-  logging the failures made that impossible to read off the log). Multiplexed messages arrive
-  wrapped as `{"stream": ..., "data": <rawPayload>}`; since the continuousKline payload carries no
-  top-level `s`/`k.s`, the symbol is read from `data["ps"]` instead. There is exactly one listener
-  task pulling from this socket, and it fully awaits each candle's processing (including order
-  dispatch) before receiving the next message — so candle processing across symbols is naturally
-  serialized and needs no extra locking; the only pre-existing race is kline processing vs. the
-  separate user-data listener task, already handled by deep-copying `Status` before an order is
-  dispatched (see the "Fills" bullet under "Live run output" above).
-  On each *closed* kline it builds a `Candle`, calls the streamer with that candle's symbol
-  (`streamer.decide_action(symbol, candle, status) -> List[Action]` — the returned actions may
-  target other symbols too, for cross-symbol strategies), updates that symbol's indicators, and
-  fires registered action/error callbacks (`add_action_callback`/`add_error_callback`).
-  `_ensure_continuity`/`_fetch_missing_candles` detect and backfill gaps **per symbol** (each
-  symbol tracks its own `_last_candle_start`), replaying missed candles through the same
-  `_handle_candle` path a live candle takes — a gap raises no exception on its own (`
-  ReliableWebsocket` only recovers from a throwing `recv()`, so a silently dropped kline would
-  otherwise leave the log quiet while the hole propagates into every rolling-window indicator and
-  the recorded series); it compares `start_time + interval_ms`, not `end_time`, because a
-  websocket kline's `T` is `start + interval - 1` (the fetcher's `end_time` is exclusive; the
-  stream's is not). `_prefeed_indicators()` backfills each symbol's indicator windows with
-  historical candles (via `BinanceCandleFetcher`, off the event loop through `asyncio.to_thread`,
-  one symbol at a time) before going live, asserting each fetched range exactly matches what's
-  expected; every symbol shares the same interval-boundary `end_time` (not recomputed per symbol)
-  so their windows stay aligned with each other despite the sequential fetches. The range is
-  floored to the **interval** boundary, not the minute, so the assertion holds for every interval
-  and not just `1m`.
+  `<symbol>_<contract_type>@continuousKline_<interval>` per symbol), via `ReliableWebsocket` (a
+  thin wrapper around python-binance's `ReconnectingWebsocket` that recovers from a dropped
+  `recv()` by closing/reconnecting the delegate, logging both the failure and the recovery with a
+  running `reconnects` count — a reconnect an hour and a reconnect a minute are very different
+  operationally, and only logging the failures made that impossible to read off the log).
+  Multiplexed messages arrive wrapped as `{"stream": ..., "data": <rawPayload>}`; since the
+  continuousKline payload carries no top-level `s`/`k.s`, the symbol is read from `data["ps"]`.
+  Since one consumer drives this source and fully awaits each event's processing (including order
+  dispatch) before pulling the next message, candle processing across symbols is naturally
+  serialized and needs no extra locking; the only race is kline processing vs. the separate
+  user-data listener task, handled by deep-copying `Status` before an order is dispatched.
+  - **Gaps and duplicates are detected per symbol** (each tracks its own `_last_candle_start`,
+    advanced *before* the candle is yielded so a consumer exception cannot cause a re-run). A gap
+    is filled by **yielding the missing candles first** — so "backfilled candles take the same path
+    as live ones" is a property of stream order rather than something the processing path has to
+    re-enter. A gap raises no exception on its own (`ReliableWebsocket` only recovers from a
+    throwing `recv()`, so a silently dropped kline would otherwise leave the log quiet while the
+    hole propagates into every rolling-window indicator and the recorded series); the check
+    compares `start_time + interval_ms`, not `end_time`, because a websocket kline's `T` is
+    `start + interval - 1` (the fetcher's `end_time` is exclusive; the stream's is not) — the
+    producer normalizes `end_time` to the interval boundary for exactly this reason.
+  - A misaligned boundary, a gap larger than `MAX_BACKFILL_CANDLES`, or a failed backfill **ends
+    the stream**; the trader then stops and a restart recovers (warm-up rebuilds the indicators,
+    the exchange owns the position).
+  - `warmup_candles(windows)` fetches each symbol's indicator history (via `BinanceCandleFetcher`,
+    off the event loop through `asyncio.to_thread`, one symbol at a time), asserting each fetched
+    range exactly matches what was expected. Every symbol shares the same interval-boundary
+    `end_time` (not recomputed per symbol) so their windows stay aligned despite the sequential
+    fetches, and the range is floored to the **interval** boundary, not the minute, so the
+    assertion holds for every interval and not just `1m`.
+- **`live_executor.py` — orders and account state.** `submit()` sends the order and returns an
+  `OrderDispatch`; the fill arrives later on the user-data stream, so the pre-trade `Status`
+  snapshot is deep-copied *before* dispatch and keyed by `(symbol, client order id)` — every order
+  gets a `newClientOrderId` (auto-generated for market orders, the strategy's `client_id` for
+  resting ones) which the exchange echoes back as `c`, so a resting order that fills hours later is
+  still paired with the decision that created it.
+  - `Status` is hydrated from `futures_account()` at startup for every traded symbol (from
+    `walletBalance`, not `marginBalance` — the latter already includes unrealised PnL, which
+    `total_margin()` adds again) and then kept in sync by `ACCOUNT_UPDATE`/`ORDER_TRADE_UPDATE`.
+    `ACCOUNT_UPDATE` carries **only changed** balances/positions, so the handler leaves `Status`
+    untouched for symbols/assets absent from the event rather than zeroing them, and iterates the
+    full `P` array without stopping at the first match — one event can carry position deltas for
+    several of our symbols at once. `_order_agg` is keyed by `(symbol, order_id)`, not `order_id`
+    alone, since nothing guarantees order IDs are unique across symbols for one account.
+  - Resting orders are never simulated here and forced liquidation is never performed — the
+    exchange does both (`match_resting` is a no-op, `force_liquidation` always returns `False`).
+    `status.open_orders` is hydrated at startup from `futures_get_open_orders()` and kept in sync
+    by `ORDER_TRADE_UPDATE` (`NEW` adds, a terminal state removes).
+  - `reconcile_resumed(saved)` compares a resumed run's remembered positions **and** open orders
+    against the exchange's actual ones and warns on any difference — a liquidation/ADL, a manual
+    order, or a fill event missed while the process was down. It only reports: live `Status` is
+    exchange truth and is left alone. The order reconciliation matters more than the position one,
+    since the exchange keeps working a stop while this process is down.
   - Every traded symbol must settle in the same margin asset, since `Status.margin` is one pool
-    shared across all of them — `_resolve_margin_asset()` asserts this once at construction and
-    caches the result as `self._margin_asset`, used everywhere a per-symbol margin-asset lookup
-    used to happen.
-  - `start()` builds the `BinanceSocketManager` first, prefeeds *before* opening any socket (so the
-    user-data queue can't overflow during a long backfill), sets `is_running = True` *before*
-    spawning listener tasks (they loop on that flag), and **re-raises** on failure — a trader that
-    could not start must not look like one that did. Listener tasks are kept in `self._tasks` so
-    asyncio can't garbage-collect them mid-flight. On success it logs one line naming the whole
-    configuration — mode (LIVE/DRY-RUN), symbols, interval, testnet, streamer, fee ratio, run id.
-    `dry_run` appears nowhere else in the log, so without it a strategy that goes days without
-    trading gives no way to tell whether real money is at stake.
-  - `_reconcile_resumed_position` (live only) compares, **per symbol**, the position the resumed
-    run remembers (`LiveRecorder.resumed_status`) against the exchange's actual position and warns
-    when any differ — a liquidation/ADL, a manual order, or a fill event missed while the process
-    was down. It only reports: live `Status` is exchange truth and is left alone.
-  - In `dry_run` mode: margin starts at a fixed synthetic `1e6`, no user-data socket is opened and
-    no orders are sent; fills are applied locally through `Status.apply_fill` with the streamer's
-    `fee_ratio`, which is the same accounting the backtester runs.
-  - In live mode: `Status` is hydrated from `futures_account()` at startup for every traded symbol
-    (from `walletBalance`, not `marginBalance` — the latter already includes unrealised PnL, which
-    `total_margin()` adds again) and then kept in sync by `ACCOUNT_UPDATE`/`ORDER_TRADE_UPDATE`
-    events off the user-data stream. `ACCOUNT_UPDATE` carries **only changed** balances/positions,
-    so the handler leaves `Status` untouched for symbols/assets absent from the event rather than
-    zeroing them, and iterates the full `P` array without stopping at the first match — one event
-    can carry position deltas for several of our symbols at once. `_order_agg` is keyed by
-    `(symbol, order_id)`, not `order_id` alone, since nothing guarantees order IDs are unique
-    across symbols for one account.
-  - With `record=True` (the `RECORD` env var, default on) the trader owns a `LiveRecorder` and
-    persists the session to `asset/live/` in backtest format — see "Live run output" above for the
-    recording seams, restart-resume behaviour and the live/backtest divergences to expect.
-- `BinanceExecutor` submits orders to a `ThreadPoolExecutor` (GIL-free from the asyncio loop) with
-  exponential-backoff retries, returning a `concurrent.futures.Future[OrderResult]`; callers (e.g.
-  `BinanceTrader._on_action`) block on `future.result(timeout=...)` from within an async callback.
-  It was already symbol-agnostic before this — `execute_action` reads `action.symbol` directly and
-  needed no changes to support multiple symbols. `execute_action` maps `ActionType` onto the
-  exchange's order types: `LIMIT` gains `timeInForce=GTC` (Binance rejects a LIMIT without it),
-  and a `STOP_MARKET` becomes `STOP_MARKET` or `TAKE_PROFIT_MARKET` depending on which side of
+    shared across all of them — `resolve_margin_asset()` asserts this once at construction, in
+    **both** modes.
+- **Dry run uses `SimulatedExecutor`** — the backtest's own class. Margin starts at a fixed
+  synthetic `1e6`, no user-data socket is opened, no orders are sent, and fills/resting orders go
+  through exactly the code a backtest runs. `core/live_check.py` asserts that a dry run and a
+  backtest of the same candles produce identical trades.
+- `start()` builds the `BinanceSocketManager` first, hydrates the account (live), sets up the
+  recorder and engine, warms up indicators *before* opening any socket (so the user-data queue
+  can't overflow during a long backfill), sets `is_running = True` *before* spawning listener tasks
+  (they loop on that flag), and **re-raises** on failure — a trader that could not start must not
+  look like one that did. Listener tasks are kept in `self._tasks` so asyncio can't garbage-collect
+  them mid-flight. On success it logs one line naming the whole configuration — mode
+  (LIVE/DRY-RUN), symbols, interval, testnet, streamer, fee ratio, run id. `dry_run` appears
+  nowhere else in the log, so without it a strategy that goes days without trading gives no way to
+  tell whether real money is at stake.
+- With `record=True` (the `RECORD` env var, default on) the trader owns a `LiveRecorder` and
+  persists the session to `asset/live/` in backtest format — see "Live run output" above for the
+  recording seams, restart-resume behaviour and the live/backtest divergences to expect.
+- `BinanceExecutor` is the low-level order client: it submits to a `ThreadPoolExecutor` (GIL-free
+  from the asyncio loop) with exponential-backoff retries, returning a
+  `concurrent.futures.Future[OrderResult]` that `OrderDispatch.wait()` awaits via
+  `asyncio.wrap_future`. It returns `success=False` rather than raising once retries are exhausted,
+  and `OrderDispatch` checks that — otherwise a permanently rejected order passes without a trace
+  and the strategy drifts from the exchange. `execute_action` maps `ActionType` onto the exchange's
+  order types: `LIMIT` gains `timeInForce=GTC` (Binance rejects a LIMIT without it), and a
+  `STOP_MARKET` becomes `STOP_MARKET` or `TAKE_PROFIT_MARKET` depending on which side of
   `reference_price` its trigger sits — the exchange rejects a conditional order whose trigger is on
   the wrong side, so the caller passes `status.last_close[symbol]` as that reference. A `CANCEL`
-  action routes to `cancel_order`, which now also accepts `origClientOrderId` (how a strategy
-  addresses its own order) and cancels every open order on the symbol when given neither id.
+  action routes to `cancel_order`, which also accepts `origClientOrderId` (how a strategy addresses
+  its own order) and cancels every open order on the symbol when given neither id.
+
+There is no `add_action_callback` any more — the `Executor` is the action seam. To observe or alter
+what gets executed, wrap `trader.executor`. `add_error_callback` remains.
 
 ## Conventions
 

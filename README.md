@@ -51,7 +51,7 @@ renders candles, indicators, trade markers, an equity curve and monthly stats.
 Subclass `BaseStreamer`, declare your indicators, and implement `decide_action`:
 
 ```python
-from core.backtest.status import Status
+from core.engine.status import Status
 from core.streamer.action import Action
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.candle import Candle
@@ -101,7 +101,7 @@ and `get_index()`. That is all you need for correctness everywhere.
 
 An indicator can additionally implement `precompute_series(open, high, low, close, volume)`,
 returning the whole series as a numpy array (element *i* = `get_latest()` after *i+1* updates, NaN
-during warm-up). `FastBacktester` detects the method by attribute presence
+during warm-up). The vectorized backtest path detects the method by attribute presence
 (`getattr(indicator, "precompute_series", None)`) and computes those in one shot instead of
 looping, which is where most of its speedup comes from. `update()` must still work — the live
 trader has no future to precompute.
@@ -149,10 +149,10 @@ the resulting numbers as a smoke test, not as evidence.
 ## Backtesting
 
 ```python
-from core.backtest.FastBacktester import FastBacktester
+from core.engine.backtest import run_backtest
 
-backtester = FastBacktester(streamer, candles, fee_ratio=0.0004)
-report = backtester.run(metadata={...}, save_series=True)
+report = run_backtest(streamer, candles, fee_ratio=0.0004,
+                      metadata={...}, save_series=True)
 ```
 
 `Report` gives you `trades`, `max_leverage`, the final `Status` and the equity curve. Passing
@@ -160,17 +160,23 @@ report = backtester.run(metadata={...}, save_series=True)
 adding `save_series=True` also writes month-bucketed `<run_id>.<YYYY-MM>.series.json` shards with
 per-candle OHLC and indicator values, which the frontend loads lazily per viewport.
 
-`SingleThreadedBacktester` is the plain reference implementation. `FastBacktester` is a drop-in
-subclass — same trades, same output, roughly 2x faster loop and 5x faster series writing.
-`backtest_fast_check.py` asserts the two produce byte-identical results and is the closest thing
-this repo has to a test suite:
+`vectorized=True` (the default) precomputes every indicator that offers `precompute_series` and
+rebuilds the equity curve with numpy; `vectorized=False` is the plain reference path. Both run the
+**same** trading engine, so they must produce identical trades — `backtest_fast_check.py` asserts
+that and is the closest thing this repo has to a test suite:
 
 ```bash
-uv run python core/backtest_fast_check.py
+uv run python core/backtest_fast_check.py   # vectorized vs reference backtest
+uv run python core/live_check.py            # live path + dry-run == backtest
 ```
 
-The backtester also force-liquidates a position when `margin <= unrealised_pnl`, so blown-up
-strategies show up as blow-ups rather than as impossible recoveries.
+The engine also force-liquidates every position when mark-to-market equity falls to zero or below,
+so blown-up strategies show up as blow-ups rather than as impossible recoveries.
+
+Backtesting and live trading are the same code path: `run_backtest` and the live trader both drive
+`core/engine/`'s `TradingEngine`, and differ only in which candle source, executor and recorder are
+plugged into it. A dry run uses the *backtest's* executor, so it produces exactly the trades a
+backtest of the same candles would.
 
 ## Data sources
 
