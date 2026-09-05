@@ -11,7 +11,6 @@
 """
 
 import sys
-from abc import ABC, abstractmethod
 from typing import Dict, Iterator, List, Optional, Tuple
 
 from tqdm import tqdm
@@ -23,21 +22,26 @@ from core.streamer.candle import Candle
 Event = Tuple[int, Dict[str, Candle]]
 
 
-class CandleProducer(ABC):
-    """이벤트를 시간순으로 내주는 소스."""
+class CandleProducer:
+    """이벤트를 시간순으로 내주는 소스.
+
+    구현체는 **동기 소스면 ``__iter__``를, 비동기 소스면 ``__aiter__``를** 제공한다. 둘 중
+    하나만 있으면 되고, 엔진의 :meth:`~core.engine.engine.TradingEngine.run`과
+    :meth:`~core.engine.engine.TradingEngine.run_async`가 각각을 받는다 — 캔들을 어디서
+    얻느냐가 동기/비동기를 가르는 유일한 지점이기 때문이다.
+    """
 
     #: 캔들 간격(ms). 샤드 메타와 Sharpe 리샘플링 주기를 정하는 데 쓰인다.
     interval_ms: int = 0
 
-    @abstractmethod
-    def __iter__(self) -> Iterator[Event]:
-        ...
-
-    def warmup_candles(self) -> Dict[str, List[Candle]]:
+    async def warmup_candles(self, windows: Dict[str, int]) -> Dict[str, List[Candle]]:
         """루프를 시작하기 전 지표에만 먹일 과거 캔들. 기본은 없음.
 
         이 캔들들은 ``process_event``를 타지 않는다 — 주문도 기록도 일어나면 안 되기 때문이다
         (:meth:`~core.engine.engine.TradingEngine.warmup` 참고).
+
+        :param windows: 심볼별로 필요한 캔들 수. 보통
+            :meth:`~core.engine.engine.TradingEngine.warmup_windows`가 만들어 준다.
         """
         return {}
 

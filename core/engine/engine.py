@@ -19,7 +19,7 @@ Dispatch`로 ``yield``해 호출자에게 넘긴다 — 동기 호출자(백테�
 
 import logging
 from collections import deque
-from typing import Dict, Iterator, List
+from typing import Awaitable, Callable, Dict, Iterator, List, Optional
 
 from core.engine.candle_producer import CandleProducer
 from core.engine.executor import Dispatch, Executor
@@ -115,6 +115,12 @@ class TradingEngine:
         # 8. 이벤트 마무리 (라이브 레코더의 flush 등)
         self.recorder.end_event(event_time)
 
+    def warmup_windows(self) -> Dict[str, int]:
+        """심볼별로 워밍업에 필요한 캔들 수 = 그 심볼 지표들의 최대 window."""
+        return {symbol: max((ind.window for ind in indicators.values()), default=0)
+                for symbol, indicators in
+                ((s, self.streamer.indicators.get(s, {})) for s in self.streamer.symbols)}
+
     def warmup(self, candles_by_symbol: Dict[str, List[Candle]]) -> None:
         """지표에만 과거 캔들을 먹인다 — 주문도 기록도 일어나지 않는다.
 
@@ -126,6 +132,9 @@ class TradingEngine:
             for candle in candles:
                 for indicator in indicators.values():
                     indicator.update(candle)
+            if indicators:
+                self.logger.info("[%s] Pre-fed indicators: %s", symbol,
+                                 generate_dict_string(indicators))
 
     def run(self, producer: CandleProducer) -> None:
         """동기 소스를 끝까지 흘려보낸다.
@@ -136,8 +145,23 @@ class TradingEngine:
         for event_time, candles in producer:
             deque(self.process_event(event_time, candles), maxlen=0)
 
-    async def run_async(self, producer, timeout: float = 10.0) -> None:
-        """비동기 소스를 끝까지 흘려보내고, 주문마다 거래소의 확인을 기다린다."""
+    async def run_async(self, producer, timeout: float = 10.0,
+                        on_error: Optional[Callable[[Exception], Awaitable[None]]] = None
+                        ) -> None:
+        """비동기 소스를 끝까지 흘려보내고, 주문마다 거래소의 확인을 기다린다.
+
+        :param on_error: 주면 한 이벤트의 처리 실패가 루프를 끝내지 않고 여기로 넘어간다 —
+            몇 주씩 사는 프로세스에서 전략의 일시적 버그 하나가 트레이더를 죽이면 안 되기
+            때문이다. None이면 그대로 올라간다 (테스트/백필 재생에서 쓴다).
+        """
         async for event_time, candles in producer:
-            for dispatch in self.process_event(event_time, candles):
-                await dispatch.wait(timeout)
+            try:
+                for dispatch in self.process_event(event_time, candles):
+                    await dispatch.wait(timeout)
+            except Exception as e:
+                if on_error is None:
+                    raise
+                # exception()으로 스택트레이스까지 남긴다 — 한 줄만으로는 핸들러 안 어느
+                # 줄에서 터졌는지 알 수 없다.
+                self.logger.exception("이벤트 처리 실패 — 다음 캔들로 넘어간다: %s", e)
+                await on_error(e)

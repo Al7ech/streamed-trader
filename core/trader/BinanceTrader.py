@@ -14,18 +14,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Callable, Dict, Any, Coroutine, List, Set, Tuple
 
 from binance import AsyncClient, BinanceSocketManager
-from binance.enums import ContractType
 from binance.exceptions import BinanceAPIException, BinanceWebsocketClosed
 
 from core.engine import order_book
 from core.engine.order_book import OpenOrder
 from core.engine.status import Status
-from core.binance_candle_fetcher.fetcher import BinanceCandleFetcher
 from core.streamer.action import Action, ActionType
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.candle import Candle
 from core.trader.BinanceExecutor import BinanceExecutor
 from core.trader.ReliableWebsocket import ReliableWebsocket
+from core.trader.live_candle_producer import LiveCandleProducer
 from core.trader.live_recorder import DEFAULT_SHARD_FLUSH_EVERY, LiveRecorder, default_run_id
 from core.utils import generate_dict_string, ms_timestamp_to_datetime, interval_to_minutes
 
@@ -64,13 +63,6 @@ _MAX_OPEN_ORDER_AGGREGATES = 256
 #: 있으므로 캔들 단위로 비울 수 없고 (아래 _PendingDecision.resting 참고), 대신 상한을 둔다.
 _MAX_PENDING_DECISIONS = 256
 
-#: 백필로 메울 수 있는 최대 캔들 수. 이걸 넘으면 메우지 않고 stop() 해서 재기동에 맡긴다.
-#: 두 가지를 한꺼번에 묶는 값이다: (a) 백필 재생은 캔들마다 주문 실행을 await 하므로 재생이
-#: 길어지면 그동안 kline 큐(python-binance 기본 100건)가 넘쳐 소켓이 죽는다, (b) 아주 오래된
-#: 구간의 결정을 무더기로 재생하면 주문 churn 이 커진다.
-#: 재기동 경로는 이미 멀쩡하다 — _prefeed_indicators 가 지표를 이력에서 다시 세우고 포지션은
-#: 거래소가 정답이다.
-_MAX_BACKFILL_CANDLES = 60
 
 
 @dataclass
@@ -171,9 +163,6 @@ class BinanceTrader:
         self.interval = interval
         #: 인터벌 길이(ms). 캔들 연속성 판정과 레코더 샤드 메타가 같이 쓴다.
         self._interval_ms = interval_to_minutes(interval) * 60_000
-        #: 심볼별 마지막으로 처리한 캔들의 시작 시각 — 중복/구멍 판정의 기준점. 값이 None이면
-        #: 그 심볼은 아직 기준이 없다 (지표 prefeed 전, 또는 prefeed 할 지표가 하나도 없는 경우).
-        self._last_candle_start: Dict[str, Optional[int]] = {s: None for s in self.symbols}
         #: 정산(마진) 자산. Status.margin이 전 심볼 공유 풀이라 모든 심볼이 같은 자산이어야
         #: 하고, 여기서 한 번만 검증/계산해 캐시한다.
         self._margin_asset: str = self._resolve_margin_asset()
@@ -196,7 +185,8 @@ class BinanceTrader:
         # WebSocket and client instances
         self.client: Optional[AsyncClient] = None
         self.socket_manager: Optional[BinanceSocketManager] = None
-        self.kline_socket: Optional[ReliableWebsocket] = None
+        #: 마감 캔들 공급자. 소켓 연결/연속성/백필/워밍업 페치를 전부 소유한다.
+        self.producer: Optional[LiveCandleProducer] = None
         self.user_socket: Optional[ReliableWebsocket] = None
 
         # Executor
@@ -250,8 +240,10 @@ class BinanceTrader:
             )
 
             # 1. Create socket manager.
-            #    소켓을 여는 쪽(_connect_*_websocket)이 이걸 참조하므로 반드시 먼저 만든다.
+            #    캔들 공급자와 유저 데이터 소켓이 이걸 참조하므로 반드시 먼저 만든다.
             self.socket_manager = BinanceSocketManager(self.client)
+            self.producer = LiveCandleProducer(self.socket_manager, self.symbols,
+                                               self.interval, self._handle_error)
 
             # 2. Load futures wallet status and apply to status object
             if not self.dry_run:
@@ -279,7 +271,8 @@ class BinanceTrader:
             # 5. Start WebSocket connections
             if not self.dry_run:
                 await self._connect_user_websocket()
-            await self._connect_kline_websocket()
+            await self.producer.connect()
+            self._spawn(self._consume_candles())
 
             # 이 프로세스가 무엇인지 한 줄로 남긴다. 특히 **dry_run**은 여기 말고는 어디에도
             # 기록되지 않는다 — 체결이 나면 "[dry-run]" 접두사로 알 수 있지만, 전략이 며칠간
@@ -515,10 +508,13 @@ class BinanceTrader:
             if task is not current:
                 task.cancel()
 
+        if self.producer:
+            self.producer.request_stop()
+
         try:
-            if self.kline_socket:
-                await self.kline_socket.close()
-                self.kline_socket = None
+            if self.producer:
+                await self.producer.close()
+                self.producer = None
 
             if self.user_socket:
                 await self.user_socket.close()
@@ -534,200 +530,6 @@ class BinanceTrader:
 
         except Exception as e:
             self.logger.error(f"Error during shutdown: {e}")
-
-    async def _connect_kline_websocket(self):
-        """Establish one multiplexed WebSocket connection carrying every symbol's kline stream.
-
-        ``kline_futures_socket`` 자체가 내부적으로 continuousKline 스트림
-        (``<symbol>_<contract_type>@continuousKline_<interval>``)을 구독한다 — 여러 심볼을
-        같은 이름 규칙으로 만들어 ``futures_multiplex_socket``으로 묶는다. 묶인 메시지는
-        ``{"stream": "...", "data": <rawPayload>}``로 오고, continuousKline 페이로드에는
-        최상위 ``s``/``k.s``가 없다 — 대신 ``ps``(pair)로 심볼을 식별한다
-        (``_process_kline_message`` 참고).
-        """
-        try:
-            streams = [f"{sym.lower()}_{ContractType.PERPETUAL.value}@continuousKline_{self.interval}"
-                      for sym in self.symbols]
-            self.kline_socket = ReliableWebsocket(
-                self.socket_manager.futures_multiplex_socket(streams=streams))
-            # noinspection PyProtectedMember
-            self.logger.info(f"connecting to kline: {self.kline_socket._url}{self.kline_socket._path} ({self.kline_socket.id()})")
-
-            # Start the socket
-            await self.kline_socket.connect()
-
-            # Start listening for messages
-            self._spawn(self._listen_kline_websocket())
-
-        except Exception as e:
-            self.logger.error(f"Failed to connect kline WebSocket: {e}")
-            raise
-
-    async def _listen_kline_websocket(self):
-        """Listen for WebSocket messages and process kline data."""
-        while self.is_running:
-            try:
-                data = await self.kline_socket.recv()
-                if not self.is_running:
-                    break
-
-                try:
-                    await self._process_kline_message(data)
-                except Exception as e:
-                    # exception()으로 스택트레이스까지 남긴다. 예전에는 한 줄뿐이라, 핸들러
-                    # 안에서 KeyError가 나면 로그에 키 이름 하나만 남고 어느 줄인지 알 수 없었다.
-                    self.logger.exception("Error processing kline message: %s", e)
-                    await self._handle_error(e)
-
-            # Something is very wrong at this point. Stop trader
-            except Exception as e:
-                if not self.is_running:
-                    break
-                self.logger.critical(f"Stopping trader. Error receiving kline message: {e}")
-                await self.stop()
-                break
-
-    async def _process_kline_message(self, data: dict):
-        """Parse an incoming kline message and hand the closed candle to the pipeline.
-
-        메시지는 멀티플렉스 봉투 ``{"stream": "...", "data": <rawPayload>}``로 온다. 에러
-        프레임은 이 봉투로 오지 않고 그대로 큐에 얹히므로(``ReconnectingWebsocket``이 합성),
-        풀기 **전에** 먼저 검사해야 한다.
-        """
-        if await self._handle_stream_error_frame(data, "kline"):
-            return
-
-        payload = data.get("data") or {}
-        symbol = (payload.get("ps") or "").upper()
-        if symbol not in self._symbol_set:
-            self.logger.warning(f"알 수 없는 심볼의 kline 메시지를 버린다: {payload.get('ps')!r}")
-            return
-
-        kline_data = payload.get('k', {})
-
-        # Check if kline is closed (completed candle)
-        if not kline_data.get('x', False):  # x = is_closed
-            return
-
-        # Extract kline data
-        open_price = float(kline_data['o'])
-        high_price = float(kline_data['h'])
-        low_price = float(kline_data['l'])
-        close_price = float(kline_data['c'])
-        volume = float(kline_data['v'])
-        start_time = int(kline_data['t'])
-
-        # Create Candle object.
-        # 마감 시각은 **인터벌 경계**로 정규화한다. 웹소켓의 T(closeTime)는 경계 - 1ms 인데
-        # BinanceCandleFetcher 는 경계(k[6] + 1)를 쓴다. 그대로 두면 백필한 캔들과 라이브 캔들의
-        # 타임스탬프가 1ms 어긋나고, 백테스트 시계열과도 짝이 맞지 않는다.
-        candle = Candle(
-            open=open_price,
-            high=high_price,
-            low=low_price,
-            close=close_price,
-            volume=volume,
-            start_time=start_time,
-            end_time=start_time + self._interval_ms
-        )
-
-        if not await self._ensure_continuity(symbol, candle):
-            return
-
-        await self._handle_candle(symbol, candle)
-
-    async def _ensure_continuity(self, symbol: str, candle: Candle) -> bool:
-        """이 캔들을 처리해도 되는지 판단하고, 앞에 빠진 캔들이 있으면 메워서 재생한다.
-
-        python-binance 는 끊김을 스스로 재연결하고(``ReconnectingWebsocket._run_reconnect``)
-        그 사이 메시지를 버린다. 게다가 그 사실은 예외가 아니라 ``{"e": "error"}`` 메시지로만
-        알려지므로, 예전에는 두 가지가 조용히 일어났다: 마감 캔들이 통째로 빠져 지표가
-        백테스트와 영구히 갈라지거나(청산 조건이 걸린 캔들을 놓치면 포지션이 그대로 남는다),
-        재연결 직후 같은 마감 캔들이 다시 와서 ``decide_action`` 이 두 번 불리고 **주문이 두 번**
-        나갔다.
-
-        :return: 호출자가 이 캔들을 이어서 처리해야 하면 True.
-        """
-        last = self._last_candle_start[symbol]
-        if last is None:
-            return True
-
-        if candle.start_time <= last:
-            self.logger.warning(
-                f"이미 처리한 캔들을 버린다 (symbol={symbol}): "
-                f"start={ms_timestamp_to_datetime(candle.start_time)} <= "
-                f"마지막 처리 {ms_timestamp_to_datetime(last)}")
-            return False
-
-        elapsed = candle.start_time - last
-        if elapsed % self._interval_ms != 0:
-            self.logger.fatal(
-                f"Stopping trader. 캔들 경계가 인터벌과 맞지 않는다 (symbol={symbol}): "
-                f"{elapsed}ms 는 {self._interval_ms}ms 의 배수가 아니다 "
-                f"({ms_timestamp_to_datetime(last)} -> "
-                f"{ms_timestamp_to_datetime(candle.start_time)})")
-            await self.stop()
-            return False
-
-        missing = elapsed // self._interval_ms - 1
-        if missing == 0:
-            return True
-
-        if missing > _MAX_BACKFILL_CANDLES:
-            self.logger.fatal(
-                f"Stopping trader. 캔들 {missing}개가 비었다 (symbol={symbol}) — 백필 상한 "
-                f"{_MAX_BACKFILL_CANDLES}개를 넘어 재기동으로 복구한다")
-            await self.stop()
-            return False
-
-        gap_start = last + self._interval_ms
-        self.logger.warning(
-            f"캔들 {missing}개가 비었다 (symbol={symbol}) — 백필해서 재생한다: "
-            f"{ms_timestamp_to_datetime(gap_start)} ~ "
-            f"{ms_timestamp_to_datetime(candle.start_time)}")
-        try:
-            missed = await self._fetch_missing_candles(symbol, gap_start, candle.start_time)
-        except Exception as e:
-            # 지표는 이미 갈라졌다. 이 상태로 계속 매매하면 전략이 백테스트와 다른 것을 본다.
-            self.logger.fatal(f"Stopping trader. 빠진 캔들을 백필하지 못했다 (symbol={symbol}): {e}")
-            await self.stop()
-            return False
-
-        for missed_candle in missed:
-            await self._handle_candle(symbol, missed_candle)
-
-        # 재생 도중 치명적 오류로 stop() 이 불렸을 수 있다.
-        return self.is_running
-
-    async def _fetch_missing_candles(self, symbol: str, start_ms: int, end_ms: int) -> List[Candle]:
-        """``[start_ms, end_ms)`` 구간의 마감 캔들을 REST 로 가져온다.
-
-        ``get_candles`` 의 구간 규약이 반열린 구간이라(``_calculate_chunk_dates`` 가 끝을 1ms
-        당겨 초 단위로 포맷한다) 정확히 빠진 캔들만 돌아온다 — ``_prefeed_indicators`` 가 쓰는
-        규약과 같다. 개수와 정렬을 검증해서, 어긋난 캔들이 조용히 지표에 먹히는 일이 없게 한다.
-        """
-        # 동기 HTTP + tqdm 이라 스레드로 뺀다 (_prefeed_indicators 와 같은 이유 — 이벤트 루프를
-        # 막으면 그동안 유저 데이터 스트림을 읽지 못한다).
-        candle_fetcher = BinanceCandleFetcher()
-        candles = await asyncio.to_thread(
-            candle_fetcher.get_candles,
-            symbol=symbol,
-            interval=self.interval,
-            start_date=ms_timestamp_to_datetime(start_ms),
-            end_date=ms_timestamp_to_datetime(end_ms)
-        )
-
-        expected = (end_ms - start_ms) // self._interval_ms
-        if len(candles) != expected:
-            raise ValueError(f"백필 캔들 개수가 맞지 않는다: {len(candles)} != {expected}")
-        for i, c in enumerate(candles):
-            want = start_ms + i * self._interval_ms
-            if c.start_time != want:
-                raise ValueError(
-                    f"백필 캔들 {i}의 시작 시각이 어긋난다: "
-                    f"{ms_timestamp_to_datetime(c.start_time)} != "
-                    f"{ms_timestamp_to_datetime(want)}")
-        return candles
 
     def _remember_decision(self, pending: _PendingDecision, symbol: str,
                            client_order_id: str) -> None:
@@ -778,10 +580,6 @@ class BinanceTrader:
 
         라이브로 받은 캔들과 백필한 캔들이 **같은 경로**를 타야 하므로 수신부와 분리돼 있다.
         """
-        # 기준점은 작업 **전에** 세운다. 아래에서 예외가 나더라도 같은 캔들이 다음번에 "구멍"
-        # 으로 다시 잡혀 두 번 실행되면 안 된다.
-        self._last_candle_start[symbol] = candle.start_time
-
         # 지난 캔들의 결정이 아직 남아 있다면 그 주문은 체결 이벤트를 못 받은 것이다
         # (주문 실패 등). 그대로 두면 이번 캔들의 체결에 엉뚱한 거래 전 스냅샷이 붙는다.
         # 액션은 자기 심볼과 다른 심볼을 겨냥할 수 있으므로 (교차 심볼 전략), pending은
@@ -920,7 +718,7 @@ class BinanceTrader:
             self.user_socket = ReliableWebsocket(self.socket_manager.futures_user_socket())
 
             # Start the socket. _conn은 connect() 안에서 만들어지므로 로그는 그 뒤에 찍는다
-            # (예전엔 connect 전의 None._conn과 아직 만들어지지 않은 kline_socket을 읽었다).
+            # (예전엔 connect 전의 None._conn을 읽었다).
             await self.user_socket.connect()
 
             # noinspection PyProtectedMember
@@ -1273,91 +1071,46 @@ class BinanceTrader:
     async def _prefeed_indicators(self):
         """Pre-feed every symbol's indicators with historical candle data.
 
-        심볼마다 독립적으로(순차) 페치하지만, 봉 경계로 내림한 ``end_time``은 전 심볼이
-        공유한다 — 심볼마다 ``datetime.now()``에서 다시 계산하면, 순차 페치가 실제로
-        걸리는 시간만큼 뒤 심볼의 창이 앞 심볼보다 늦은 경계로 밀려 서로 어긋난다
-        (``max_window``에서 나온 ``start_time``은 심볼마다 달라도 무방하다).
+        과거 캔들을 어디서 어떻게 가져오는지는 :class:`LiveCandleProducer`가 안다 — 여기서는
+        그것을 지표에 먹이기만 한다. ``status``는 넘기지 않는다: 이 구간에는 대응하는 계좌
+        상태가 없으므로 status를 읽는 지표는 ``None``을 워밍업으로 다뤄야 한다.
         """
         try:
             self.logger.info("Pre-feeding indicators with historical data...")
-
-            interval_minutes = interval_to_minutes(self.interval)
-
-            current_sec = datetime.now().second
-            if 55 <= current_sec:
-                sleep_sec = 61 - current_sec
-                self.logger.info(f"skipping to next minute ({sleep_sec} seconds)")
-                await asyncio.sleep(sleep_sec)
-
-            # Get historical klines.
-            # **인터벌 경계**로 내림한다. 예전엔 분 단위로만 잘라서, 1h 인터벌을 13:37에
-            # 기동하면 start_time이 :37이 되고 Binance가 주는 정시 정렬 캔들과 어긋나
-            # 아래 검증이 무조건 실패했다 — 사실상 1m 외에는 라이브 기동이 불가능했다.
-            interval_delta = timedelta(minutes=interval_minutes)
-            now = datetime.now(tz=timezone.utc)
-            epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-            end_time = epoch + (now - epoch) // interval_delta * interval_delta
-
-            candle_fetcher = BinanceCandleFetcher()
-            for symbol in self.symbols:
+            windows = {
+                symbol: max((ind.window
+                             for ind in self.streamer.indicators.get(symbol, {}).values()),
+                            default=0)
+                for symbol in self.symbols
+            }
+            warmup = await self.producer.warmup_candles(windows)
+            for symbol, candles in warmup.items():
                 symbol_indicators = self.streamer.indicators.get(symbol, {})
-                max_window = 0
-                for indicator_name, indicator in symbol_indicators.items():
-                    max_window = max(max_window, indicator.window)
-
-                if max_window == 0:
-                    self.logger.info(f"No indicators found for {symbol}, skipping pre-feeding")
-                    continue
-
-                self.logger.info(f"[{symbol}] Maximum indicator window size: {max_window}")
-
-                total_minutes = max_window * interval_minutes
-                start_time = end_time - timedelta(minutes=total_minutes)
-
-                self.logger.info(f"[{symbol}] Fetching historical data from {start_time} to {end_time}")
-
-                # 동기 HTTP + tqdm이라 스레드로 뺀다 (수십 초간 이벤트 루프를 막으면 안 된다).
-                candles = await asyncio.to_thread(
-                    candle_fetcher.get_candles,
-                    symbol=symbol,
-                    interval=self.interval,
-                    start_date=start_time,
-                    end_date=end_time
-                )
-
-                # Assert
-                actual_start = ms_timestamp_to_datetime(candles[0].start_time) if candles else None
-                actual_end = ms_timestamp_to_datetime(candles[-1].end_time) if candles else None
-                if max_window != len(candles) or actual_start != start_time or actual_end != end_time:
-                    raise ValueError(
-                        f"historical kline assert error for {symbol}: "
-                        f"count {len(candles)} != {max_window}, "
-                        f"start {actual_start} != {start_time}, "
-                        f"end {actual_end} != {end_time}")
-
-                start_datetime = candles[0].start_time
-                end_datetime = candles[-1].end_time
-                candle_count = len(candles)
-
                 for candle in candles:
-                    for indicator_name, indicator in symbol_indicators.items():
+                    for indicator in symbol_indicators.values():
                         indicator.update(candle)
-
-                # 라이브 캔들은 여기서부터 이어져야 한다. 기준점을 세워 두면 prefeed 와 첫
-                # 라이브 캔들 사이에 생긴 구멍도 _ensure_continuity 가 잡아 백필한다 —
-                # prefeed는 페처의 레이트리밋 대기까지 포함해 수십 초가 걸릴 수 있어
-                # 실제로 벌어지는 일이다.
-                self._last_candle_start[symbol] = candles[-1].start_time
-
-                s = ms_timestamp_to_datetime(start_datetime)
-                e = ms_timestamp_to_datetime(end_datetime)
                 self.logger.info(
-                    f"[{symbol}] Pre-fed indicators with {candle_count} historical candles: {s} ~ {e}")
-                self.logger.info(f"[{symbol}] Pre-fed indicators: {generate_dict_string(symbol_indicators)}")
-
+                    f"[{symbol}] Pre-fed indicators: {generate_dict_string(symbol_indicators)}")
         except Exception as e:
             self.logger.error(f"Failed to pre-feed indicators: {e}")
             raise
+
+    async def _consume_candles(self):
+        """Producer가 내주는 마감 캔들을 처리 경로에 흘려보낸다.
+
+        한 캔들의 처리 실패가 루프를 끝내지 않는다 — 몇 주씩 사는 프로세스에서 전략의 일시적
+        버그 하나가 트레이더를 죽이면 안 된다. 스트림 자체가 끊기면(치명적 사유든 정상 종료든)
+        반복이 끝나고 트레이더를 멈춘다.
+        """
+        async for _, candles in self.producer:
+            for symbol, candle in candles.items():
+                try:
+                    await self._handle_candle(symbol, candle)
+                except Exception as e:
+                    self.logger.exception("Error processing candle: %s", e)
+                    await self._handle_error(e)
+        if self.is_running:
+            await self.stop()
 
     async def _on_action(self, action: Action):
         """Handle trading actions from streamer."""
