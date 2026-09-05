@@ -39,8 +39,7 @@ class SupertrendStreamer(BaseStreamer):
 
     def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
         st = self.indicators[symbol]["ST"]
-        line = st.get_latest()
-        direction = st.get_direction(-1)
+        line, direction = st.read_both()
         if line is None or direction is None:
             return []
 

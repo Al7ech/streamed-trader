@@ -6,14 +6,14 @@ import pandas as pd
 
 from core.backtest.status import Status
 from core.streamer.candle import Candle
-from core.streamer.indicator.base_indicator import BaseIndicator
+from core.streamer.indicator.base_indicator import NumericIndicator
 
 
-class MinDonchianIndicator(BaseIndicator):
+class MinDonchianIndicator(NumericIndicator):
     def __init__(self, window: int):
-        super().__init__(window)
+        super().__init__()
+        self.window = window
         self.min_deque = deque(maxlen=window)
-        self.values = self._new_history()
         self.cnt = 0
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
@@ -32,24 +32,18 @@ class MinDonchianIndicator(BaseIndicator):
             self.min_deque.popleft()
 
         v, _ = self.min_deque[0]
-        self.values.append(v if self.window <= idx else None)
-
-    def get_index(self, idx: int) -> Optional[float]:
-        return self._read(self.values, idx)
-
-    def get_latest(self) -> Optional[float]:
-        return self.get_index(-1)
+        self._deque.append(v if self.window <= idx else None)
 
     def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
                           close: np.ndarray, volume: np.ndarray) -> np.ndarray:
         return pd.Series(low).rolling(self.window).min().to_numpy()
 
 
-class MaxDonchianIndicator(BaseIndicator):
+class MaxDonchianIndicator(NumericIndicator):
     def __init__(self, window: int):
-        super().__init__(window)
+        super().__init__()
+        self.window = window
         self.max_deque = deque(maxlen=window)
-        self.values = self._new_history()
         self.cnt = 0
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
@@ -68,13 +62,7 @@ class MaxDonchianIndicator(BaseIndicator):
             self.max_deque.popleft()
 
         v, _ = self.max_deque[0]
-        self.values.append(v if self.window <= idx else None)
-
-    def get_index(self, idx: int) -> Optional[float]:
-        return self._read(self.values, idx)
-
-    def get_latest(self) -> Optional[float]:
-        return self.get_index(-1)
+        self._deque.append(v if self.window <= idx else None)
 
     def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
                           close: np.ndarray, volume: np.ndarray) -> np.ndarray:

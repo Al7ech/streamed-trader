@@ -43,7 +43,7 @@ from core.streamer.action import Action, ActionType
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.candle import Candle
 from core.streamer.indicator.atr import ATRIndicator
-from core.streamer.indicator.base_indicator import BaseIndicator
+from core.streamer.indicator.base_indicator import BaseIndicator, NumericIndicator
 from core.streamer.indicator.moving_average import MovingAverage
 from core.streamer.keltner_stop_streamer import KeltnerStopStreamer
 from core.streamer.keltner_streamer import KeltnerStreamer
@@ -55,20 +55,18 @@ class LoopOnlyIndicator(BaseIndicator):
     """Hides the wrapped indicator's `precompute_series` override, forcing the loop path."""
 
     def __init__(self, inner: BaseIndicator):
-        super().__init__(inner.window)
+        super().__init__()
+        self.window = inner.window
         self._inner = inner
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
         self._inner.update(candle, status)
 
-    def get_index(self, idx: int) -> Optional[float]:
-        return self._inner.get_index(idx)
-
-    def get_latest(self) -> Optional[float]:
-        return self._inner.get_latest()
+    def read(self, idx: int) -> Optional[float]:
+        return self._inner.read(idx)
 
 
-class EquityIndicator(BaseIndicator):
+class EquityIndicator(NumericIndicator):
     """매 캔들의 거래 전 시가평가 자본을 기록하는 status 의존 지표 (검사용).
 
     ``status``를 읽으므로 벡터화가 불가능하고 항상 루프 경로에 남는다. decide_action보다 먼저
@@ -78,20 +76,14 @@ class EquityIndicator(BaseIndicator):
     scale_group = "balance"
 
     def __init__(self):
-        super().__init__(1)
-        self.values = self._new_history()
+        super().__init__()
+        self.window = 1
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
         # 라이브 프리피드는 status=None으로 부른다 — 워밍업으로 취급한다.
         if status is None:
             return
-        self.values.append(status.total_margin())
-
-    def get_index(self, idx: int) -> Optional[float]:
-        return self._read(self.values, idx)
-
-    def get_latest(self) -> Optional[float]:
-        return self._read(self.values, -1)
+        self._deque.append(status.total_margin())
 
 
 class EquityGatedKeltner(KeltnerStreamer):
@@ -109,8 +101,8 @@ class EquityGatedKeltner(KeltnerStreamer):
     def decide_action(self, symbol, candle: Candle, status: Status):
         position = status.position_for(symbol).position
         if position != 0.0:
-            now = self.indicators[symbol]["EQ"].get_index(-1)
-            prev = self.indicators[symbol]["EQ"].get_index(-2)
+            now = self.indicators[symbol]["EQ"].read(-1)
+            prev = self.indicators[symbol]["EQ"].read(-2)
             if now is not None and prev is not None and now < prev:
                 return [Action(symbol, -position)]
         return super().decide_action(symbol, candle, status)
@@ -278,7 +270,7 @@ class RelativeStrengthRotationStreamer(BaseStreamer):
             return []
         scores: Dict[str, float] = {}
         for s in self.symbols:
-            ref = self.indicators[s]["close_hist"].get_index(-self.lookback)
+            ref = self.indicators[s]["close_hist"].read(-self.lookback)
             latest = status.last_close.get(s)
             if ref is None or latest is None or ref <= 0:
                 return []
@@ -632,18 +624,18 @@ def check_history_bound(candles) -> bool:
     shim.cursor = n
 
     for idx in (-1, -2, -hist + 1, -hist):
-        a, b = loop.get_index(idx), shim.get_index(idx)
+        a, b = loop.read(idx), shim.read(idx)
         if a is None or b is None or not math.isclose(a, b, rel_tol=1e-9):
-            print(f"  [history bound] FAIL: get_index({idx}) 루프={a} 배열={b}")
+            print(f"  [history bound] FAIL: read({idx}) 루프={a} 배열={b}")
             ok = False
 
     for idx in (-hist - 1, -hist - 1000):
         for name, ind in (("loop", loop), ("array", shim)):
             try:
-                ind.get_index(idx)
+                ind.read(idx)
             except IndexError:
                 continue
-            print(f"  [history bound] FAIL: {name}.get_index({idx})가 IndexError를 안 냈다")
+            print(f"  [history bound] FAIL: {name}.read({idx})가 IndexError를 안 냈다")
             ok = False
 
     print(f"[history bound] {'OK' if ok else 'MISMATCH'} — history_size={hist}, "

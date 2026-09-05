@@ -22,7 +22,8 @@ class PivotTrendlineIndicator(BaseIndicator):
     scale_group = "price"
 
     def __init__(self, window: int, mode: str = "high"):
-        super().__init__(window)
+        super().__init__()
+        self.window = window
         assert mode in ("high", "low")
         self.mode = mode
         self._vals = []                     # 봉별 high(또는 low) 전체 이력
@@ -57,7 +58,7 @@ class PivotTrendlineIndicator(BaseIndicator):
         self._p2, self._y2 = idx, val
         self.pair_id += 1
 
-    def get_index(self, idx: int) -> Optional[float]:
+    def read(self, idx: int) -> Optional[float]:
         # 경신 빈도가 낮아 과거 이력은 유지하지 않는다 — 최신값만 지원.
-        assert idx == -1, "PivotTrendlineIndicator supports only get_index(-1)"
+        assert idx == -1, "PivotTrendlineIndicator supports only read(-1)"
         return self._latest

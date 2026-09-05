@@ -6,10 +6,10 @@ import pandas as pd
 
 from core.backtest.status import Status
 from core.streamer.candle import Candle
-from core.streamer.indicator.base_indicator import BaseIndicator
+from core.streamer.indicator.base_indicator import NumericIndicator
 
 
-class VolumeMovingAverage(BaseIndicator):
+class VolumeMovingAverage(NumericIndicator):
     """
     Rolling mean of candle volume over `window` candles.
     """
@@ -17,10 +17,10 @@ class VolumeMovingAverage(BaseIndicator):
     scale_group = "volume"
 
     def __init__(self, window: int):
-        super().__init__(window)
+        super().__init__()
+        self.window = window
         self.values = deque(maxlen=window)
         self._sum = 0.0
-        self.ma_values = self._new_history()
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
         if len(self.values) == self.window:
@@ -31,17 +31,14 @@ class VolumeMovingAverage(BaseIndicator):
         # return premature indicators
         if len(self.values) < self.window:
             return
-        self.ma_values.append(self._sum / self.window)
-
-    def get_index(self, idx: int) -> Optional[float]:
-        return self._read(self.ma_values, idx)
+        self._deque.append(self._sum / self.window)
 
     def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
                           close: np.ndarray, volume: np.ndarray) -> np.ndarray:
         return pd.Series(volume).rolling(self.window).mean().to_numpy()
 
 
-class VolumeRollingStd(BaseIndicator):
+class VolumeRollingStd(NumericIndicator):
     """
     Rolling sample standard deviation (ddof=1) of candle volume over `window` candles.
     """
@@ -53,9 +50,9 @@ class VolumeRollingStd(BaseIndicator):
             # RollingStd와 같은 이유 — 표본 1개의 ddof=1 표준편차는 NaN이다.
             raise ValueError(
                 f"VolumeRollingStd(window={window}): 표본표준편차는 window >= 2 가 필요하다.")
-        super().__init__(window)
+        super().__init__()
+        self.window = window
         self.values = deque(maxlen=window)
-        self.std_values = self._new_history()
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
         self.values.append(candle.volume)
@@ -63,10 +60,7 @@ class VolumeRollingStd(BaseIndicator):
         # return premature indicators
         if len(self.values) < self.window:
             return
-        self.std_values.append(float(np.std(self.values, ddof=1)))
-
-    def get_index(self, idx: int) -> Optional[float]:
-        return self._read(self.std_values, idx)
+        self._deque.append(float(np.std(self.values, ddof=1)))
 
     def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
                           close: np.ndarray, volume: np.ndarray) -> np.ndarray:

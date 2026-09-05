@@ -3,10 +3,10 @@ from typing import Optional
 
 from core.backtest.status import Status
 from core.streamer.candle import Candle
-from core.streamer.indicator.base_indicator import BaseIndicator
+from core.streamer.indicator.base_indicator import NumericIndicator
 
 
-class TakerImbalanceIndicator(BaseIndicator):
+class TakerImbalanceIndicator(NumericIndicator):
     """
     롤링 윈도우의 taker 매수/매도 임밸런스: (2·Σtaker_buy − Σvolume) / Σvolume ∈ [−1, 1].
 
@@ -19,14 +19,14 @@ class TakerImbalanceIndicator(BaseIndicator):
     scale_group = "taker_imbalance"
 
     def __init__(self, window: int):
-        super().__init__(window)
+        super().__init__()
+        self.window = window
         self._buy = deque(maxlen=window)
         self._vol = deque(maxlen=window)
         self._buy_sum = 0.0
         self._vol_sum = 0.0
         self._missing = deque(maxlen=window)
         self._missing_count = 0
-        self._values = self._new_history()
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
         if len(self._buy) == self.window:
@@ -45,9 +45,6 @@ class TakerImbalanceIndicator(BaseIndicator):
         if len(self._buy) < self.window:
             return
         if self._missing_count > 0 or self._vol_sum <= 0:
-            self._values.append(None)
+            self._deque.append(None)
             return
-        self._values.append((2.0 * self._buy_sum - self._vol_sum) / self._vol_sum)
-
-    def get_index(self, idx: int) -> Optional[float]:
-        return self._read(self._values, idx)
+        self._deque.append((2.0 * self._buy_sum - self._vol_sum) / self._vol_sum)

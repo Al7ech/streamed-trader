@@ -3,24 +3,25 @@ from typing import Optional
 
 from core.backtest.status import Status
 from core.streamer.candle import Candle
-from core.streamer.indicator.base_indicator import BaseIndicator
+from core.streamer.indicator.base_indicator import NumericIndicator
 
 
-class ADXIndicator(BaseIndicator):
+class ADXIndicator(NumericIndicator):
     """
     표준 Wilder ADX (Average Directional Index), 0~100.
 
     +DM/-DM과 TR을 Wilder smoothing(초기 n개 단순평균 시드 후 재귀)으로 평활,
     DI+/DI- -> DX -> DX의 Wilder smoothing = ADX.
 
-    Wilder 재귀는 경로 의존이라 벡터화하지 않는다(plain BaseIndicator,
+    Wilder 재귀는 경로 의존이라 벡터화하지 않는다(plain NumericIndicator,
     FastBacktester 루프 경로 — Supertrend와 동일 전례). 워밍업은 약 2*window 캔들.
     """
 
     scale_group = "adx"
 
     def __init__(self, window: int):
-        super().__init__(window)
+        super().__init__()
+        self.window = window
         self._prev_high: Optional[float] = None
         self._prev_low: Optional[float] = None
         self._prev_close: Optional[float] = None
@@ -35,8 +36,6 @@ class ADXIndicator(BaseIndicator):
         self._pdm_s: Optional[float] = None
         self._ndm_s: Optional[float] = None
         self._adx: Optional[float] = None
-
-        self._adx_values = self._new_history()
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
         h, l, c = candle.high, candle.low, candle.close
@@ -81,7 +80,4 @@ class ADXIndicator(BaseIndicator):
         else:
             self._adx = (self._adx * (n - 1) + dx) / n
 
-        self._adx_values.append(self._adx)
-
-    def get_index(self, idx: int) -> Optional[float]:
-        return self._read(self._adx_values, idx)
+        self._deque.append(self._adx)

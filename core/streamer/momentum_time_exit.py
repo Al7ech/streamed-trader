@@ -19,8 +19,8 @@ class MomentumTimeExitStreamer(BaseStreamer):
     - 사이징: 스탑 거리(threshold%)에서의 손실이 max_loss가 되도록 레버리지 설정, 6x 캡
 
     "close_hist"는 MovingAverage(1)을 종가 시계열로 재사용한 것. 인디케이터는 decide_action
-    이전에 업데이트되므로 get_index(-1)이 현재 캔들 종가다 — "N캔들 전 종가, 현재 캔들 제외"는
-    get_index(-N-1)로 읽는다.
+    이전에 업데이트되므로 read(-1)이 현재 캔들 종가다 — "N캔들 전 종가, 현재 캔들 제외"는
+    read(-N-1)로 읽는다.
     """
 
     def __init__(self, symbol: str,
@@ -31,12 +31,12 @@ class MomentumTimeExitStreamer(BaseStreamer):
                  fee_ratio: float = 0.0004,
                  use_stop: bool = True):
         if mom_lookback < 1:
-            # 0이면 get_index(-mom_lookback-1) == get_index(-1) 이 되어 "N캔들 전 제외" 라는
+            # 0이면 read(-mom_lookback-1) == read(-1) 이 되어 "N캔들 전 제외" 라는
             # 정의 자체가 무너진다.
             raise ValueError(f"MomentumTimeExitStreamer(mom_lookback={mom_lookback}): 1 이상이어야 한다.")
         super().__init__([symbol], {symbol: {
-            # get_index(-mom_lookback-1)로 읽으므로 조회 깊이가 파라미터에 걸린다.
-            # 기본 이력(BaseIndicator.history_size)을 넘는 lookback을 줘도 깨지지 않게 맞춰 둔다.
+            # read(-mom_lookback-1)로 읽으므로 조회 깊이가 파라미터에 걸린다.
+            # 기본 이력(NumericIndicator.history_size)을 넘는 lookback을 줘도 깨지지 않게 맞춰 둔다.
             "close_hist": MovingAverage(
                 1, history_size=max(MovingAverage.history_size, mom_lookback + 2)),
         }})
@@ -74,7 +74,7 @@ class MomentumTimeExitStreamer(BaseStreamer):
                 return [Action(symbol, -position)]
             return []
 
-        ref = self.indicators[symbol]["close_hist"].get_index(-self.mom_lookback - 1)
+        ref = self.indicators[symbol]["close_hist"].read(-self.mom_lookback - 1)
         if ref is None:
             return []
 

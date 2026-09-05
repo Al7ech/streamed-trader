@@ -35,8 +35,8 @@ class CrossMovingAverageStreamer(BaseStreamer):
         ind = self.indicators[symbol]
         ma10 = ind["ma10"].get_latest()
         ma25 = ind["ma25"].get_latest()
-        prev_ma10 = ind["ma10"].get_index(-2)
-        prev_ma25 = ind["ma25"].get_index(-2)
+        prev_ma10 = ind["ma10"].read(-2)
+        prev_ma25 = ind["ma25"].read(-2)
 
         # 워밍업 중에는 지표가 None이다 (MA25 기준 25봉 + 이전 값 1봉).
         if prev_ma10 is None or prev_ma25 is None or ma10 is None or ma25 is None:

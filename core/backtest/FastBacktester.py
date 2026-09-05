@@ -35,31 +35,25 @@ class ArrayIndicator(BaseIndicator):
     """
 
     def __init__(self, seq: np.ndarray, window: int, history_size: int):
-        super().__init__(window, history_size=history_size)
+        self.window = window
+        self.history_size = history_size
         self.seq = seq
         self.cursor = 0
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
         self.cursor += 1
 
-    def get_index(self, idx: int) -> Optional[float]:
+    def read(self, idx: int) -> Optional[float]:
         if idx >= 0:
             # 여기서 막지 않으면 seq[cursor] = 아직 반영되지 않은 캔들의 값이 나온다 (룩어헤드).
             raise IndexError(
-                f"ArrayIndicator.get_index({idx}): 인덱스는 음수여야 한다 "
+                f"ArrayIndicator.read({idx}): 인덱스는 음수여야 한다 "
                 f"(-1 = 최신, -2 = 직전).")
         if idx < -self.history_size:
             raise IndexError(
-                f"ArrayIndicator.get_index({idx}): 보관 이력 {self.history_size}개를 넘는 "
+                f"ArrayIndicator.read({idx}): 보관 이력 {self.history_size}개를 넘는 "
                 f"조회다. 지표 생성자에 history_size를 키워 넘겨라.")
         i = self.cursor + idx  # idx is negative (-1 = latest)
-        if i < 0:
-            return None
-        v = self.seq[i]
-        return None if v != v else v
-
-    def get_latest(self) -> Optional[float]:
-        i = self.cursor - 1
         if i < 0:
             return None
         v = self.seq[i]

@@ -6,10 +6,10 @@ import pandas as pd
 
 from core.backtest.status import Status
 from core.streamer.candle import Candle
-from core.streamer.indicator.base_indicator import BaseIndicator
+from core.streamer.indicator.base_indicator import NumericIndicator
 
 
-class ATRIndicator(BaseIndicator):
+class ATRIndicator(NumericIndicator):
     """
     Simple (non-Wilder) moving average of True Range over `window` candles.
     True Range = max(high-low, |high-prev_close|, |low-prev_close|).
@@ -18,11 +18,11 @@ class ATRIndicator(BaseIndicator):
     scale_group = "atr"
 
     def __init__(self, window: int, history_size: Optional[int] = None):
-        # ATR 기울기를 보는 전략(RyulStreamer_edit2)이 get_index(-1-lookback)으로 읽어
+        # ATR 기울기를 보는 전략(RyulStreamer_edit2)이 read(-1-lookback)으로 읽어
         # 조회 깊이가 파라미터에 걸린다. 그래서 이 지표도 history_size를 열어 둔다.
-        super().__init__(window, history_size=history_size)
+        super().__init__(history_size=history_size)
+        self.window = window
         self._tr_values = deque(maxlen=window)
-        self._atr_values = self._new_history()
         self._sum = 0.0
         self._prev_close: Optional[float] = None
 
@@ -44,10 +44,7 @@ class ATRIndicator(BaseIndicator):
 
         if len(self._tr_values) < self.window:
             return
-        self._atr_values.append(self._sum / self.window)
-
-    def get_index(self, idx: int) -> Optional[float]:
-        return self._read(self._atr_values, idx)
+        self._deque.append(self._sum / self.window)
 
     def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
                           close: np.ndarray, volume: np.ndarray) -> np.ndarray:

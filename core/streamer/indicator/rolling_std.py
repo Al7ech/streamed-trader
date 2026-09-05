@@ -6,10 +6,10 @@ import pandas as pd
 
 from core.backtest.status import Status
 from core.streamer.candle import Candle
-from core.streamer.indicator.base_indicator import BaseIndicator
+from core.streamer.indicator.base_indicator import NumericIndicator
 
 
-class RollingStd(BaseIndicator):
+class RollingStd(NumericIndicator):
     """
     Rolling sample standard deviation (ddof=1) of close over `window` candles.
     """
@@ -21,9 +21,9 @@ class RollingStd(BaseIndicator):
             # 표본 1개짜리 ddof=1 표준편차는 NaN이다. 조용히 NaN을 흘리면
             # `std is None or std <= 0` 류의 가드를 전부 통과해 사이징/스탑까지 오염된다.
             raise ValueError(f"RollingStd(window={window}): 표본표준편차는 window >= 2 가 필요하다.")
-        super().__init__(window)
+        super().__init__()
+        self.window = window
         self.values = deque(maxlen=window)
-        self.std_values = self._new_history()
 
     def update(self, candle: Candle, status: Optional[Status] = None) -> None:
         self.values.append(candle.close)
@@ -32,10 +32,7 @@ class RollingStd(BaseIndicator):
         if len(self.values) < self.window:
             return
 
-        self.std_values.append(float(np.std(self.values, ddof=1)))
-
-    def get_index(self, idx: int) -> Optional[float]:
-        return self._read(self.std_values, idx)
+        self._deque.append(float(np.std(self.values, ddof=1)))
 
     def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
                           close: np.ndarray, volume: np.ndarray) -> np.ndarray:
