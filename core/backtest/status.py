@@ -1,5 +1,8 @@
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:  # 런타임 임포트는 순환을 만든다 (order_book이 Status를 쓴다)
+    from core.backtest.order_book import OpenOrder
 
 
 @dataclass
@@ -15,17 +18,35 @@ class Status:
                  margin: float = 0.0,
                  positions: Optional[Dict[str, PositionState]] = None,
                  leverage: float = 0.0,
-                 last_close: Optional[Dict[str, float]] = None):
+                 last_close: Optional[Dict[str, float]] = None,
+                 open_orders: Optional[Dict[str, List["OpenOrder"]]] = None):
         self.margin = margin
         self.positions: Dict[str, PositionState] = positions if positions is not None else {}
         self.leverage = leverage
         #: 심볼별 최근 알려진 종가. 엔진이 매 이벤트마다 갱신한다 — 트리거 심볼이 아닌
         #: 다른 심볼을 대상으로 하는 Action의 체결가/시가평가에 쓰인다.
         self.last_close: Dict[str, float] = last_close if last_close is not None else {}
+        #: 심볼별 미체결(resting) 주문. 거래소에서 미체결 주문은 실제로 계좌 상태의 일부이고,
+        #: Status는 백테스터와 라이브 트레이더가 공유하는 단일 계좌 상태 표현이므로 여기 둔다.
+        #: 덕분에 decide_action(symbol, candle, status) 시그니처를 바꾸지 않고도 전략이 자기
+        #: 미체결 주문을 읽고 취소할 수 있다. 리스트 순서 = 제출 순서.
+        self.open_orders: Dict[str, List["OpenOrder"]] = \
+            open_orders if open_orders is not None else {}
 
     def position_for(self, symbol: str) -> PositionState:
         """해당 심볼의 PositionState. 처음 보는 심볼이면 flat 상태로 만들어 등록한다."""
         return self.positions.setdefault(symbol, PositionState())
+
+    def open_orders_for(self, symbol: str) -> List["OpenOrder"]:
+        """해당 심볼의 미체결 주문 리스트. 처음 보는 심볼이면 빈 리스트를 만들어 등록한다.
+
+        반환된 리스트는 살아 있는 참조다 — 전략은 **읽기만** 해야 하고, 취소는
+        ``Action.cancel(symbol, client_id)``로 해야 세 엔진이 같은 의미를 갖는다.
+        """
+        return self.open_orders.setdefault(symbol, [])
+
+    def total_open_orders(self) -> int:
+        return sum(len(v) for v in self.open_orders.values())
 
     def total_margin(self) -> float:
         return self.margin + sum(p.unrealised_pnl for p in self.positions.values())
@@ -124,4 +145,7 @@ class Status:
         positions = ", ".join(f"{sym}: [avg_price: {p.avg_price}, position: {p.position}, "
                               f"unrealised_pnl: {p.unrealised_pnl}]"
                               for sym, p in self.positions.items())
-        return f"[margin: {self.margin}, leverage: {self.leverage}, positions: {{{positions}}}]"
+        resting = self.total_open_orders()
+        orders = f", open_orders: {resting}" if resting else ""
+        return (f"[margin: {self.margin}, leverage: {self.leverage}, "
+                f"positions: {{{positions}}}{orders}]")

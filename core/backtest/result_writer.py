@@ -37,8 +37,13 @@ from core.backtest.report import Report
 #    v1-v3 샤드의 평평한 ohlc/indicators 모양은 그대로 두고 건드리지 않는다 — 심볼 N개를
 #    평평한 ohlc dict 하나에 욱여넣으면 어느 심볼의 close인지 알 수 없어져 addition이 아니라
 #    네임스페이스 충돌이 되기 때문이다. summary에 by_symbol(심볼별 승패 집계)도 추가됐다.
-# 모두 순수 additive — 프론트는 없는 블록의 UI를 숨기고 키를 골라 읽으므로 구 런도 그대로 로드된다.
-SCHEMA_VERSION = 4
+# 5: 지정가/조건부 주문 — trades[]에 "order_type"(ActionType의 값)과 "submitted_at"(주문이
+#    제출된 시각) 추가. MARKET은 submitted_at == timestamp지만, 지정가/조건부 주문은 몇 봉
+#    전에 제출돼 나중에 체결되므로 timestamp 하나로는 결정 시점과 체결 시점을 함께 담을 수
+#    없다. 샤드 모양은 v4 그대로다.
+# v2-v3, v5는 순수 additive — 프론트는 없는 블록의 UI를 숨기고 키를 골라 읽으므로 구 런도
+# 그대로 로드된다 (v4만 샤드의 물리적 모양을 바꿨다).
+SCHEMA_VERSION = 5
 
 # Columns whose empty/warm-up value should be stored as JSON null.
 _OHLC_KEYS = ("open", "high", "low", "close")
@@ -439,6 +444,10 @@ def write_run_json(dir_path: str, run_id: str, report: Report, metadata: Dict,
             # 재기동 후 자기 run JSON에서 Trade를 복원할 때 이게 없으면 집계가 무너진다.
             "position": t.status.position_for(t.symbol).position,
             "leverage": t.leverage,
+            # 이 체결을 낳은 주문 종류와 그 주문이 제출된 시각. 지정가/조건부 주문은 둘이
+            # 갈라진다 — "이 청산은 손절 체결이었다"를 사후에 구분하려면 필요하다.
+            "order_type": t.order_type,
+            "submitted_at": t.submitted_at,
         }
         for t in report.trades
     ]

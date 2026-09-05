@@ -23,6 +23,7 @@ import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
+from core.backtest import order_book
 from core.backtest.indicator_columns import collect_indicator_columns
 from core.backtest.metrics import build_multi_symbol_buy_and_hold_curve
 from core.backtest.report import Report
@@ -151,8 +152,15 @@ class LiveRecorder:
         self._candles_since_shard_flush += 1
 
     def record_trade(self, symbol: str, timestamp: int, quantity: float, price: float,
-                     wnl: float, fee: float, pre_status: Status, leverage: float) -> None:
-        """체결 하나를 적재한다. ``pre_status``는 **거래 전** 스냅샷이어야 한다."""
+                     wnl: float, fee: float, pre_status: Status, leverage: float,
+                     order_type: str = "MARKET",
+                     submitted_at: Optional[int] = None) -> None:
+        """체결 하나를 적재한다. ``pre_status``는 **거래 전** 스냅샷이어야 한다.
+
+        :param order_type: 이 체결을 낳은 주문 종류 (``ActionType``의 값).
+        :param submitted_at: 그 주문이 제출된 시각(ms). None이면 ``timestamp``와 같다고 본다 —
+            MARKET은 결정과 체결이 같은 캔들이지만, 지정가/조건부 주문은 몇 봉 전이다.
+        """
         self._max_leverage = max(self._max_leverage, leverage)
         self._trades.append(Trade(
             timestamp=timestamp,
@@ -163,6 +171,8 @@ class LiveRecorder:
             fee=fee,
             status=pre_status,
             leverage=leverage,
+            order_type=order_type,
+            submitted_at=submitted_at if submitted_at is not None else timestamp,
         ))
 
     # ------------------------------------------------------------------ 영속화
@@ -274,9 +284,14 @@ class LiveRecorder:
                                    unrealised_pnl=float(p.get("unrealised_pnl", 0.0)))
                 for sym, p in (saved_status.get("positions") or {}).items()
             }
-            self.resumed_status = Status(margin=float(saved_status.get("margin", 0.0)),
-                                         positions=positions,
-                                         leverage=float(saved_status.get("leverage", 0.0)))
+            self.resumed_status = Status(
+                margin=float(saved_status.get("margin", 0.0)),
+                positions=positions,
+                leverage=float(saved_status.get("leverage", 0.0)),
+                # 드라이런은 이 장부가 유일한 사본이다. 복원하지 않으면 재기동할 때마다
+                # 걸어둔 손절이 사라진다. 라이브에서는 거래소 장부와 대조하는 데 쓴다
+                # (BinanceTrader._reconcile_resumed_orders).
+                open_orders=order_book.deserialize(saved_status.get("open_orders")))
 
         shards = series.get("shards") or []
         self._restore_curves(shards)
@@ -317,6 +332,8 @@ class LiveRecorder:
                 status=Status(margin=float(d.get("margin", 0.0)),
                               positions={symbol: PositionState(position=float(d.get("position", 0.0)))}),
                 leverage=float(d.get("leverage", 0.0)),
+                order_type=d.get("order_type", "MARKET"),
+                submitted_at=d.get("submitted_at"),
             ))
         return trades
 
@@ -362,6 +379,8 @@ class LiveRecorder:
         meta["candle_count"] = len(self._equity)
         # 계좌 상태를 같이 남긴다. 드라이런은 합성 자본이라 재기동하면 초기값으로 돌아가는데,
         # 자본 곡선은 이어붙으므로 복원하지 않으면 재기동 지점에서 곡선이 튄다.
+        # 미체결 주문도 같이 남긴다. 드라이런은 장부가 프로세스 안에만 있어서, 이게 없으면
+        # 재기동할 때마다 걸어둔 손절이 조용히 사라진다 (라이브는 거래소가 들고 있다).
         meta["last_status"] = {
             "margin": self._status.margin,
             "leverage": self._status.leverage,
@@ -370,6 +389,7 @@ class LiveRecorder:
                      "unrealised_pnl": p.unrealised_pnl}
                 for sym, p in self._status.positions.items()
             },
+            "open_orders": order_book.serialize(self._status.open_orders),
         }
         if self._equity:
             meta.setdefault("start", _iso(self._equity[0][0]))

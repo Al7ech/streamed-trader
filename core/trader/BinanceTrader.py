@@ -17,9 +17,11 @@ from binance import AsyncClient, BinanceSocketManager
 from binance.enums import ContractType
 from binance.exceptions import BinanceAPIException, BinanceWebsocketClosed
 
+from core.backtest import order_book
+from core.backtest.order_book import OpenOrder
 from core.backtest.status import Status
 from core.binance_candle_fetcher.fetcher import BinanceCandleFetcher
-from core.streamer.action import Action
+from core.streamer.action import Action, ActionType
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.candle import Candle
 from core.trader.BinanceExecutor import BinanceExecutor
@@ -41,15 +43,26 @@ _TERMINAL_ORDER_STATES = ("FILLED", "CANCELED", "EXPIRED", "REJECTED")
 #: 기록/로그 대상이 되는 상태. 종결 상태 + 진행 중인 부분 체결.
 _TRACKED_ORDER_STATES = _TERMINAL_ORDER_STATES + ("PARTIALLY_FILLED",)
 
+#: 거래소가 주문을 접수했다고 알리는 상태. 지정가/조건부 주문은 여기서부터 **미체결 상태로
+#: 살아 있으므로**, 이 이벤트로 status.open_orders에 등록한다 (시장가는 곧바로 체결돼
+#: 종결되므로 사실상 지나가는 상태다).
+_ACK_ORDER_STATE = "NEW"
+
 #: 결정 수량과 실제 체결 수량의 상대 차이가 이 값을 넘으면 경고한다.
 #: ``BinanceExecutor.execute_action``은 거래소의 step size로 양자화하지 않으므로 약간의
 #: 차이는 정상이고 문서화돼 있다. 다만 "약간"이 얼마인지는 아무도 보지 않고 있었다.
 _QUANTITY_DIVERGENCE_TOLERANCE = 0.01
 
-#: 진행 중인 주문 집계를 들고 있을 최대 개수. 현재 실행기는 MARKET 주문만 내므로 즉시
-#: 종결되고 사실상 1을 넘지 않는다. 다만 종결 이벤트를 놓치면 항목이 영영 남는데, 이 프로세스는
-#: 몇 주씩 사는 게 정상이라 상한을 둬서 무한히 쌓이지 않게 한다.
-_MAX_OPEN_ORDER_AGGREGATES = 32
+#: 진행 중인 주문 집계를 들고 있을 최대 개수. 지정가/조건부 주문이 생기면서 한 심볼에
+#: 여러 주문이 동시에 미체결로 살 수 있게 됐으므로 (예전 주석의 "MARKET만 내므로 1을 넘지
+#: 않는다"는 더 이상 사실이 아니다), 심볼 수 × 심볼당 장부 상한을 감당할 만큼 넉넉히 잡는다.
+#: 종결 이벤트를 놓치면 항목이 영영 남는데, 이 프로세스는 몇 주씩 사는 게 정상이라 상한을
+#: 둬서 무한히 쌓이지 않게 한다.
+_MAX_OPEN_ORDER_AGGREGATES = 256
+
+#: 체결을 기다리는 결정 스냅샷의 최대 개수. 미체결 주문은 몇 봉에서 몇 시간까지 살 수
+#: 있으므로 캔들 단위로 비울 수 없고 (아래 _PendingDecision.resting 참고), 대신 상한을 둔다.
+_MAX_PENDING_DECISIONS = 256
 
 #: 백필로 메울 수 있는 최대 캔들 수. 이걸 넘으면 메우지 않고 stop() 해서 재기동에 맡긴다.
 #: 두 가지를 한꺼번에 묶는 값이다: (a) 백필 재생은 캔들마다 주문 실행을 await 하므로 재생이
@@ -67,10 +80,19 @@ class _PendingDecision:
     체결 이벤트(ORDER_TRADE_UPDATE)에는 **거래 전 Status**가 없다. ACCOUNT_UPDATE가 먼저
     도착해 self.status를 이미 갈아엎었을 수 있어서 그 시점에 스냅샷을 떠도 늦다. 그래서
     주문을 내보내기 직전의 상태를 여기 보관한다.
+
+    키는 **client order id**다. 예전에는 심볼이었는데, 그러면 심볼당 in-flight 결정이 하나로
+    제한되고 무엇보다 지정가/조건부 주문을 짝지을 수 없다 — 그 주문은 몇 봉 뒤에 체결되는데
+    심볼 키 방식은 다음 캔들에서 스냅샷을 버렸다.
     """
     timestamp: int
     quantity: float
     pre_status: Status
+    symbol: str = ""
+    order_type: str = "MARKET"
+    #: 장부에 남는 주문인가. 시장가 결정은 그 캔들 안에 결과가 나와야 하므로 다음 캔들에
+    #: 버려지지만, 미체결 주문은 종결 이벤트가 올 때까지 살아 있어야 한다.
+    resting: bool = False
 
 
 @dataclass
@@ -165,6 +187,11 @@ class BinanceTrader:
             self.fee_ratio = streamer_fee
         else:
             self.fee_ratio = DEFAULT_FEE_RATIO
+        #: 드라이런에서 조건부 시장가 체결에 얹을 슬리피지. 백테스터와 같은 규칙으로
+        #: 스트리머에서 읽는다. 라이브는 실제 체결가가 오므로 쓰이지 않는다.
+        self.slippage_ratio = getattr(streamer, "slippage_ratio", None) or 0.0
+        #: 드라이런 장부의 주문 제출 순서 (백테스터의 같은 이름 필드와 같은 역할).
+        self._order_seq = 0
 
         # WebSocket and client instances
         self.client: Optional[AsyncClient] = None
@@ -195,8 +222,13 @@ class BinanceTrader:
         self.run_metadata = run_metadata or {}
         self.shard_flush_every = shard_flush_every
         self.recorder: Optional[LiveRecorder] = None
-        self._pending_decision: Dict[str, _PendingDecision] = {}
+        # 키는 (심볼, client order id). 심볼만으로는 심볼당 in-flight 결정이 하나로 제한되고,
+        # 무엇보다 몇 봉 뒤에 체결되는 미체결 주문을 짝지을 수 없다.
+        self._pending_decision: Dict[Tuple[str, str], _PendingDecision] = {}
         self._order_agg: Dict[Tuple[str, int], _OrderAggregate] = {}
+        #: 시장가 주문에 붙일 client order id의 일련번호. 지정가/조건부는 전략이 지은
+        #: client_id를 그대로 쓴다 (그래야 전략이 나중에 그 id로 취소할 수 있다).
+        self._client_order_seq = 0
         self._warned_fee_asset = False
 
         # Callbacks
@@ -224,6 +256,10 @@ class BinanceTrader:
             # 2. Load futures wallet status and apply to status object
             if not self.dry_run:
                 await self._load_futures_wallet_status()
+                # 거래소에 살아 있는 미체결 주문을 장부로 끌어온다. 프로세스가 죽어 있어도
+                # 걸어둔 손절은 거래소에서 계속 살아 있으므로, 이걸 안 하면 전략이 "손절이
+                # 없다"고 보고 하나 더 걸어 이중으로 청산된다.
+                await self._load_open_orders()
 
             # 3. Pre-feed indicators with historical candle data.
             #    소켓을 열기 **전에** 한다 — 이 작업은 수십 초가 걸릴 수 있는데, 그동안
@@ -234,6 +270,7 @@ class BinanceTrader:
             #      소켓을 열기(5) 전이어야 recorder가 None인 채로 캔들이 들어오지 않는다.
             self._setup_recorder()
             self._reconcile_resumed_position()
+            self._reconcile_resumed_orders()
 
             # 4. 리스너 태스크 생성 전에 플래그를 세운다. 리스너 루프가 `while self.is_running`
             #    으로 시작하므로, 나중에 세우면 첫 await에서 태스크가 곧바로 빠져나간다.
@@ -249,9 +286,10 @@ class BinanceTrader:
             # 매매를 안 하면 로그만 보고 실제 돈이 걸려 있는지 판단할 방법이 없었다.
             self.logger.info(
                 "BinanceTrader started: mode=%s symbols=%s interval=%s testnet=%s "
-                "streamer=%s fee_ratio=%s record=%s run_id=%s",
+                "streamer=%s fee_ratio=%s slippage_ratio=%s open_orders=%d record=%s run_id=%s",
                 "DRY-RUN" if self.dry_run else "LIVE", self.symbols, self.interval,
                 self.testnet, type(self.streamer).__name__, self.fee_ratio,
+                self.slippage_ratio, self.status.total_open_orders(),
                 bool(self.recorder), self.recorder.run_id if self.recorder else None)
 
         except Exception as e:
@@ -309,7 +347,116 @@ class BinanceTrader:
             pos.position = saved_pos.position
         self.status.margin = saved.margin
         self.status.leverage = saved.leverage
+        # 미체결 주문도 되살린다. 드라이런의 장부는 이 프로세스 안에만 있어서, 복원하지
+        # 않으면 재기동할 때마다 걸어둔 손절이 조용히 사라진다.
+        self.status.open_orders = copy.deepcopy(saved.open_orders)
         self.logger.info(f"[dry-run] 이전 런의 계좌 상태를 복원했다: {self.status}")
+        if self.status.total_open_orders():
+            self.logger.info("[dry-run] 미체결 주문 %d건을 복원했다",
+                             self.status.total_open_orders())
+
+    def _new_client_order_id(self) -> str:
+        """시장가 주문에 붙일 client order id. 체결 이벤트를 그 결정과 정확히 짝짓는 데 쓴다.
+
+        예전에는 심볼만으로 짝지어서, 한 심볼에 결정이 둘 이상 떠 있으면 뒤엣것이 앞엣것을
+        덮어썼다. 거래소 규격(``^[.A-Z:/a-z0-9_-]{1,36}$``)을 넘지 않는 짧은 형태로 만든다.
+        """
+        self._client_order_seq += 1
+        return f"st-{self._client_order_seq}"
+
+    async def _load_open_orders(self):
+        """거래소의 미체결 주문을 ``status.open_orders``로 끌어온다 — **라이브 전용**."""
+        try:
+            raw = await self.client.futures_get_open_orders()
+        except Exception as e:
+            # 치명적이지 않다 — 장부가 비어 보일 뿐이고, 이후 ORDER_TRADE_UPDATE로 채워진다.
+            # 다만 그 사이 전략이 손절을 중복으로 걸 수 있으므로 조용히 넘기면 안 된다.
+            self.logger.error("미체결 주문을 불러오지 못했다: %s", e, exc_info=True)
+            return
+
+        self.status.open_orders = {}
+        loaded = 0
+        for o in raw:
+            symbol = o.get("symbol", "")
+            if symbol not in self._symbol_set:
+                continue
+            order = self._order_from_exchange(o)
+            if order is None:
+                continue
+            self.status.open_orders_for(symbol).append(order)
+            loaded += 1
+        if loaded:
+            self.logger.info("거래소의 미체결 주문 %d건을 불러왔다: %s", loaded,
+                             {s: len(v) for s, v in self.status.open_orders.items() if v})
+
+    def _order_from_exchange(self, o: Dict) -> Optional[OpenOrder]:
+        """거래소 주문 표현(REST의 open order, 또는 ORDER_TRADE_UPDATE의 ``o``)을 OpenOrder로.
+
+        REST와 스트림이 필드 이름을 다르게 쓰므로 (``origQty``/``q``, ``type``/``o`` …) 둘 다
+        받는다. 이 엔진이 모르는 주문 타입(트레일링 스탑 등, 사람이 앱에서 낸 것)은 None을
+        돌려 장부에 넣지 않는다 — 체결 판정 규칙이 없는 주문을 들고 있어봐야 오해만 낳는다.
+        """
+        raw_type = o.get("type") or o.get("o") or ""
+        if raw_type in ("LIMIT", "STOP", "TAKE_PROFIT"):
+            order_type = ActionType.LIMIT
+        elif raw_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            order_type = ActionType.STOP_MARKET
+        else:
+            return None
+
+        side = o.get("side") or o.get("S") or ""
+        try:
+            qty = float(o.get("origQty", o.get("q", 0.0)) or 0.0)
+            price = float(o.get("price", o.get("p", 0.0)) or 0.0)
+            trigger = float(o.get("stopPrice", o.get("sp", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if qty <= 0:
+            return None
+
+        quantity = -qty if side == "SELL" else qty
+        reference = self.status.last_close.get(o.get("symbol") or o.get("s") or "")
+        trigger_above = trigger >= reference if (reference and trigger) else quantity > 0
+        return OpenOrder(
+            symbol=o.get("symbol") or o.get("s") or "",
+            quantity=quantity,
+            order_type=order_type,
+            price=price or None,
+            trigger_price=trigger or None,
+            trigger_above=bool(trigger_above),
+            reduce_only=bool(o.get("reduceOnly", o.get("R", False))),
+            client_id=o.get("clientOrderId") or o.get("c") or None,
+            created_at=int(o.get("time", o.get("T", 0)) or 0),
+            exchange_order_id=str(o.get("orderId", o.get("i", "")) or ""),
+        )
+
+    def _reconcile_resumed_orders(self):
+        """재개한 런이 기억하는 미체결 주문과 거래소의 실제 장부를 대조한다 — **라이브 전용**.
+
+        포지션 대조(``_reconcile_resumed_position``)와 같은 이유이고, 오히려 더 중요하다:
+        프로세스가 죽어 있는 동안에도 거래소에 걸어둔 손절 주문은 **계속 살아 있고 체결될 수
+        있다**. 저장된 장부에는 있는데 거래소에 없다면 그 사이 체결됐거나 취소된 것이고,
+        거래소에만 있다면 이 프로세스가 모르는 주문이 자기 포지션을 건드릴 수 있다.
+
+        되살리지는 않는다 — 라이브에서는 거래소가 정답이고 ``status.open_orders``는 이미
+        거래소 값이다 (``_load_open_orders``).
+        """
+        if self.dry_run or not self.recorder or not self.recorder.resumed_status:
+            return
+        saved = {(o.symbol, o.client_id) for book in
+                 self.recorder.resumed_status.open_orders.values() for o in book}
+        actual = {(o.symbol, o.client_id) for book in self.status.open_orders.values()
+                  for o in book}
+        gone = saved - actual
+        unknown = actual - saved
+        if not gone and not unknown:
+            if actual:
+                self.logger.info("재개한 런의 미체결 주문이 거래소와 일치한다 (%d건)", len(actual))
+            return
+        self.logger.warning(
+            "재개한 런의 미체결 주문이 거래소와 다르다 — 저장됐지만 거래소에 없음: %s / "
+            "거래소에만 있음: %s. 멈춰 있는 동안 체결·취소됐거나 이 프로세스가 모르는 주문이다. "
+            "거래소 값으로 계속한다", sorted(gone) or "없음", sorted(unknown) or "없음")
 
     def _reconcile_resumed_position(self):
         """재개한 런이 기억하는 포지션과 거래소의 실제 포지션을 대조한다 — **라이브 전용**.
@@ -582,6 +729,50 @@ class BinanceTrader:
                     f"{ms_timestamp_to_datetime(want)}")
         return candles
 
+    def _remember_decision(self, pending: _PendingDecision, symbol: str,
+                           client_order_id: str) -> None:
+        """체결 이벤트와 짝지을 거래 전 스냅샷을 보관한다.
+
+        미체결 주문은 몇 시간씩 살 수 있어서 캔들 단위로 비울 수 없으므로, 대신 상한을 두고
+        가장 오래된 것부터 버린다 (``_order_agg``와 같은 정책).
+        """
+        if len(self._pending_decision) >= _MAX_PENDING_DECISIONS:
+            stale = next(iter(self._pending_decision))
+            self.logger.warning(f"짝지어지지 않은 결정을 버린다: {stale}")
+            self._pending_decision.pop(stale, None)
+        self._pending_decision[(symbol, client_order_id)] = pending
+
+    def _match_dry_run_orders(self, symbol: str, candle: Candle) -> bool:
+        """드라이런에서 미체결 주문을 이 캔들로 체결시킨다. 체결이 있었으면 True.
+
+        백테스터의 ``_match_resting_orders``와 **같은** ``order_book`` 코드를 쓴다 — 드라이런은
+        백테스트와 대조하기 위해 존재하므로 체결 규칙이 갈라지면 기능 자체가 무의미해진다.
+        호출 위치도 같다: 지표 갱신과 decide_action보다 앞이라, 전략이 "이미 손절된 포지션을
+        아직 들고 있다"고 착각하지 않는다.
+        """
+        filled = False
+        for order, price, quantity in order_book.match_symbol(
+                self.status, symbol, candle, self.slippage_ratio):
+            # 체결가 기준으로 다시 시가평가한 뒤 체결한다 — apply_fill의 실현손익이
+            # unrealised_pnl 안분이라 그렇다 (백테스터 _fill과 같은 이유/같은 순서).
+            self.status.update_unrealised_pnl(symbol, price)
+            pre_status = copy.deepcopy(self.status)
+            wnl, fee = self.status.apply_fill(symbol, quantity, price, self.fee_ratio)
+            leverage = self.status.update_leverage()
+            self.logger.info(
+                f"[dry-run] {order.order_type.value} filled symbol={symbol} qty={quantity} "
+                f"@ {price} wnl={wnl:.4f} fee={fee:.4f} -> {self.status}")
+            if self.recorder:
+                self.recorder.record_trade(symbol, candle.end_time, quantity, price, wnl, fee,
+                                           pre_status, leverage,
+                                           order_type=order.order_type.value,
+                                           submitted_at=order.created_at)
+            filled = True
+        expired = order_book.tick_expiry(self.status, symbol)
+        for order in expired:
+            self.logger.info("[dry-run] 미체결 주문 만료: %s", order)
+        return filled
+
     async def _handle_candle(self, symbol: str, candle: Candle):
         """마감 캔들 하나를 지표/스트리머/레코더에 흘려보내고, 나온 액션을 실행한다.
 
@@ -595,15 +786,24 @@ class BinanceTrader:
         # (주문 실패 등). 그대로 두면 이번 캔들의 체결에 엉뚱한 거래 전 스냅샷이 붙는다.
         # 액션은 자기 심볼과 다른 심볼을 겨냥할 수 있으므로 (교차 심볼 전략), pending은
         # **액션의 대상 심볼** 기준으로 키가 잡혀 있다 — 여기서는 지금 마감한 심볼 몫만 지운다.
-        pending = self._pending_decision.pop(symbol, None)
-        if pending is not None:
+        # 미체결(지정가/조건부) 주문은 몇 봉 뒤에 체결되는 게 정상이므로 여기서 버리면 안 된다
+        # — 그 항목은 주문이 종결될 때(_process_order_trade_update) 지워진다. 시장가 결정만
+        # 그 캔들 안에 결과가 나와야 한다.
+        for key in [k for k, p in self._pending_decision.items()
+                    if k[0] == symbol and not p.resting]:
             self.logger.warning(
-                f"체결되지 않은 이전 결정을 버린다 (symbol={symbol}): {pending}")
+                f"체결되지 않은 이전 결정을 버린다 (symbol={symbol}): "
+                f"{self._pending_decision.pop(key)}")
 
         # last_close는 다른 심볼을 겨냥한 액션의 체결가/벤치마크 곡선에 쓰인다 — decide_action
         # 을 부르기 전에 갱신해야 한다 (백테스터의 이벤트별 last_close 갱신과 같은 순서).
         self.status.last_close[symbol] = candle.close
         self.status.update_unrealised_pnl(symbol, candle.close)
+
+        # 드라이런은 거래소가 없으니 미체결 주문을 여기서 직접 채운다 — 백테스터와 **같은**
+        # 자리(지표 갱신/decide_action 앞)에서, 같은 order_book 코드로. 라이브는 거래소가
+        # 채우고 ORDER_TRADE_UPDATE로 알려주므로 이 경로를 타지 않는다.
+        resting_filled = self._match_dry_run_orders(symbol, candle) if self.dry_run else False
 
         symbol_indicators = self.streamer.indicators.get(symbol, {})
 
@@ -630,9 +830,33 @@ class BinanceTrader:
                               symbol, candle, actions, self.status,
                               generate_dict_string(symbol_indicators))
 
-        traded = False
+        traded = resting_filled
         for action in actions:
+            # 취소는 quantity가 0이라 아래 스킵에 걸린다 — 타입 분기가 먼저다.
+            if action.order_type is ActionType.CANCEL:
+                cancelled = order_book.cancel_orders(self.status, action.symbol,
+                                                     action.client_id)
+                if cancelled:
+                    self.logger.info("주문 취소: symbol=%s client_id=%s (%d건)",
+                                     action.symbol, action.client_id or "*", len(cancelled))
+                if not self.dry_run and self.on_action_callbacks:
+                    await asyncio.gather(*[c(action) for c in self.on_action_callbacks])
+                continue
+
             if action.quantity == 0:
+                continue
+
+            # 지정가/조건부는 client_id가 곧 취소 키이므로 전략의 것을 그대로 쓰고, 시장가는
+            # 여기서 하나 지어 붙인다 — 체결 이벤트를 이 결정과 정확히 짝짓기 위해서다.
+            if action.client_id is None:
+                action.client_id = self._new_client_order_id()
+
+            # 드라이런은 주문을 보내지 않으므로 장부를 직접 채운다 (백테스터와 같은 코드).
+            if self.dry_run and action.is_resting:
+                self._order_seq += 1
+                if order_book.register_order(self.status, action, candle.end_time,
+                                             self._order_seq):
+                    self.logger.info("[dry-run] 미체결 주문 등록: %s", action)
                 continue
 
             # 거래 전 스냅샷은 주문을 내보내기 **전에** 떠야 한다. _on_action이 주문 future를
@@ -641,11 +865,14 @@ class BinanceTrader:
             # dry-run은 유저 데이터 소켓을 열지 않아 ORDER_TRADE_UPDATE가 오지 않는다. 짝지을
             # 상대가 없으므로 여기서 만들지 않고, 아래 dry-run 블록이 직접 스냅샷을 뜬다.
             if self.recorder and not self.dry_run:
-                self._pending_decision[action.symbol] = _PendingDecision(
+                self._remember_decision(_PendingDecision(
                     timestamp=candle.end_time,
                     quantity=action.quantity,
                     pre_status=copy.deepcopy(self.status),
-                )
+                    symbol=action.symbol,
+                    order_type=action.order_type.value,
+                    resting=action.is_resting,
+                ), action.symbol, action.client_id)
 
             # Execute action if callback is set
             if self.on_action_callbacks:
@@ -664,6 +891,9 @@ class BinanceTrader:
                     self.logger.warning(
                         f"[dry-run] 가격을 알 수 없는 심볼에 대한 액션을 건너뛴다: {action}")
                     continue
+                # 백테스터 _fill과 같은 순서: 체결가로 시가평가 후 체결. 교차 심볼 액션은
+                # 위에서 시가평가한 심볼과 대상 심볼이 다를 수 있어 이 줄이 필요하다.
+                self.status.update_unrealised_pnl(action.symbol, price)
                 pre_status = copy.deepcopy(self.status)
                 wnl, fee = self.status.apply_fill(action.symbol, action.quantity, price,
                                                   self.fee_ratio)
@@ -672,7 +902,9 @@ class BinanceTrader:
                                  f"@ {price} wnl={wnl:.4f} fee={fee:.4f} -> {self.status}")
                 if self.recorder:
                     self.recorder.record_trade(action.symbol, candle.end_time, action.quantity,
-                                               price, wnl, fee, pre_status, leverage)
+                                               price, wnl, fee, pre_status, leverage,
+                                               order_type=ActionType.MARKET.value,
+                                               submitted_at=candle.end_time)
                     traded = True
 
         if self.recorder:
@@ -804,6 +1036,12 @@ class BinanceTrader:
             if order_symbol not in self._symbol_set:
                 return
             status = order_data.get('X', "")
+
+            # 거래소 장부의 진실을 그대로 따라간다: NEW면 미체결로 등록, 종결이면 제거.
+            # 지정가/조건부 주문은 여기서부터 몇 시간씩 살 수 있으므로, 이 동기화가 없으면
+            # 전략의 status.open_orders가 거래소와 어긋난 채로 돈다.
+            self._sync_open_order(order_data, status)
+
             if status not in _TRACKED_ORDER_STATES:
                 return
 
@@ -852,17 +1090,54 @@ class BinanceTrader:
                 return  # 아직 진행 중 — 종결될 때 하나의 Trade로 합쳐 기록한다
 
             self._order_agg.pop(key, None)
+            client_order_id = order_data.get('c') or ""
             if self.recorder and agg.cum_qty > 0:
-                self._record_live_fill(agg, filled)
+                self._record_live_fill(agg, filled, client_order_id)
+            else:
+                # 한 건도 안 채워지고 취소/거절된 주문 — 짝지을 체결이 영영 없으므로
+                # 스냅샷을 붙들고 있을 이유가 없다.
+                self._pending_decision.pop((order_symbol, client_order_id), None)
         except Exception as e:
             # 바로 아래에서 re-raise 하므로 스택트레이스는 이걸 받는
             # _listen_user_websocket의 logger.exception이 남긴다. 여기서 또 쓰면 중복된다.
             self.logger.error("Error processing order trade update: %s", e)
             raise
 
-    def _record_live_fill(self, agg: _OrderAggregate, quantity: float):
-        """종결된 주문 하나를 Trade로 기록한다."""
-        pending = self._pending_decision.pop(agg.symbol, None)
+    def _sync_open_order(self, order_data: Dict, order_status: str) -> None:
+        """ORDER_TRADE_UPDATE를 ``status.open_orders``에 반영한다 — **라이브 전용**.
+
+        거래소가 주문을 접수하면(NEW) 장부에 넣고, 종결되면(체결/취소/만료/거절) 뺀다.
+        ``PARTIALLY_FILLED``은 아직 살아 있으므로 그대로 둔다 — 이 엔진은 부분 체결을
+        모델링하지 않지만, 장부에서 지워버리면 남은 수량이 보이지 않게 된다.
+        """
+        symbol = order_data.get('s', "")
+        client_id = order_data.get('c') or None
+        book = self.status.open_orders_for(symbol)
+
+        if order_status == _ACK_ORDER_STATE:
+            if any(o.client_id == client_id for o in book):
+                return  # 이미 등록됨 (재연결 후 중복 이벤트 등)
+            order = self._order_from_exchange(order_data)
+            if order is not None:
+                book.append(order)
+                self.logger.info("미체결 주문 등록: %s", order)
+            return
+
+        if order_status in _TERMINAL_ORDER_STATES:
+            removed = [o for o in book if o.client_id == client_id]
+            if removed:
+                self.status.open_orders[symbol] = [o for o in book if o.client_id != client_id]
+                self.logger.info("미체결 주문 해제 (%s): client_id=%s", order_status.lower(),
+                                 client_id)
+
+    def _record_live_fill(self, agg: _OrderAggregate, quantity: float,
+                          client_order_id: str = ""):
+        """종결된 주문 하나를 Trade로 기록한다.
+
+        짝짓기 키는 거래소가 그대로 돌려주는 ``c``(clientOrderId)다 — 심볼만으로 짝지으면
+        몇 봉 뒤에 체결되는 미체결 주문을 원래 결정과 이을 수 없다.
+        """
+        pending = self._pending_decision.pop((agg.symbol, client_order_id), None)
 
         if pending is None:
             # 청산/ADL/앱에서 낸 수동 주문/재기동 직후 남은 체결 등. 실제 자본을 움직이므로
@@ -889,12 +1164,21 @@ class BinanceTrader:
                     abs(quantity - pending.quantity) / abs(pending.quantity) * 100,
                     pending.quantity, quantity, agg.order_id)
             pre_status = pending.pre_status
-            # 체결 시각(T)이 아니라 **결정 캔들의 마감 시각**을 쓴다. T는 캔들 경계보다
-            # 수백 ms 뒤라, 집계 뷰(1h/1d)에서 원인이 된 캔들과 다른 버킷에 떨어질 수 있다.
-            timestamp = pending.timestamp
+            if pending.resting:
+                # 미체결 주문은 결정이 몇 봉 전이므로, 결정 캔들에 버킷하면 오히려 틀리다 —
+                # **실제 체결 시각**을 쓴다. 백테스터는 체결을 감지한 봉의 마감 시각을 쓰므로
+                # 둘이 최대 한 봉 어긋날 수 있다 (CLAUDE.md의 라이브/백테스트 차이 목록 참고).
+                timestamp = agg.last_trade_ms or pending.timestamp
+            else:
+                # 체결 시각(T)이 아니라 **결정 캔들의 마감 시각**을 쓴다. T는 캔들 경계보다
+                # 수백 ms 뒤라, 집계 뷰(1h/1d)에서 원인이 된 캔들과 다른 버킷에 떨어질 수 있다.
+                timestamp = pending.timestamp
 
+        order_type = pending.order_type if pending is not None else ActionType.MARKET.value
+        submitted_at = pending.timestamp if pending is not None else timestamp
         self.recorder.record_trade(agg.symbol, timestamp, quantity, agg.avg_price, agg.wnl,
-                                   agg.fee, pre_status, self.status.update_leverage())
+                                   agg.fee, pre_status, self.status.update_leverage(),
+                                   order_type=order_type, submitted_at=submitted_at)
         self.recorder.flush(force=True)
 
     async def _handle_stream_error_frame(self, data: dict, stream: str) -> bool:
@@ -1082,7 +1366,10 @@ class BinanceTrader:
 
         else:
             # Execute order asynchronously. action.symbol이 대상 심볼이다.
-            future = self._executor.execute_action(action)
+            # reference_price는 조건부 주문을 STOP_MARKET / TAKE_PROFIT_MARKET 중 어느 쪽으로
+            # 보낼지 고르는 데 쓴다 — 거래소는 트리거가 현재가의 반대쪽에 있는 주문을 거부한다.
+            future = self._executor.execute_action(
+                action, reference_price=self.status.last_close.get(action.symbol))
 
             # concurrent.futures.Future라서 .result()는 **블로킹**이다 — 코루틴 안에서 부르면
             # 유저 데이터 스트림을 포함한 이벤트 루프 전체가 최대 10초 멈춘다. wrap_future로 감싼다.

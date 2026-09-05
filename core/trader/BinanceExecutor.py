@@ -19,7 +19,7 @@ from typing import Optional, Dict, Any, Union
 from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceOrderException
 
-from core.streamer.action import Action
+from core.streamer.action import Action, ActionType
 
 
 class OrderType(Enum):
@@ -52,6 +52,10 @@ class OrderRequest:
     close_position: bool = False  # Close position flag for futures
     activation_price: Optional[float] = None  # For conditional orders
     callback_rate: Optional[float] = None  # For trailing stop orders
+    #: LIMIT 계열에 필수. Binance는 timeInForce 없는 LIMIT 주문을 거부한다.
+    time_in_force: Optional[str] = None
+    #: newClientOrderId. 체결 이벤트를 자기 결정과 짝짓고, 나중에 이 id로 취소하기 위해 쓴다.
+    client_order_id: Optional[str] = None
 
 
 @dataclass
@@ -132,17 +136,35 @@ class BinanceExecutor:
         future = self.executor.submit(self._execute_order_with_retry, order_request)
         return future
 
-    def execute_action(self, action: Action) -> Future[OrderResult]:
+    #: 엔진의 ActionType을 거래소 주문 타입으로 옮기는 표. STOP_MARKET은 트리거가 현재가의
+    #: 어느 쪽에 있느냐에 따라 갈리므로 여기 없고 execute_action이 따로 고른다.
+    _ORDER_TYPES = {
+        ActionType.MARKET: OrderType.MARKET,
+        ActionType.LIMIT: OrderType.LIMIT,
+    }
+
+    def execute_action(self, action: Action,
+                       client_order_id: Optional[str] = None,
+                       reference_price: Optional[float] = None) -> Future[OrderResult]:
         """
-        Execute a trading action as a market order. ``action.symbol``이 대상 심볼이다 —
-        Action이 자기 심볼을 들고 다니므로 별도 symbol 인자를 받지 않는다.
+        Execute a trading action. ``action.symbol``이 대상 심볼이다 — Action이 자기 심볼을
+        들고 다니므로 별도 symbol 인자를 받지 않는다.
 
         Args:
             action: Trading action from streamer
+            client_order_id: 이 주문에 붙일 newClientOrderId. 호출자가 체결 이벤트를 자기
+                결정과 짝짓고 나중에 취소하는 데 쓴다.
+            reference_price: STOP_MARKET을 STOP_MARKET / TAKE_PROFIT_MARKET 중 어느 쪽으로
+                보낼지 정하는 기준가 (보통 최근 종가). 거래소는 트리거가 현재가의 반대쪽에
+                있는 조건부 주문을 거부하므로, ``action.trigger_above``와 이 값으로 맞는 쪽을
+                고른다. None이면 trigger_above만 보고 정한다.
 
         Returns:
             Future object that will contain the OrderResult
         """
+        if action.order_type is ActionType.CANCEL:
+            return self.cancel_order(action.symbol, orig_client_order_id=action.client_id)
+
         if action.quantity == 0:
             # No action needed
             result = OrderResult(success=True, error="No action required")
@@ -154,11 +176,33 @@ class BinanceExecutor:
         side = OrderSide.BUY if action.quantity > 0 else OrderSide.SELL
         quantity = abs(action.quantity)
 
+        if action.order_type is ActionType.STOP_MARKET:
+            trigger_above = action.trigger_above
+            if trigger_above is None and reference_price is not None:
+                trigger_above = action.trigger_price >= reference_price
+            # 매수 주문의 트리거가 위에 있으면 돌파 매수(STOP), 아래면 익절 매수
+            # (TAKE_PROFIT). 매도는 대칭이다.
+            takes_profit = (action.quantity > 0) != bool(trigger_above)
+            order_type = (OrderType.TAKE_PROFIT_MARKET if takes_profit
+                          else OrderType.STOP_MARKET)
+        else:
+            order_type = self._ORDER_TYPES.get(action.order_type)
+            if order_type is None:
+                result = OrderResult(
+                    success=False, error=f"Unsupported order type: {action.order_type}")
+                future = Future()
+                future.set_result(result)
+                return future
+
         order_request = OrderRequest(
             symbol=action.symbol,
             side=side,
-            order_type=OrderType.MARKET,
-            quantity=quantity
+            order_type=order_type,
+            quantity=quantity,
+            price=action.price,
+            stop_price=action.trigger_price,
+            reduce_only=action.reduce_only,
+            client_order_id=client_order_id or action.client_id,
         )
 
         return self.execute_order(order_request)
@@ -248,6 +292,9 @@ class BinanceExecutor:
                 if order_request.price is None:
                     return OrderResult(success=False, error="Price required for limit orders")
                 order_params['price'] = order_request.price
+                # timeInForce 없는 LIMIT은 거래소가 거부한다. 이 엔진의 미체결 주문은
+                # 체결되거나 명시적으로 취소될 때까지 사는 GTC가 기본이다.
+                order_params['timeInForce'] = order_request.time_in_force or 'GTC'
 
             # Add stop price for conditional orders
             if order_request.order_type in [OrderType.STOP, OrderType.STOP_MARKET,
@@ -274,6 +321,9 @@ class BinanceExecutor:
             if order_request.close_position:
                 order_params['closePosition'] = True
 
+            if order_request.client_order_id:
+                order_params['newClientOrderId'] = order_request.client_order_id
+
             # Execute futures order
             self.logger.info(f"sending futures order with {order_params}")
             response = self.client.futures_create_order(**order_params)
@@ -291,24 +341,39 @@ class BinanceExecutor:
         except Exception as e:
             return OrderResult(success=False, error=f"Unexpected error: {e}")
 
-    def cancel_order(self, symbol: str, order_id: Union[str, int]) -> Future[OrderResult]:
+    def cancel_order(self, symbol: str, order_id: Optional[Union[str, int]] = None,
+                     orig_client_order_id: Optional[str] = None) -> Future[OrderResult]:
         """
         Cancel an existing order.
-        
+
         Args:
             symbol: Trading symbol
-            order_id: Order ID to cancel
-            
+            order_id: 거래소가 매긴 주문 ID
+            orig_client_order_id: 주문을 낼 때 붙인 newClientOrderId. 전략은 이쪽으로
+                취소한다 — 거래소 ID는 주문을 낸 뒤에야 알 수 있어서 전략이 들고 있을 수 없다.
+
+        둘 다 None이면 그 심볼의 **미체결 주문을 전부** 취소한다
+        (``Action.cancel(symbol)``의 라이브 대응).
+
         Returns:
             Future object that will contain the OrderResult
         """
-        future = self.executor.submit(self._cancel_single_order, symbol, order_id)
+        future = self.executor.submit(self._cancel_single_order, symbol, order_id,
+                                      orig_client_order_id)
         return future
 
-    def _cancel_single_order(self, symbol: str, order_id: Union[str, int]) -> OrderResult:
-        """Cancel a single order."""
+    def _cancel_single_order(self, symbol: str, order_id: Optional[Union[str, int]] = None,
+                             orig_client_order_id: Optional[str] = None) -> OrderResult:
+        """Cancel a single order, or every open order on the symbol."""
         try:
-            response = self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
+            if order_id is None and orig_client_order_id is None:
+                self.client.futures_cancel_all_open_orders(symbol=symbol)
+                return OrderResult(success=True, order_id=None, error=None)
+            if orig_client_order_id is not None:
+                self.client.futures_cancel_order(symbol=symbol,
+                                                 origClientOrderId=orig_client_order_id)
+                return OrderResult(success=True, order_id=orig_client_order_id, error=None)
+            self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
             return OrderResult(
                 success=True,
                 order_id=str(order_id),

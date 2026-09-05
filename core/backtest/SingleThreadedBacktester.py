@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
+from core.backtest import order_book
 from core.backtest.candle_merge import merge_candle_timeline
 from core.backtest.indicator_columns import collect_indicator_columns
 from core.backtest.metrics import build_multi_symbol_buy_and_hold_curve
@@ -15,20 +16,26 @@ from core.backtest.result_writer import ShardWriter, write_run_json
 from core.backtest.status import Status
 from core.backtest.trade import Trade
 from core.streamer import Action
+from core.streamer import ActionType
 from core.streamer import BaseStreamer
 from core.streamer import Candle
 
 
 DEFAULT_FEE_RATIO = 0.0004
+DEFAULT_SLIPPAGE_RATIO = 0.0
 
 
 class SingleThreadedBacktester:
     def __init__(self, streamer: BaseStreamer, candles_by_symbol: Dict[str, List[Candle]],
-                 fee_ratio: Optional[float] = None, result_path: str = "asset/"):
+                 fee_ratio: Optional[float] = None, result_path: str = "asset/",
+                 slippage_ratio: Optional[float] = None):
         """:param candles_by_symbol: 심볼별 캔들 리스트 (각자 end_time 오름차순). 스트리머가
             다루는 심볼(``streamer.symbols``)과 정확히 일치할 필요는 없다 — 여기 없는 심볼은
             그 심볼의 이벤트가 아예 발생하지 않는다.
         :param fee_ratio: 실제로 부과할 수수료율. None이면 **스트리머의 값을 따라간다**.
+        :param slippage_ratio: 조건부 시장가(STOP_MARKET) 체결에 불리한 방향으로 얹을 비율.
+            None이면 ``fee_ratio``와 같은 규칙으로 스트리머의 값을 따라간다. 기본 0.0이라
+            지정가/조건부 주문을 쓰지 않는 기존 전략의 결과는 그대로다.
 
         스트리머는 자기 ``fee_ratio``로 사이징하고 백테스터는 자기 값으로 과금하므로, 둘이
         어긋나면 실효 레버리지가 의도와 달라진다. 예전 기본값(고정 0.0004)은 ``FastBacktester(
@@ -46,7 +53,19 @@ class SingleThreadedBacktester:
                 logging.getLogger(__name__).warning(
                     "수수료율 불일치: 백테스터 %s vs 스트리머 %s — 스트리머는 자기 값으로 "
                     "사이징하므로 실효 레버리지가 의도와 달라진다", fee_ratio, streamer_fee)
+        streamer_slippage = getattr(streamer, "slippage_ratio", None)
+        if slippage_ratio is None:
+            self.slippage_ratio = (streamer_slippage if streamer_slippage is not None
+                                   else DEFAULT_SLIPPAGE_RATIO)
+        else:
+            self.slippage_ratio = slippage_ratio
+            if streamer_slippage is not None and streamer_slippage != slippage_ratio:
+                logging.getLogger(__name__).warning(
+                    "슬리피지율 불일치: 백테스터 %s vs 스트리머 %s", slippage_ratio,
+                    streamer_slippage)
         self.result_path = result_path
+        #: 미체결 주문 제출 순서. 같은 봉 안에서 체결 순서를 결정적으로 만드는 데 쓴다.
+        self._order_seq = 0
         self.logger = logging.getLogger(__name__)
 
     def _interval_ms(self) -> int:
@@ -117,6 +136,13 @@ class SingleThreadedBacktester:
                 event_candles[symbol] = candle
                 self.status.last_close[symbol] = candle.close
 
+            # 미체결 주문은 봉이 닫히기 전에 거래소에서 채워진다 — 그러니 시가평가보다도,
+            # decide_action보다도 **앞에서** 매칭한다. 뒤에 두면 전략이 "이미 손절된 포지션을
+            # 아직 들고 있다"고 착각한 채 결정하게 된다.
+            for trade in self._match_resting_orders(event_candles, event_time):
+                max_leverage = max(max_leverage, trade.leverage)
+                trades.append(trade)
+
             # 매 이벤트 시가평가 — 열린 포지션 전부, 최신 알려진 종가로 (이 이벤트에 캔들이
             # 없는 심볼은 직전 알려진 종가를 그대로 쓴다).
             for symbol, pos_state in self.status.positions.items():
@@ -134,6 +160,12 @@ class SingleThreadedBacktester:
             # 기록은 파산 여부와 무관하게 이 이벤트에 등장한 모든 심볼에 대해 계속된다 —
             # 건너뛰는 것은 오직 스트리머의 결정 호출뿐이다.
             bankrupt = event_equity <= 0.0
+            if bankrupt:
+                # 파산 후에도 손절 주문이 장부에 남으면, flat이 된 계좌에 나중에 유령
+                # 포지션을 여는 체결이 생긴다.
+                cancelled = order_book.cancel_all(self.status)
+                if cancelled:
+                    self.logger.warning("강제청산: 미체결 주문 %d건을 취소한다", len(cancelled))
             actions: List[Action] = []
             symbol_data: Dict[str, Tuple[Candle, Dict[str, Optional[float]]]] = {}
             for symbol in self.streamer.symbols:
@@ -165,6 +197,10 @@ class SingleThreadedBacktester:
                 shard_writer.add(event_time, event_equity, symbol_data)
 
             for action in actions:
+                # 장부 조작(취소/지정가·조건부 등록)이 먼저다 — CANCEL은 quantity가 0이라
+                # 아래의 0 스킵에 걸려 조용히 사라진다.
+                if self._submit_book_action(action, event_time):
+                    continue
                 if action.quantity == 0:
                     continue
                 price = self.status.last_close.get(action.symbol)
@@ -174,20 +210,10 @@ class SingleThreadedBacktester:
                         action.symbol, action)
                     continue
 
-                prev_status = copy.deepcopy(self.status)
-                wnl, fee = self._trade(action, price)
-                leverage = self.status.update_leverage()
-                max_leverage = max(max_leverage, leverage)
-                trades.append(Trade(
-                    timestamp=event_time,
-                    symbol=action.symbol,
-                    quantity=action.quantity,
-                    price=price,
-                    wnl=wnl,
-                    fee=fee,
-                    status=prev_status,
-                    leverage=leverage,
-                ))
+                trade = self._fill(action.symbol, action.quantity, price, event_time,
+                                   ActionType.MARKET.value, event_time)
+                max_leverage = max(max_leverage, trade.leverage)
+                trades.append(trade)
 
         benchmark_curve = build_multi_symbol_buy_and_hold_curve(
             [t for t, _ in equity_curve], closes_by_symbol, init_margin)
@@ -219,3 +245,63 @@ class SingleThreadedBacktester:
         :return: tuple of wnl, fee
         """
         return self.status.apply_fill(action.symbol, action.quantity, price, self.fee_ratio)
+
+    def _fill(self, symbol: str, quantity: float, price: float, event_time: int,
+              order_type: str, submitted_at: int) -> Trade:
+        """체결 하나를 반영하고 Trade를 만든다. 두 백테스터가 공유한다.
+
+        거래 전 스냅샷은 ``apply_fill`` **전에** 떠야 한다 — Trade.status의 계약이고,
+        승패 분류(``result_writer._win_lose_counts``)가 그 시점의 포지션 부호를 본다.
+
+        ``apply_fill``의 청산 손익은 ``unrealised_pnl``을 안분해서 구하므로, 그 값이 **체결가
+        기준**이어야 실현손익이 맞는다. 시장가는 체결가가 곧 이벤트 종가라 직전 시가평가가
+        이미 그 값이지만, 지정가/조건부는 봉 중간 가격에 체결되므로 여기서 다시 매긴다
+        (시장가에는 같은 값을 다시 계산하는 무해한 no-op이다).
+        """
+        self.status.update_unrealised_pnl(symbol, price)
+        prev_status = copy.deepcopy(self.status)
+        wnl, fee = self.status.apply_fill(symbol, quantity, price, self.fee_ratio)
+        leverage = self.status.update_leverage()
+        return Trade(
+            timestamp=event_time,
+            symbol=symbol,
+            quantity=quantity,
+            price=price,
+            wnl=wnl,
+            fee=fee,
+            status=prev_status,
+            leverage=leverage,
+            order_type=order_type,
+            submitted_at=submitted_at,
+        )
+
+    def _match_resting_orders(self, event_candles: Dict[str, Candle],
+                              event_time: int) -> List[Trade]:
+        """이 이벤트의 캔들들로 미체결 주문을 체결시키고, 만료된 주문을 거둔다.
+
+        심볼 순회는 ``streamer.symbols`` 순서다 — 결정 루프와 같은 순서를 써야 두 백테스터가
+        같은 결과를 낸다. ``match_symbol``이 제너레이터이므로 체결은 한 건씩 즉시 반영되고,
+        같은 봉의 뒤쪽 주문은 갱신된 포지션을 본다.
+        """
+        filled: List[Trade] = []
+        for symbol in self.streamer.symbols:
+            candle = event_candles.get(symbol)
+            if candle is None:
+                continue
+            for order, price, quantity in order_book.match_symbol(
+                    self.status, symbol, candle, self.slippage_ratio):
+                filled.append(self._fill(symbol, quantity, price, event_time,
+                                         order.order_type.value, order.created_at))
+            order_book.tick_expiry(self.status, symbol)
+        return filled
+
+    def _submit_book_action(self, action: Action, event_time: int) -> bool:
+        """장부를 건드리는 액션이면 처리하고 True. 즉시 체결(MARKET)이면 False."""
+        if action.order_type is ActionType.CANCEL:
+            order_book.cancel_orders(self.status, action.symbol, action.client_id)
+            return True
+        if action.is_resting:
+            self._order_seq += 1
+            order_book.register_order(self.status, action, event_time, self._order_seq)
+            return True
+        return False

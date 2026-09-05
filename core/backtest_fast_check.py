@@ -18,6 +18,13 @@ threshold comparisons and changes a few trades out of several thousand. The 12-m
 happens to have no such coincidence. Exact bit-parity between an O(1) incremental update and
 a vectorized rolling sum is not achievable without changing one side's arithmetic; treat a
 small `--full` trade-count delta as this, and any structural difference as a real bug.
+
+The same rounding reaches `Trade.price` now that resting orders exist: a stop whose trigger is
+an indicator value (`ma - m_exit*atr`) fills *at that value*, so the MA divergence lands in the
+fill price on **every** such fill rather than only when it flips a threshold. `compare_reports`
+therefore compares `price` with the same tolerance it already uses for wnl/fee/leverage. A
+structurally wrong fill price (close instead of trigger, wrong bar, wrong side) differs by
+orders of magnitude, so the tolerance costs no real coverage.
 """
 import math
 import sys
@@ -32,12 +39,13 @@ from core.backtest.SingleThreadedBacktester import SingleThreadedBacktester
 from core.backtest.status import PositionState, Status
 from core.binance_candle_fetcher.vision_fetcher import BinanceVisionFetcher
 from core.logging_config import setup_logging
-from core.streamer.action import Action
+from core.streamer.action import Action, ActionType
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.candle import Candle
 from core.streamer.indicator.atr import ATRIndicator
 from core.streamer.indicator.base_indicator import BaseIndicator
 from core.streamer.indicator.moving_average import MovingAverage
+from core.streamer.keltner_stop_streamer import KeltnerStopStreamer
 from core.streamer.keltner_streamer import KeltnerStreamer
 from core.streamer.mean_reversion_zscore import MeanReversionZScoreStreamer
 from core.utils import trunc_by_sign
@@ -154,6 +162,100 @@ class DualSymbolMomentum(BaseStreamer):
         if position != 0 and candle.close < ma * 0.999:
             return [Action(symbol, -position)]
         return []
+
+
+class LimitLadderStreamer(BaseStreamer):
+    """토이 지정가 전략 (검사 전용) — 미체결 주문이 여러 봉에 걸쳐 사는 경로를 만든다.
+
+    플랫이면 종가보다 ``spread`` 만큼 아래에 지정가 매수를 걸고, 포지션이 있으면 진입가보다
+    ``spread`` 위에 지정가 매도(익절)를 건다. 주문이 ``ttl`` 캔들 안에 안 채워지면 만료된다.
+    가끔 전량 취소를 섞어 CANCEL 경로도 태운다.
+
+    지정가는 ``candle.close``에서만 유도되므로 (지표를 거치지 않는다) 두 엔진의 체결가가
+    비트 단위로 같다 — 구조적 버그가 float 반올림에 묻히지 않는다.
+    """
+
+    def __init__(self, symbols: List[str], spread: float = 0.002, ttl: int = 30,
+                 fee_ratio: float = 0.0004):
+        super().__init__(symbols, {s: {} for s in symbols})
+        self.spread = spread
+        self.ttl = ttl
+        self.fee_ratio = fee_ratio
+        self._bar = 0
+
+    def decide_action(self, symbol, candle: Candle, status: Status):
+        self._bar += 1
+        position = status.position_for(symbol).position
+        resting = status.open_orders_for(symbol)
+
+        # 200봉마다 전량 취소 — CANCEL 경로와, 취소 뒤 장부가 실제로 비는지를 태운다.
+        if self._bar % 200 == 0 and resting:
+            return [Action.cancel(symbol)]
+        if resting:
+            return []  # 이미 걸어둔 주문이 있으면 그대로 둔다
+
+        if position == 0:
+            qty = trunc_by_sign(status.total_margin() / len(self.symbols) / candle.close * 0.5, 3)
+            if qty == 0:
+                return []
+            return [Action(symbol, qty, order_type=ActionType.LIMIT,
+                           price=candle.close * (1 - self.spread),
+                           client_id="entry", expire_after_candles=self.ttl)]
+
+        avg = status.position_for(symbol).avg_price
+        return [Action(symbol, -position, order_type=ActionType.LIMIT,
+                       price=avg * (1 + self.spread), reduce_only=True, client_id="exit")]
+
+
+class StopLadderStreamer(LimitLadderStreamer):
+    """위와 같지만 청산을 ``reduce_only`` 조건부 시장가(손절)로 건다.
+
+    ``reduce_only`` clamp, 트리거 방향 자동 유도, 갭 관통 체결(트리거보다 아래에서 봉이
+    시작하면 시가 체결)을 모두 태운다.
+    """
+
+    def decide_action(self, symbol, candle: Candle, status: Status):
+        self._bar += 1
+        position = status.position_for(symbol).position
+        resting = status.open_orders_for(symbol)
+        if self._bar % 200 == 0 and resting:
+            return [Action.cancel(symbol)]
+        if resting:
+            return []
+        if position == 0:
+            qty = trunc_by_sign(status.total_margin() / len(self.symbols) / candle.close * 0.5, 3)
+            if qty == 0:
+                return []
+            return [Action(symbol, qty)]  # 시장가 진입
+        avg = status.position_for(symbol).avg_price
+        # 일부러 포지션보다 큰 수량을 건다 — reduce_only clamp가 안 걸리면 반대 포지션이 열린다.
+        return [Action(symbol, -position * 3, order_type=ActionType.STOP_MARKET,
+                       trigger_price=avg * (1 - self.spread), reduce_only=True,
+                       client_id="stop")]
+
+
+class RestingBlowUpStreamer(BaseStreamer):
+    """강제청산 시 미체결 주문까지 취소되는지 확인하기 위한 픽스처.
+
+    첫 캔들에 큰 레버리지로 진입하면서, 절대 체결되지 않을 지정가 주문(현재가의 1%)을 같이
+    걸어둔다. 파산 후에도 그 주문이 장부에 남아 있으면 flat인 계좌에 유령 포지션이 열린다.
+    """
+
+    def __init__(self, symbols: List[str], leverage: float = 50.0, fee_ratio: float = 0.0004):
+        super().__init__(symbols, {s: {} for s in symbols})
+        self.leverage = leverage
+        self.fee_ratio = fee_ratio
+
+    def decide_action(self, symbol, candle: Candle, status: Status):
+        if status.position_for(symbol).position != 0:
+            return []
+        qty = trunc_by_sign(
+            status.total_margin() * self.leverage / len(self.symbols) / candle.close, 3)
+        if qty == 0:
+            return []
+        return [Action(symbol, qty),
+                Action(symbol, qty, order_type=ActionType.LIMIT,
+                       price=candle.close * 0.01, client_id="never")]
 
 
 class RelativeStrengthRotationStreamer(BaseStreamer):
@@ -349,6 +451,165 @@ def check_staggered_start(candles_a, candles_b) -> bool:
     return ok
 
 
+def check_limit_orders(candles) -> bool:
+    """지정가 주문: 두 엔진 일치 + 체결이 실제로 "종가가 아닌 가격"에 일어났는지.
+
+    ``LimitLadderStreamer``의 지정가는 종가에서만 유도되므로 체결가가 비트 단위로 같아야 한다.
+    체결가가 그 봉의 종가와 다른 거래가 하나도 없으면, 매칭을 타지 않고 시장가로 떨어졌다는
+    뜻이므로 실패로 본다 — 침묵은 성공이 아니다.
+    """
+    by_symbol = {"X": candles}
+    close_at = {c.end_time: c.close for c in candles}
+
+    ref_bt = SingleThreadedBacktester(LimitLadderStreamer(["X"]), by_symbol)
+    ref_report = ref_bt.run()
+    fast_bt = FastBacktester(LimitLadderStreamer(["X"]), by_symbol)
+    fast_report = fast_bt.run()
+
+    ok = compare_reports("limit orders", ref_report, ref_bt.status.total_margin(),
+                         fast_report, fast_bt.status.total_margin())
+
+    limits = [t for t in ref_report.trades if t.order_type == "LIMIT"]
+    if not limits:
+        print("  [limit orders] FAIL: 지정가 체결이 하나도 없다 — 경로를 타지 않았다")
+        return False
+    off_close = [t for t in limits if t.price != close_at.get(t.timestamp)]
+    if not off_close:
+        print("  [limit orders] FAIL: 모든 지정가 체결이 종가와 같다 — 봉 내 체결이 아니다")
+        ok = False
+    delayed = [t for t in limits if t.submitted_at is not None and t.submitted_at < t.timestamp]
+    if not delayed:
+        print("  [limit orders] FAIL: 제출 봉보다 나중에 체결된 주문이 없다")
+        ok = False
+    if ref_bt.status.total_open_orders() != fast_bt.status.total_open_orders():
+        print(f"  [limit orders] FAIL: 남은 미체결 주문 수가 다르다 "
+              f"{ref_bt.status.total_open_orders()} != {fast_bt.status.total_open_orders()}")
+        ok = False
+    print(f"[limit orders] {'OK' if ok else 'MISMATCH'} — trades={len(ref_report.trades)} "
+          f"limit={len(limits)} 종가와 다른 체결={len(off_close)} 지연체결={len(delayed)}")
+    return ok
+
+
+def check_stop_orders(candles) -> bool:
+    """조건부 시장가 + reduce_only clamp + 슬리피지.
+
+    ``StopLadderStreamer``는 일부러 포지션의 3배 수량으로 손절을 건다 — clamp가 없으면 반대
+    방향 포지션이 열리므로, 체결 수량이 언제나 직전 포지션의 정확한 반대인지 확인한다.
+    """
+    by_symbol = {"X": candles}
+    ok = True
+    reports = {}
+    for slippage in (0.0, 0.0005):
+        ref_bt = SingleThreadedBacktester(StopLadderStreamer(["X"]), by_symbol,
+                                          slippage_ratio=slippage)
+        ref_report = ref_bt.run()
+        fast_bt = FastBacktester(StopLadderStreamer(["X"]), by_symbol, slippage_ratio=slippage)
+        fast_report = fast_bt.run()
+        ok &= compare_reports(f"stop orders (slippage={slippage})", ref_report,
+                              ref_bt.status.total_margin(), fast_report,
+                              fast_bt.status.total_margin())
+        reports[slippage] = ref_report
+
+    stops = [t for t in reports[0.0].trades if t.order_type == "STOP_MARKET"]
+    if not stops:
+        print("  [stop orders] FAIL: 조건부 체결이 하나도 없다 — 경로를 타지 않았다")
+        return False
+    for t in stops:
+        pre = t.status.position_for(t.symbol).position
+        if t.quantity != -pre:
+            print(f"  [stop orders] FAIL: reduce_only clamp 실패 — 직전 포지션 {pre}, "
+                  f"체결 수량 {t.quantity}")
+            ok = False
+            break
+
+    # 슬리피지는 반드시 불리한 방향으로만 작용해야 한다 (매도 체결가는 내려간다).
+    plain = {t.timestamp: t.price for t in stops}
+    slipped = [t for t in reports[0.0005].trades if t.order_type == "STOP_MARKET"]
+    compared = 0
+    for t in slipped:
+        base = plain.get(t.timestamp)
+        if base is None:
+            continue
+        compared += 1
+        worse = t.price < base if t.quantity < 0 else t.price > base
+        if not worse:
+            print(f"  [stop orders] FAIL: 슬리피지가 불리한 방향이 아니다 — "
+                  f"{base} -> {t.price} (qty={t.quantity})")
+            ok = False
+            break
+    if compared == 0:
+        print("  [stop orders] FAIL: 슬리피지 비교 대상이 없다")
+        ok = False
+    print(f"[stop orders] {'OK' if ok else 'MISMATCH'} — stop 체결={len(stops)} "
+          f"슬리피지 대조={compared}")
+    return ok
+
+
+def check_order_expiry(candles) -> bool:
+    """``expire_after_candles`` 만료: 절대 체결되지 않는 지정가는 장부에 쌓이지 않아야 한다."""
+    class NeverFillStreamer(BaseStreamer):
+        def __init__(self, symbols):
+            super().__init__(symbols, {s: {} for s in symbols})
+            self.fee_ratio = 0.0004
+
+        def decide_action(self, symbol, candle: Candle, status: Status):
+            if status.open_orders_for(symbol):
+                return []
+            # 현재가의 1% — 이 데이터로는 절대 닿지 않는다.
+            return [Action(symbol, 1.0, order_type=ActionType.LIMIT,
+                           price=candle.close * 0.01, expire_after_candles=5)]
+
+    by_symbol = {"X": candles}
+    ref_bt = SingleThreadedBacktester(NeverFillStreamer(["X"]), by_symbol)
+    ref_report = ref_bt.run()
+    fast_bt = FastBacktester(NeverFillStreamer(["X"]), by_symbol)
+    fast_report = fast_bt.run()
+
+    ok = compare_reports("order expiry", ref_report, ref_bt.status.total_margin(),
+                         fast_report, fast_bt.status.total_margin())
+    if ref_report.trades or fast_report.trades:
+        print(f"  [order expiry] FAIL: 닿을 수 없는 지정가가 체결됐다 "
+              f"({len(ref_report.trades)}건)")
+        ok = False
+    for name, bt in (("ref", ref_bt), ("fast", fast_bt)):
+        # 매 5봉마다 만료되고 다시 걸리므로 장부에는 항상 1건 이하만 남는다.
+        if bt.status.total_open_orders() > 1:
+            print(f"  [order expiry] FAIL: {name}의 장부에 만료되지 않은 주문이 쌓였다 "
+                  f"({bt.status.total_open_orders()}건)")
+            ok = False
+    print(f"[order expiry] {'OK' if ok else 'MISMATCH'} — 남은 미체결 주문="
+          f"{ref_bt.status.total_open_orders()}")
+    return ok
+
+
+def check_liquidation_cancels_orders(candles_a, candles_b) -> bool:
+    """강제청산이 미체결 주문까지 거두는지 (멀티심볼, 증거금 공유 풀)."""
+    by_symbol = {"AAA": candles_a, "BBB": candles_b}
+    ref_bt = SingleThreadedBacktester(RestingBlowUpStreamer(["AAA", "BBB"], leverage=500.0),
+                                      by_symbol)
+    ref_report = ref_bt.run()
+    fast_bt = FastBacktester(RestingBlowUpStreamer(["AAA", "BBB"], leverage=500.0), by_symbol)
+    fast_report = fast_bt.run()
+
+    ok = compare_reports("liquidation cancels orders", ref_report, ref_bt.status.total_margin(),
+                         fast_report, fast_bt.status.total_margin())
+    if ref_bt.status.total_margin() > 0:
+        print("  [liquidation cancels orders] FAIL: 파산했어야 하는데 자본이 남았다")
+        ok = False
+    for name, bt in (("ref", ref_bt), ("fast", fast_bt)):
+        if bt.status.total_open_orders() != 0:
+            print(f"  [liquidation cancels orders] FAIL: {name}의 장부에 미체결 주문이 남았다 "
+                  f"({bt.status.total_open_orders()}건)")
+            ok = False
+        nonflat = {s: p.position for s, p in bt.status.positions.items() if p.position != 0.0}
+        if nonflat:
+            print(f"  [liquidation cancels orders] FAIL: {name}에 청산되지 않은 포지션 {nonflat}")
+            ok = False
+    print(f"[liquidation cancels orders] {'OK' if ok else 'MISMATCH'} — "
+          f"trades={len(ref_report.trades)} 최종 자본={ref_bt.status.total_margin():.2f}")
+    return ok
+
+
 def check_history_bound(candles) -> bool:
     """지표 이력 경계에서 루프 경로와 ArrayIndicator가 같게 동작하는지.
 
@@ -396,9 +657,15 @@ def compare_reports(label, ref_report, ref_final, fast_report, fast_final) -> bo
         print(f"  [{label}] FAIL: trade count {len(ref_report.trades)} != {len(fast_report.trades)}")
         return False
     for i, (a, b) in enumerate(zip(ref_report.trades, fast_report.trades)):
+        # 실현손익은 quantity * (체결가 - 평단)이라 **거의 같은 두 수의 차**다. 체결가가
+        # 지표값인 조건부 주문에서는 지표 반올림(1e-14 상대)이 그 뺄셈에서 세 자릿수쯤
+        # 증폭되므로, wnl의 허용오차는 wnl 자신이 아니라 **명목가치**에 비례해야 한다.
+        # 구조적으로 틀린 손익은 명목가치의 유의미한 비율만큼 어긋나므로 이걸로도 충분히 걸린다.
+        notional_tol = max(1e-9, 1e-11 * abs(a.quantity * a.price))
         if not (a.timestamp == b.timestamp and a.symbol == b.symbol and a.quantity == b.quantity
-                and a.price == b.price
-                and math.isclose(a.wnl, b.wnl, rel_tol=1e-12, abs_tol=1e-9)
+                and a.order_type == b.order_type and a.submitted_at == b.submitted_at
+                and math.isclose(a.price, b.price, rel_tol=1e-12, abs_tol=1e-9)
+                and math.isclose(a.wnl, b.wnl, rel_tol=1e-12, abs_tol=notional_tol)
                 and math.isclose(a.fee, b.fee, rel_tol=1e-12, abs_tol=1e-9)
                 and math.isclose(a.leverage, b.leverage, rel_tol=1e-12, abs_tol=1e-9)):
             print(f"  [{label}] FAIL: trade #{i} differs:\n    ref : {a}\n    fast: {b}")
@@ -415,17 +682,29 @@ def compare_reports(label, ref_report, ref_final, fast_report, fast_final) -> bo
               f"{len(ref_report.equity_curve)} != {len(fast_report.equity_curve)}")
         ok = False
     else:
-        max_diff = 0.0
-        for (ts_a, eq_a), (ts_b, eq_b) in zip(ref_report.equity_curve, fast_report.equity_curve):
+        # 허용오차는 **상대**가 본질이다. 지표 반올림 차이(위 docstring)가 체결가와 avg_price를
+        # 통해 자본에 누적되므로, 오차는 계좌 크기에 비례해서 커진다. 고정 1e-6 절대값만 쓰면
+        # 100배로 불어난 계좌에서 순수 반올림이 실패로 잡힌다 — 구조적 어긋남은 자본의 유의미한
+        # 비율만큼 벌어지므로 rel_tol 1e-11로도 충분히 걸린다.
+        worst = (0.0, 0.0, 0)  # (abs, rel, index)
+        for i, ((ts_a, eq_a), (ts_b, eq_b)) in enumerate(
+                zip(ref_report.equity_curve, fast_report.equity_curve)):
             if ts_a != ts_b:
                 print(f"  [{label}] FAIL: equity curve timestamps diverge at {ts_a} vs {ts_b}")
                 ok = False
                 break
-            max_diff = max(max_diff, abs(eq_a - eq_b))
-        else:
-            if max_diff > 1e-6:
-                print(f"  [{label}] FAIL: equity curve max diff {max_diff}")
+            diff = abs(eq_a - eq_b)
+            if diff > worst[0]:
+                worst = (diff, diff / abs(eq_a) if eq_a else 0.0, i)
+            if not math.isclose(eq_a, eq_b, rel_tol=1e-11, abs_tol=1e-6):
+                print(f"  [{label}] FAIL: equity curve diverges at index {i} ({ts_a}): "
+                      f"{eq_a} vs {eq_b}")
                 ok = False
+                break
+        else:
+            if worst[0] > 1e-6:
+                print(f"  [{label}] note: equity curve max abs diff {worst[0]:.3e} "
+                      f"(relative {worst[1]:.3e}) — 지표 반올림 누적")
     # buy & hold 기준선은 종가에서만 유도되므로 사실상 회귀 가드 — 두 경로가 같은 이벤트 구간을
     # 잘라냈는지(reference 는 병합 루프 필터, fast 는 심볼별 searchsorted 슬라이스)까지 확인한다
     if len(ref_report.benchmark_curve) != len(fast_report.benchmark_curve):
@@ -482,6 +761,14 @@ if __name__ == "__main__":
         # 케이스들은 ATR/MA만 써서 status를 아예 읽지 않으므로 이 규약을 못 잡는다.
         "EquityGatedKeltner (status-aware indicator)":
             lambda: EquityGatedKeltner(symbols=[symbol], **keltner_params),
+        # 조건부 시장가로 손절을 거는 전략. 트리거가 지표값(ma)이라 체결가가 지표 반올림을
+        # 그대로 물고 들어온다 — compare_reports의 price/wnl 허용오차가 존재하는 이유다.
+        # 위 keltner_params를 쓰지 않는다: max_loss=0.08은 1분봉에서 레버리지를 6x 캡에
+        # 붙여놓고 왕복 수수료로 계좌를 태우는데 (examples/backtest.py의 같은 주석 참고),
+        # 자본이 초기값의 1/500,000까지 줄면 상대 허용오차로 재는 패리티 자체가 무의미해진다.
+        "KeltnerStopStreamer (real stop orders)":
+            lambda: KeltnerStopStreamer(symbols=[symbol], window=72 * 60, m_entry=4.0,
+                                        m_exit=3.0, max_loss=0.005, fee_ratio=0.0004),
     }
 
     all_ok = True
@@ -517,6 +804,14 @@ if __name__ == "__main__":
     all_ok &= check_multi_symbol_overlap(candles[:20_000], candles2[:20_000])
     all_ok &= check_staggered_start(candles[:20_000], candles2[stagger_offset:n_stagger])
     all_ok &= check_forced_liquidation_multi(candles[:500], candles2[:500])
+
+    # 지정가/조건부 주문 전용 경로 — 봉 내 체결가, 여러 봉을 사는 미체결 주문, reduce_only
+    # clamp, 슬리피지 방향, 만료, 강제청산 시 장부 정리. 위 케이스들은 전부 시장가라 이 중
+    # 어느 것도 밟지 않는다. 참조 구현이 느려서 구간을 잘라 쓴다.
+    all_ok &= check_limit_orders(candles[:60_000])
+    all_ok &= check_stop_orders(candles[:60_000])
+    all_ok &= check_order_expiry(candles[:20_000])
+    all_ok &= check_liquidation_cancels_orders(candles[:500], candles2[:500])
 
     print("PARITY:", "ALL OK" if all_ok else "FAILED")
     sys.exit(0 if all_ok else 1)

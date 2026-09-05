@@ -1,4 +1,3 @@
-import copy
 import os
 import sys
 from datetime import datetime, timezone
@@ -7,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from tqdm import tqdm
 
+from core.backtest import order_book
 from core.backtest.candle_merge import merge_candle_timeline
 from core.backtest.metrics import build_multi_symbol_buy_and_hold_curve, forward_fill_nan
 from core.backtest.SingleThreadedBacktester import SingleThreadedBacktester
@@ -15,6 +15,7 @@ from core.backtest.result_writer import write_run_json, write_series_shards
 from core.backtest.status import Status
 from core.backtest.trade import Trade
 from core.streamer import Action
+from core.streamer import ActionType
 from core.streamer.candle import Candle
 from core.streamer.indicator.base_indicator import BaseIndicator
 
@@ -191,10 +192,19 @@ class FastBacktester(SingleThreadedBacktester):
 
         trades: List[Trade] = []
         max_leverage = 0.0
-        # (event idx, post-trade margin, {symbol: (position, avg_price)}) marks for equity
+        # (effective_from, post-trade margin, {symbol: (position, avg_price)}) marks for equity
         # reconstruction — a fill only changes one symbol's position, but reconstructing equity
         # for the segment needs every symbol's state, so the full snapshot is kept each time.
+        # ``effective_from``은 이 상태가 처음 적용되는 이벤트 인덱스다. MARKET 체결은 이벤트의
+        # 자본이 기록된 **뒤에** 일어나므로 idx+1부터, 미체결 주문 체결은 자본 기록 **전에**
+        # 일어나므로 idx부터다. 한 이벤트 안에서 미체결 mark가 MARKET mark보다 먼저 쌓이므로
+        # 리스트는 계속 단조 비감소를 유지한다.
         trade_marks: List[Tuple[int, float, Dict[str, Tuple[float, float]]]] = []
+
+        def mark(effective_from: int) -> None:
+            trade_marks.append((effective_from, status.margin,
+                                {s: (p.position, p.avg_price)
+                                 for s, p in status.positions.items()}))
 
         status = self.status
         self.streamer.indicators = run_indicators
@@ -206,6 +216,15 @@ class FastBacktester(SingleThreadedBacktester):
                     event_candles[symbol] = candle
                     status.last_close[symbol] = candle.close
 
+                # 미체결 주문은 봉이 닫히기 전에 채워진다 — 시가평가/decide_action보다 앞이다
+                # (reference와 같은 자리). 이 체결은 이 이벤트의 자본에 이미 반영되므로 mark의
+                # effective_from이 idx+1이 아니라 idx다.
+                for trade in self._match_resting_orders(event_candles, event_time):
+                    if trade.leverage > max_leverage:
+                        max_leverage = trade.leverage
+                    trades.append(trade)
+                    mark(event_idx)
+
                 # 시가평가를 먼저 한다 (before-indicator가 거래 전 스냅샷을 보게 하려면 이 순서).
                 for symbol, pos_state in status.positions.items():
                     if pos_state.position != 0.0 and symbol in status.last_close:
@@ -215,6 +234,8 @@ class FastBacktester(SingleThreadedBacktester):
                 # 강제청산: 시가평가 자본이 0 이하면 파산. 지표 갱신은 파산 여부와 무관하게
                 # 계속된다 — 건너뛰는 것은 스트리머의 결정 호출뿐이다 (reference와 동일).
                 bankrupt = event_equity <= 0.0
+                if bankrupt:
+                    order_book.cancel_all(status)
                 actions: List[Action] = []
                 for symbol in symbols:
                     candle = event_candles.get(symbol)
@@ -241,29 +262,19 @@ class FastBacktester(SingleThreadedBacktester):
                     actions.extend(symbol_actions)
 
                 for action in actions:
+                    if self._submit_book_action(action, event_time):
+                        continue
                     if action.quantity == 0:
                         continue
                     price = status.last_close.get(action.symbol)
                     if price is None:
                         continue
-                    prev_status = copy.deepcopy(status)
-                    wnl, fee = self._trade(action, price)
-                    leverage = status.update_leverage()
-                    if leverage > max_leverage:
-                        max_leverage = leverage
-                    trades.append(Trade(
-                        timestamp=event_time,
-                        symbol=action.symbol,
-                        quantity=action.quantity,
-                        price=price,
-                        wnl=wnl,
-                        fee=fee,
-                        status=prev_status,
-                        leverage=leverage,
-                    ))
-                    trade_marks.append((event_idx, status.margin,
-                                        {s: (p.position, p.avg_price)
-                                        for s, p in status.positions.items()}))
+                    trade = self._fill(action.symbol, action.quantity, price, event_time,
+                                       ActionType.MARKET.value, event_time)
+                    if trade.leverage > max_leverage:
+                        max_leverage = trade.leverage
+                    trades.append(trade)
+                    mark(event_idx + 1)
         finally:
             self.streamer.indicators = original_indicators
 
@@ -320,8 +331,9 @@ class FastBacktester(SingleThreadedBacktester):
 
         Between trades margin and every symbol's (position, avg_price) are constant, so each
         segment is ``margin + Σ_sym position_sym * (close_sym[seg] - avg_price_sym)``. The
-        reference records equity *before* the trade at a trade event, so the state from trade k
-        applies to events (idx_k, idx_{k+1}].
+        reference records equity *before* a MARKET fill, so that state applies from ``idx_k + 1``;
+        a resting (limit/stop) fill happens *before* the equity is recorded, so its state applies
+        from ``idx_k`` itself. 그 차이를 mark에 담긴 ``effective_from``이 들고 있다.
 
         첫 거래 이전 구간은 **진입 시점의 실제 상태**로 시드한다 (``run()``을 같은 인스턴스로
         두 번 부르거나 포지션을 들고 시작할 때를 위해).
@@ -333,8 +345,8 @@ class FastBacktester(SingleThreadedBacktester):
         seg_start = 0
         margin = entry_margin
         positions = entry_positions
-        for idx, m, pos_snapshot in trade_marks:
-            seg_end = idx + 1
+        for effective_from, m, pos_snapshot in trade_marks:
+            seg_end = effective_from
             equity[seg_start:seg_end] = margin
             for sym, (pos, avg) in positions.items():
                 if pos != 0.0:
