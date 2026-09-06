@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict, List
 
 from core.domain import Action, Candle
 from core.domain.status import Status
@@ -19,7 +19,12 @@ class TradeStreamer(BaseStreamer):
         self.symbol = symbol
         self.dir = 1  # 다음 진입 방향: 1이면 롱, -1이면 숏
 
-    def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
+    def decide_action(self, candles: Dict[str, Candle], status: Status) -> List[Action]:
+        symbol = self.symbols[0]
+        candle = candles.get(symbol)
+        if candle is None:
+            return []
+
         position = status.position_for(symbol).position
         if position == 0:
             # 포지션이 없으면 dir 방향으로 전액 진입하고 다음 번을 위해 방향을 뒤집는다.

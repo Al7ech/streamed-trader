@@ -38,7 +38,7 @@ class Status:
         self.last_close: Dict[str, float] = last_close if last_close is not None else {}
         #: 심볼별 미체결(resting) 주문. 거래소에서 미체결 주문은 실제로 계좌 상태의 일부이고,
         #: Status는 백테스터와 라이브 트레이더가 공유하는 단일 계좌 상태 표현이므로 여기 둔다.
-        #: 덕분에 decide_action(symbol, candle, status) 시그니처를 바꾸지 않고도 전략이 자기
+        #: 덕분에 decide_action(candles, status) 시그니처를 바꾸지 않고도 전략이 자기
         #: 미체결 주문을 읽고 취소할 수 있다. 리스트 순서 = 제출 순서.
         self.open_orders: Dict[str, List["OpenOrder"]] = \
             open_orders if open_orders is not None else {}

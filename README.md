@@ -51,6 +51,8 @@ renders candles, indicators, trade markers, an equity curve and monthly stats.
 Subclass `BaseStreamer`, declare your indicators, and implement `decide_action`:
 
 ```python
+from typing import Dict, List
+
 from core.domain.action import Action
 from core.domain.candle import Candle
 from core.domain.status import Status
@@ -60,29 +62,40 @@ from core.streamer.indicator.moving_average import MovingAverage
 
 class MyStreamer(BaseStreamer):
     def __init__(self, symbol: str):
-        super().__init__({"fast": MovingAverage(10), "slow": MovingAverage(60)})
+        super().__init__([symbol], {symbol: {
+            "fast": MovingAverage(10),
+            "slow": MovingAverage(60),
+        }})
         self.symbol = symbol
 
-    def decide_action(self, candle: Candle, status: Status) -> Action:
-        fast = self.indicators["fast"].get_latest()
-        slow = self.indicators["slow"].get_latest()
-        if fast is None or slow is None:      # warm-up
-            return Action(0)
-        if status.position == 0 and fast > slow:
-            return Action(status.total_margin() / candle.close)
-        if status.position > 0 and fast < slow:
-            return Action(-status.position)   # close
-        return Action(0)
+    def decide_action(self, candles: Dict[str, Candle], status: Status) -> List[Action]:
+        candle = candles.get(self.symbol)
+        if candle is None:                     # this symbol didn't close this event
+            return []
+        ind = self.indicators[self.symbol]
+        fast = ind["fast"].get_latest()
+        slow = ind["slow"].get_latest()
+        if fast is None or slow is None:       # warm-up
+            return []
+        position = status.position_for(self.symbol).position
+        if position == 0 and fast > slow:
+            return [Action(self.symbol, status.total_margin() / candle.close)]
+        if position > 0 and fast < slow:
+            return [Action(self.symbol, -position)]   # close
+        return []
 ```
 
 Two rules matter:
 
 1. **`Action.quantity` is a signed delta, not a target.** Positive buys, negative sells.
-   `Action(-status.position)` closes; `Action(-2 * status.position)` flips.
-2. **Indicators ingest the candle you are deciding on — always.** The engine updates every
-   indicator with a closed candle *first*, then calls `decide_action`. `get_latest()` is the
+   `Action(sym, -position)` closes; `Action(sym, -2 * position)` flips.
+2. **`decide_action` is called once per event** with `{symbol: candle}` for every symbol whose
+   candle just closed (live: always one entry; a merged backtest event: one or more). Every
+   traded symbol's indicators are already updated for that event, so a strategy can read and act
+   on other symbols too — each `Action` carries its own `.symbol`. The engine updates every
+   indicator with its closed candle *first*, then calls `decide_action`. `get_latest()` is the
    value through the candle being decided on, `get_index(-2)` the one before that — the current
-   candle's OHLCV is also available directly as the `candle` argument.
+   candle's OHLCV is also available directly from the `candles` dict.
 
    This is a semantic convention, not a look-ahead guard: the candle has already closed, so
    including it leaks nothing. It does mean breakout comparisons need `get_index(-2)`, not

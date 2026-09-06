@@ -24,16 +24,16 @@ class BaseIndicator(ABC):
         """
         Update the indicator with a new candle.
 
-        The engine always calls this **before** ``decide_action`` runs for the same candle, so
-        ``get_latest()`` includes the candle being decided on and ``read(-2)`` is the
-        previous one. That candle has already closed by then, so this is a semantics choice, not
+        The engine always calls this — for **every** symbol in the event — **before**
+        ``decide_action`` runs for that event, so ``get_latest()`` includes the candle being
+        decided on and ``read(-2)`` is the previous one. That candle has already closed by then, so this is a semantics choice, not
         look-ahead — but it does mean breakout/extremum comparisons must read ``read(-2)``
         instead of ``get_latest()``: a Donchian max channel that included the current bar would
         satisfy ``channel_max >= candle.high >= candle.close``, so ``close > channel_max`` could
         never fire. Level-style indicators (MA, ATR, rolling std) read fine at ``get_latest()``.
 
-        ``status`` is the pre-trade account snapshot — the same one ``decide_action`` saw for
-        this candle (on an entry candle, ``status.position_for(symbol).position`` is still 0).
+        ``status`` is the pre-trade account snapshot — the same one ``decide_action`` sees for
+        this event (on an entry candle, ``status.position_for(symbol).position`` is still 0).
         During the live trader's indicator prefeed the historical status is unknown and ``None``
         is passed, so status-aware indicators must treat ``None`` as warm-up.
         """

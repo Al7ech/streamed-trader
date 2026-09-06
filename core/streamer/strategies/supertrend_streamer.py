@@ -1,5 +1,5 @@
 import logging
-from typing import List
+from typing import Dict, List
 
 from core.domain.action import Action
 from core.domain.candle import Candle
@@ -35,7 +35,12 @@ class SupertrendStreamer(BaseStreamer):
             f"SupertrendStreamer initialized with params: [atr_window={atr_window},"
             f"multiplier={multiplier},max_loss={max_loss}]")
 
-    def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
+    def decide_action(self, candles: Dict[str, Candle], status: Status) -> List[Action]:
+        symbol = self.symbols[0]
+        candle = candles.get(symbol)
+        if candle is None:
+            return []
+
         st = self.indicators[symbol]["ST"]
         line, direction = st.read_both()
         if line is None or direction is None:

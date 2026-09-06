@@ -27,13 +27,17 @@ class BaseStreamer(ABC):
         self.indicators = indicators
 
     @abstractmethod
-    def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
+    def decide_action(self, candles: Dict[str, Candle], status: Status) -> List[Action]:
         """
-        Update된 candle과 indicator들을 바탕으로 거래 Action들을 결정한다.
+        Update된 candle들과 indicator들을 바탕으로 거래 Action들을 결정한다.
 
-        :param symbol: 이번에 마감된 candle의 심볼. ``self.indicators``는 이 스트리머가
-            다루는 **모든** 심볼의 지표를 담고 있으므로, 구현은 ``symbol`` 외의 다른 심볼의
-            지표도 읽을 수 있고, 다른 심볼을 대상으로 하는 Action도 반환할 수 있다.
+        이벤트당 **한 번** 호출된다 — 호출 시점에 이 스트리머가 다루는 **모든** 심볼의
+        지표가 이번 이벤트 캔들까지 이미 갱신돼 있으므로, 크로스심볼 결정이 자연스럽다.
+
+        :param candles: 이번 이벤트에 캔들이 마감한 심볼 → 그 캔들. 라이브는 항상 원소
+            하나, 백테스트 병합 이벤트는 하나 이상. ``self.indicators``는 여기 없는 심볼의
+            지표도 담고 있으므로, 구현은 임의의 심볼 지표를 읽고 임의의 심볼을 겨냥한
+            Action(각 ``Action``이 자기 ``.symbol``을 든다)을 반환할 수 있다.
         :return: Action 리스트. 비어 있으면 아무 것도 하지 않는다.
         """
         pass

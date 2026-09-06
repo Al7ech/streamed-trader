@@ -287,7 +287,7 @@ implements one method, `__aiter__` — nothing else in the codebase has to know 
 2. executor.match_resting()        # fills happen here (sim only; live's exchange does it)
 3. executor.mark_to_market()       # -> equity for this event
 4. executor.force_liquidation()    # sim: equity <= 0 -> cancel_all + flatten every symbol
-5. per symbol: update indicators -> decide_action (or flatten if bankrupt)
+5. update every symbol's indicators, then one streamer.decide_action(candles, status) for the whole event (engine flattens each symbol itself if bankrupt — decide_action is not called)
 6. recorder.record_event()
 7. per action: executor.submit()   # sim: CANCEL/register/fill in list order; live: fire the order, return
 8. recorder.end_event()
@@ -501,16 +501,19 @@ those check scripts default to WARNING.
   indicators)` takes the list of symbols it trades and `indicators: Dict[str, Dict[str,
   BaseIndicator]]` — one indicator instance per `(symbol, name)` pair (never shared across
   symbols, since each instance carries its own series state). It exposes the abstract
-  `decide_action(symbol, candle, status) -> List[Action]`, called by all three engines once a
-  symbol's indicators are updated. `symbol` identifies whose candle just closed and triggered the call,
-  but `self.indicators` holds every traded symbol's state, so an implementation can read other
-  symbols' indicators too and return `Action`s (each carrying its own `.symbol`) for symbols other
-  than the trigger — this is what makes pairs/relative-strength/rotation strategies possible. A
-  single-symbol strategy just ignores the `symbol` argument (`self.symbols` has one element) and
-  returns `[Action(self.symbols[0], qty)]` or `[]`.
+  `decide_action(candles, status) -> List[Action]`, called by all three engines **once per event**,
+  after every traded symbol's indicators are updated. `candles: Dict[str, Candle]` holds each
+  symbol whose candle just closed this event mapped to that candle — live always has exactly one
+  entry, a merged backtest event has one or more. `self.indicators` holds every traded symbol's
+  state regardless of what's in `candles`, so an implementation can read any symbol's indicators
+  and return `Action`s (each carrying its own `.symbol`) for any symbol — this is what makes
+  pairs/relative-strength/rotation strategies possible. A single-symbol strategy pulls
+  `candle = candles.get(self.symbols[0])`, returns `[]` if it's `None`, and otherwise returns
+  `[Action(self.symbols[0], qty)]` or `[]`. A strategy constructed multi-symbol with no cross-symbol
+  coupling (`KeltnerStreamer`) just loops `self.symbols` inside `decide_action`.
 - Indicators come in two types. `BaseIndicator` (ABC) is a loop-updated rolling-window indicator:
   `update(candle, status=None)` ingests one candle plus the *pre-trade* `Status` snapshot — the
-  same one `decide_action` saw for that candle (`TradingEngine.warmup` passes `None`, so
+  same one `decide_action` sees for that event (`TradingEngine.warmup` passes `None`, so
   status-aware indicators must treat `None` as warm-up); `get_index(idx)`/`get_latest()`
   read back past values (`-1` = latest, `-2` = previous, ...). An indicator that reads `status`
   cannot be vectorized (account state is a feedback loop of the strategy's own trades) and must
@@ -534,12 +537,13 @@ those check scripts default to WARNING.
   it on; indicators sharing a group share a pane and price scale (this grouping is keyed by
   indicator **name** only, shared across symbols).
 - **Ordering matters**: `TradingEngine.process_event` — the single loop backtest, dry run and live
-  all go through — always updates **every** indicator for a symbol with its closed candle *before*
-  calling `streamer.decide_action` for that symbol, so
-  `get_latest()` includes the candle being decided on and `get_index(-2)` is the previous one —
-  the current candle's OHLCV is also available directly as the `candle` argument, and every
+  all go through — updates **every** indicator for **every** symbol in the event with its closed
+  candle *before* calling `streamer.decide_action(candles, status)` once for the event, so
+  `get_latest()` includes the candle being decided on and `get_index(-2)` is the previous one, and
+  a cross-symbol strategy sees every symbol's indicators already advanced to this event —
+  the current candle's OHLCV is also available directly from the `candles` dict, and every
   strategy uses it. The `Status` passed to both `update` and `decide_action` is still the
-  pre-trade snapshot (fills are only applied after every symbol in the event has been decided),
+  pre-trade snapshot (fills are only applied after `decide_action` has returned for the event),
   so an indicator that reads `status` sees exactly what the decision it's paired with saw. The
   backtester records the series right after `decide_action` returns, once every indicator is
   already updated, so every plotted column is the value the decision actually saw.
@@ -580,8 +584,9 @@ those check scripts default to WARNING.
   mechanically):
   `CrossMovingAverageStreamer` (MA10/MA25 cross — the simplest one, read it first),
   `KeltnerStreamer` (ATR channel breakout; wired into `backtest.py` and `trader.py` — accepts
-  `symbols: List[str]` and trades each independently with its own indicator state, but with no
-  cross-symbol coupling, since `decide_action` only ever reads the `symbol` it was called with),
+  `symbols: List[str]` and trades each independently with its own indicator state via a plain
+  `for symbol in self.symbols` loop inside `decide_action` that delegates to a per-symbol
+  `_decide_symbol`, with no cross-symbol coupling),
   `SupertrendStreamer` (always-in trend flip), `MeanReversionZScoreStreamer` (z-score fade;
   stateful across candles), `MomentumTimeExitStreamer` (momentum + fixed-time exit),
   `VolumeConfirmedMomentumStreamer` (the previous one subclassed to add a volume entry filter),
@@ -594,8 +599,9 @@ those check scripts default to WARNING.
   `mean_reversion_zscore`, `trendline_bounce`, `keltner_streamer`) are deliberately left alone as
   illustrations of the older style; they compare the closed bar's `low`/`high` to a stored stop
   and then fill at that bar's **close**, which is exactly the pricing error resting orders remove.
-  No shipped example strategy uses the cross-symbol capability yet (`decide_action` can read and
-  act on other symbols' state, but the examples don't). **The `visualise/` frontend does not render multi-symbol
+  No shipped example strategy uses the cross-symbol capability yet (`decide_action` receives the
+  whole event and can read and act on other symbols' state, but the examples each handle only
+  `self.symbols[0]` / loop `self.symbols` independently). **The `visualise/` frontend does not render multi-symbol
   runs** (multiple price panes, per-symbol trade markers, `summary.by_symbol`) — that's unbuilt
   follow-up work; only the core engine and output schema support multiple symbols today.
 
@@ -604,7 +610,7 @@ those check scripts default to WARNING.
 `Action` can request an order that is **not** filled on the decision candle: a `LIMIT` at a price,
 or a `STOP_MARKET` at a trigger. Those live in `Status.open_orders: Dict[str, List[OpenOrder]]`
 until they fill, expire, or are cancelled — open orders really are account state on an exchange,
-and putting them on `Status` means `decide_action(symbol, candle, status)` needs no signature
+and putting them on `Status` means `decide_action(candles, status)` needs no signature
 change to read them (`status.open_orders_for(symbol)`; cancel via `Action.cancel`, never by
 mutating the list). `order_book.py` holds the one copy of the matching rules, and
 `SimulatedExecutor` is the one caller — backtest and dry run are the *same object*, so they cannot
@@ -668,9 +674,9 @@ one symbol draws down the same pool a profit on another symbol credits. `status.
 symbol)` lazily creates a flat `PositionState` for a symbol not yet touched, so callers never
 `KeyError` on a symbol they haven't traded. `total_margin()` sums `margin` plus every symbol's
 `unrealised_pnl`; `update_leverage()` sums notional (`avg_price * abs(position)`) across every
-symbol over that. `status.last_close: Dict[str, float]` is engine-maintained (set to each
-symbol's close as it's processed within a merged event, before any symbol's own `decide_action`
-runs that event) — it's what lets a cross-symbol action price a non-trigger symbol correctly.
+symbol over that. `status.last_close: Dict[str, float]` is engine-maintained (every symbol's close
+in a merged event is frozen up front, before `decide_action` runs for that event) — it's what
+lets a cross-symbol action price a non-trigger symbol correctly.
 `status.fee_ratio` is the account's fee rate — a `Status` field (default `DEFAULT_FEE_RATIO` in
 `core/domain/status.py`) the executor sets: `SimulatedExecutor` from its constructor arg,
 `LiveExecutor` from `futures_commission_rate`. Strategies read it when sizing (`price * (1/lev +

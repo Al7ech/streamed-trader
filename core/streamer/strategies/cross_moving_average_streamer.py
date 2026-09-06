@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict, List
 
 from core.domain.action import Action
 from core.domain.candle import Candle
@@ -30,7 +30,12 @@ class CrossMovingAverageStreamer(BaseStreamer):
         }})
         self.symbol = symbol
 
-    def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
+    def decide_action(self, candles: Dict[str, Candle], status: Status) -> List[Action]:
+        symbol = self.symbols[0]
+        candle = candles.get(symbol)
+        if candle is None:
+            return []
+
         ind = self.indicators[symbol]
         ma10 = ind["ma10"].get_latest()
         ma25 = ind["ma25"].get_latest()

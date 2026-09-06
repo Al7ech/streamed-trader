@@ -1,5 +1,5 @@
 import logging
-from typing import List
+from typing import Dict, List
 
 from core.domain.action import Action
 from core.domain.candle import Candle
@@ -41,7 +41,16 @@ class KeltnerStreamer(BaseStreamer):
             f"KeltnerStreamer initialized with params: [window={window},m_entry={m_entry},"
             f"m_exit={m_exit},max_loss={max_loss}]")
 
-    def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
+    def decide_action(self, candles: Dict[str, Candle], status: Status) -> List[Action]:
+        # 심볼별 독립 판단 (크로스심볼 커플링 없음). 이 이벤트에 마감한 심볼만 순회한다.
+        actions: List[Action] = []
+        for symbol in self.symbols:
+            candle = candles.get(symbol)
+            if candle is not None:
+                actions.extend(self._decide_symbol(symbol, candle, status))
+        return actions
+
+    def _decide_symbol(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
         ind = self.indicators[symbol]
         ma = ind["MA"].get_latest()
         atr = ind["ATR"].get_latest()

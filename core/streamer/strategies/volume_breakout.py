@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from core.domain.action import Action
 from core.domain.candle import Candle
@@ -40,8 +40,13 @@ class VolumeConfirmedMomentumStreamer(MomentumTimeExitStreamer):
             f"[mom_lookback={mom_lookback},entry_threshold_pct={entry_threshold_pct},"
             f"hold_candles={hold_candles},vol_window={vol_window},min_vol_z={min_vol_z}]")
 
-    def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
-        actions = super().decide_action(symbol, candle, status)
+    def decide_action(self, candles: Dict[str, Candle], status: Status) -> List[Action]:
+        symbol = self.symbols[0]
+        candle = candles.get(symbol)
+        if candle is None:
+            return []
+
+        actions = super().decide_action(candles, status)
 
         # 플랫 상태의 진입 액션만 볼륨 게이트로 필터
         position = status.position_for(symbol).position

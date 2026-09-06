@@ -22,7 +22,7 @@ import math
 import sys
 from concurrent.futures import Future
 from datetime import datetime, timezone
-from typing import List
+from typing import Dict, List
 
 from core.backtest.in_memory_candle_producer import InMemoryCandleProducer
 from core.backtest.recorder import BacktestRecorder
@@ -79,8 +79,16 @@ class LimitLadderStreamer(BaseStreamer):
         self.ttl = ttl
         self._bar = 0
 
-    def decide_action(self, symbol, candle: Candle, status: Status):
-        self._bar += 1
+    def decide_action(self, candles: Dict[str, Candle], status: Status):
+        self._bar += 1  # 이벤트당 1회 (검사 데이터는 단일 심볼이라 봉 카운트와 같다)
+        actions = []
+        for symbol in self.symbols:
+            candle = candles.get(symbol)
+            if candle is not None:
+                actions.extend(self._decide_symbol(symbol, candle, status))
+        return actions
+
+    def _decide_symbol(self, symbol, candle: Candle, status: Status):
         position = status.position_for(symbol).position
         resting = status.open_orders_for(symbol)
 
@@ -110,8 +118,7 @@ class StopLadderStreamer(LimitLadderStreamer):
     시작하면 시가 체결)을 모두 태운다.
     """
 
-    def decide_action(self, symbol, candle: Candle, status: Status):
-        self._bar += 1
+    def _decide_symbol(self, symbol, candle: Candle, status: Status):
         position = status.position_for(symbol).position
         resting = status.open_orders_for(symbol)
         if self._bar % 200 == 0 and resting:

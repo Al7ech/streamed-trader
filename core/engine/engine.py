@@ -92,8 +92,8 @@ class TradingEngine:
         for symbol, candle in candles.items():
             st.last_close[symbol] = candle.close
 
-        # 2. 미체결 주문 매칭. 심볼 순회는 streamer.symbols 순서다 — 결정 루프와 같은 순서를
-        #    써야 어떤 실행 경로에서도 같은 결과가 나온다.
+        # 2. 미체결 주문 매칭. 심볼 순회는 streamer.symbols 순서다 — 지표 갱신 루프와 같은
+        #    순서를 써야 어떤 실행 경로에서도 같은 결과가 나온다.
         for symbol in self.streamer.symbols:
             candle = candles.get(symbol)
             if candle is not None:
@@ -108,32 +108,37 @@ class TradingEngine:
         #    무관하게 계속된다 — 건너뛰는 것은 오직 스트리머의 결정 호출뿐이다.
         bankrupt = self.executor.force_liquidation(equity)
 
-        # 5. 심볼별 지표 갱신 → 결정. 모든 지표가 decide_action보다 **먼저** 이 캔들을
-        #    반영한다. status는 decide_action이 보는 것과 같은 거래 전 스냅샷이다.
-        actions: List[Action] = []
+        # 5. 이 이벤트의 **모든** 심볼 지표를 먼저 갱신한 뒤, decide_action을 이벤트당 한 번
+        #    부른다 — 결정 시점에 모든 심볼 지표가 이 캔들까지 반영돼 있어 크로스심볼 결정이
+        #    가능하다. status는 decide_action이 보는 것과 같은 거래 전 스냅샷이다.
         for symbol in self.streamer.symbols:
             candle = candles.get(symbol)
             if candle is None:
                 continue
-
-            symbol_indicators = self.streamer.indicators.get(symbol, {})
-            for indicator in symbol_indicators.values():
+            for indicator in self.streamer.indicators.get(symbol, {}).values():
                 indicator.update(candle, st)
 
-            if bankrupt:
+        actions: List[Action] = []
+        if bankrupt:
+            # 파산 후에는 스트리머를 부르지 않는다 — 캔들이 마감한 심볼만 flatten한다.
+            for symbol in self.streamer.symbols:
+                if candles.get(symbol) is None:
+                    continue
                 position = st.position_for(symbol).position
                 if position != 0.0:
                     actions.append(Action(symbol, -position))
-            else:
-                actions.extend(self.streamer.decide_action(symbol, candle, st))
+        else:
+            actions = list(self.streamer.decide_action(candles, st))
 
-            # 캔들 하나당 DEBUG 한 줄. isEnabledFor로 감싸는 게 핵심이다 —
-            # generate_dict_string은 전 지표를 순회하며 get_latest()를 부르는데, 인자로 넘기면
-            # DEBUG가 꺼져 있어도 매 캔들 실행된 뒤 버려진다.
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug("symbol=%s candle=%s actions=%s status=%s indicators=%s",
-                                  symbol, candle, actions, st,
-                                  generate_dict_string(symbol_indicators))
+        # 이벤트당 DEBUG 한 줄. isEnabledFor로 감싸는 게 핵심이다 — generate_dict_string은
+        # 전 지표를 순회하며 get_latest()를 부르는데, 인자로 넘기면 DEBUG가 꺼져 있어도
+        # 매 이벤트 실행된 뒤 버려진다.
+        if self.logger.isEnabledFor(logging.DEBUG):
+            for symbol in candles:
+                self.logger.debug(
+                    "symbol=%s candle=%s actions=%s status=%s indicators=%s",
+                    symbol, candles[symbol], actions, st,
+                    generate_dict_string(self.streamer.indicators.get(symbol, {})))
 
         # 6. 기록. 모든 지표가 이미 갱신되고 decide_action이 반환한 직후라, 레코더가 읽는 모든
         #    값이 그 결정이 실제로 본 값이다.

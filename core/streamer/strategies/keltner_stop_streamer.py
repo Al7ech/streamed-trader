@@ -42,7 +42,7 @@ class KeltnerStopStreamer(KeltnerStreamer):
                       reduce_only=True,
                       client_id=self.STOP_ID)
 
-    def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
+    def _decide_symbol(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
         ind = self.indicators[symbol]
         ma = ind["MA"].get_latest()
         atr = ind["ATR"].get_latest()
