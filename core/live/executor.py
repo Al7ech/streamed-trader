@@ -97,16 +97,15 @@ def resolve_margin_asset(symbols: List[str]) -> str:
     return next(iter(unique))
 
 
-def order_from_exchange(o: Dict, last_close: Optional[Dict[str, float]] = None
-                        ) -> Optional[OpenOrder]:
+def order_from_exchange(o: Dict) -> Optional[OpenOrder]:
     """거래소 주문 표현(REST의 open order, 또는 ``ORDER_TRADE_UPDATE``의 ``o``)을 OpenOrder로.
 
     REST와 스트림이 필드 이름을 다르게 쓰므로 (``origQty``/``q``, ``type``/``o`` …) 둘 다
     받는다. 이 엔진이 모르는 주문 타입(트레일링 스탑 등, 사람이 앱에서 낸 것)은 None을
     돌려 장부에 넣지 않는다 — 체결 판정 규칙이 없는 주문을 들고 있어봐야 오해만 낳는다.
 
-    :param last_close: 트리거 방향을 유추할 기준가. 기동 시점의 적재에는 아직 종가가 없어
-        비어 있고, 그때는 수량 부호로 방향을 잡는다.
+    트리거 방향은 거래소가 준 ``type``+``side``로 그대로 복원한다 (STOP_MARKET+BUY 또는
+    TAKE_PROFIT_MARKET+SELL이면 위로 관통 시 발동) — 기준가 추측이 필요 없다.
     """
     raw_type = o.get("type") or o.get("o") or ""
     if raw_type in ("LIMIT", "STOP", "TAKE_PROFIT"):
@@ -127,8 +126,7 @@ def order_from_exchange(o: Dict, last_close: Optional[Dict[str, float]] = None
         return None
 
     quantity = -qty if side == "SELL" else qty
-    reference = (last_close or {}).get(o.get("symbol") or o.get("s") or "")
-    trigger_above = trigger >= reference if (reference and trigger) else quantity > 0
+    trigger_above = (raw_type == "STOP_MARKET") == (side == "BUY")
     return OpenOrder(
         symbol=o.get("symbol") or o.get("s") or "",
         quantity=quantity,
@@ -187,7 +185,7 @@ def build_status(account_info: Dict, raw_open_orders: List[Dict], symbols: List[
         symbol = o.get("symbol", "")
         if symbol not in symbol_set:
             continue
-        order = order_from_exchange(o, status.last_close)
+        order = order_from_exchange(o)
         if order is not None:
             status.open_orders_for(symbol).append(order)
     return status
@@ -428,10 +426,7 @@ class LiveExecutor(Executor):
         self._dispatch(action)
 
     def _dispatch(self, action: Action) -> None:
-        # reference_price는 조건부 주문을 STOP_MARKET / TAKE_PROFIT_MARKET 중 어느 쪽으로
-        # 보낼지 고르는 데 쓴다 — 거래소는 트리거가 현재가의 반대쪽에 있는 주문을 거부한다.
-        future = self._orders.execute_action(
-            action, reference_price=self.status.last_close.get(action.symbol))
+        future = self._orders.execute_action(action)
         # submit은 run_async가 도는 이벤트 루프 스레드에서 불리므로 create_task가 가능하다.
         task = asyncio.create_task(self._await_order_result(future, action))
         self._pending_order_tasks.add(task)
@@ -481,11 +476,6 @@ class LiveExecutor(Executor):
         self._pending_decision[(symbol, client_order_id)] = pending
 
     # ------------------------------------------------------- 계좌 상태 적재
-
-    def _order_from_exchange(self, o: Dict) -> Optional[OpenOrder]:
-        """스트림이 준 주문 표현을 OpenOrder로. 해석 규칙은 :func:`order_from_exchange`에 있다
-        (기동 시점의 적재와 같은 한 벌을 쓴다)."""
-        return order_from_exchange(o, self.status.last_close)
 
     def reconcile_resumed(self, saved: Optional[Status]) -> None:
         """재개한 런이 기억하는 포지션/미체결 주문을 거래소의 실제 값과 대조한다.
@@ -684,7 +674,7 @@ class LiveExecutor(Executor):
         if order_status == _ACK_ORDER_STATE:
             if any(o.client_id == client_id for o in book):
                 return  # 이미 등록됨 (재연결 후 중복 이벤트 등)
-            order = self._order_from_exchange(order_data)
+            order = order_from_exchange(order_data)
             if order is not None:
                 book.append(order)
                 self.logger.info("미체결 주문 등록: %s", order)

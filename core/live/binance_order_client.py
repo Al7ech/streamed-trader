@@ -142,16 +142,16 @@ class BinanceOrderClient:
         future = self.executor.submit(self._execute_order_with_retry, order_request)
         return future
 
-    #: 엔진의 ActionType을 거래소 주문 타입으로 옮기는 표. STOP_MARKET은 트리거가 현재가의
-    #: 어느 쪽에 있느냐에 따라 갈리므로 여기 없고 execute_action이 따로 고른다.
+    #: 엔진의 ActionType을 거래소 주문 타입으로 옮기는 표. STOP_MARKET은 trigger_above와
+    #: 주문 방향에 따라 STOP_MARKET / TAKE_PROFIT_MARKET으로 갈리므로 여기 없고
+    #: execute_action이 따로 고른다.
     _ORDER_TYPES = {
         ActionType.MARKET: OrderType.MARKET,
         ActionType.LIMIT: OrderType.LIMIT,
     }
 
     def execute_action(self, action: Action,
-                       client_order_id: Optional[str] = None,
-                       reference_price: Optional[float] = None) -> Future[OrderResult]:
+                       client_order_id: Optional[str] = None) -> Future[OrderResult]:
         """
         Execute a trading action. ``action.symbol``이 대상 심볼이다 — Action이 자기 심볼을
         들고 다니므로 별도 symbol 인자를 받지 않는다.
@@ -160,10 +160,6 @@ class BinanceOrderClient:
             action: Trading action from streamer
             client_order_id: 이 주문에 붙일 newClientOrderId. 호출자가 체결 이벤트를 자기
                 결정과 짝짓고 나중에 취소하는 데 쓴다.
-            reference_price: STOP_MARKET을 STOP_MARKET / TAKE_PROFIT_MARKET 중 어느 쪽으로
-                보낼지 정하는 기준가 (보통 최근 종가). 거래소는 트리거가 현재가의 반대쪽에
-                있는 조건부 주문을 거부하므로, ``action.trigger_above``와 이 값으로 맞는 쪽을
-                고른다. None이면 trigger_above만 보고 정한다.
 
         Returns:
             Future object that will contain the OrderResult
@@ -183,12 +179,10 @@ class BinanceOrderClient:
         quantity = abs(action.quantity)
 
         if action.order_type is ActionType.STOP_MARKET:
-            trigger_above = action.trigger_above
-            if trigger_above is None and reference_price is not None:
-                trigger_above = action.trigger_price >= reference_price
             # 매수 주문의 트리거가 위에 있으면 돌파 매수(STOP), 아래면 익절 매수
-            # (TAKE_PROFIT). 매도는 대칭이다.
-            takes_profit = (action.quantity > 0) != bool(trigger_above)
+            # (TAKE_PROFIT). 매도는 대칭이다. 거래소는 트리거가 현재가 반대쪽에 있는
+            # 조건부 주문을 거부하므로 trigger_above로 맞는 타입을 고른다.
+            takes_profit = (action.quantity > 0) != bool(action.trigger_above)
             order_type = (OrderType.TAKE_PROFIT_MARKET if takes_profit
                           else OrderType.STOP_MARKET)
         else:

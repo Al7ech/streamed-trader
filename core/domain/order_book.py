@@ -41,7 +41,7 @@ class OpenOrder:
     price: Optional[float] = None
     trigger_price: Optional[float] = None
     #: True면 가격이 트리거 이상으로 올라올 때, False면 트리거 이하로 내려갈 때 발동.
-    #: 등록 시점에 확정된다 (Action.trigger_above가 None이면 last_close로 유도).
+    #: Action.trigger_above를 그대로 옮긴 값이다 (STOP_MARKET이면 항상 명시돼 있다).
     trigger_above: bool = True
     reduce_only: bool = False
     client_id: Optional[str] = None
@@ -92,9 +92,8 @@ class OpenOrder:
 def register_order(status: Status, action: Action, event_time: int, seq: int) -> Optional[OpenOrder]:
     """지정가/조건부 액션을 장부에 올린다. 등록된 OpenOrder, 거부됐으면 None.
 
-    ``action.trigger_above``가 None이면 그 심볼의 마지막 알려진 종가로 방향을 유도한다 —
-    트리거가 현재가보다 위면 위로 관통할 때 발동(= Binance의 STOP_MARKET/TAKE_PROFIT_MARKET
-    구분과 같은 규칙).
+    STOP_MARKET이면 ``action.trigger_above``가 트리거 방향을 그대로 정한다 (``Action``이
+    생성 시점에 필수로 받는다).
     """
     if not action.is_resting:
         raise ValueError(f"장부에 올릴 수 없는 액션이다: {action}")
@@ -112,25 +111,13 @@ def register_order(status: Status, action: Action, event_time: int, seq: int) ->
                        action.symbol, MAX_OPEN_ORDERS_PER_SYMBOL, action)
         return None
 
-    trigger_above = action.trigger_above
-    if action.order_type is ActionType.STOP_MARKET and trigger_above is None:
-        ref = status.last_close.get(action.symbol)
-        if ref is None:
-            # 엔진은 결정 전에 last_close를 채우므로 여기 오면 비정상이다. 매수=위로 돌파,
-            # 매도=아래로 이탈이라는 가장 흔한 모양으로 떨어뜨리고 경고한다.
-            trigger_above = action.quantity > 0
-            logger.warning("%s의 마지막 종가를 몰라 트리거 방향을 수량 부호로 유도한다: %s",
-                           action.symbol, action)
-        else:
-            trigger_above = action.trigger_price >= ref
-
     order = OpenOrder(
         symbol=action.symbol,
         quantity=action.quantity,
         order_type=action.order_type,
         price=action.price,
         trigger_price=action.trigger_price,
-        trigger_above=bool(trigger_above),
+        trigger_above=bool(action.trigger_above),
         reduce_only=action.reduce_only,
         client_id=action.client_id,
         remaining_candles=action.expire_after_candles,

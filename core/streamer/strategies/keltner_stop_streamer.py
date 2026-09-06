@@ -35,10 +35,11 @@ class KeltnerStopStreamer(KeltnerStreamer):
         super().__init__(*args, **kwargs)
         self.logger = logging.getLogger(__name__)
 
-    def _stop(self, symbol: str, quantity: float, level: float) -> Action:
+    def _stop(self, symbol: str, quantity: float, level: float, trigger_above: bool) -> Action:
         return Action(symbol, quantity,
                       order_type=ActionType.STOP_MARKET,
                       trigger_price=level,
+                      trigger_above=trigger_above,
                       reduce_only=True,
                       client_id=self.STOP_ID)
 
@@ -56,7 +57,7 @@ class KeltnerStopStreamer(KeltnerStreamer):
             # 채널을 따라 손절을 옮겨 단다. 이미 체결됐다면 장부에 없으므로 취소는 무해하다.
             level = ma - self.m_exit * atr if position > 0 else ma + self.m_exit * atr
             return [Action.cancel(symbol, self.STOP_ID),
-                    self._stop(symbol, -position, level)]
+                    self._stop(symbol, -position, level, trigger_above=position < 0)]
 
         upper = ma + self.m_entry * atr
         lower = ma - self.m_entry * atr
@@ -72,7 +73,8 @@ class KeltnerStopStreamer(KeltnerStreamer):
             qty = trunc_by_sign(status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
             if qty == 0:
                 return []
-            return [Action(symbol, qty), self._stop(symbol, -qty, long_stop)]
+            return [Action(symbol, qty),
+                    self._stop(symbol, -qty, long_stop, trigger_above=False)]
 
         if price <= lower:
             dist = short_stop - price
@@ -82,6 +84,7 @@ class KeltnerStopStreamer(KeltnerStreamer):
             qty = trunc_by_sign(-status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
             if qty == 0:
                 return []
-            return [Action(symbol, qty), self._stop(symbol, -qty, short_stop)]
+            return [Action(symbol, qty),
+                    self._stop(symbol, -qty, short_stop, trigger_above=True)]
 
         return []

@@ -132,9 +132,10 @@ class StopLadderStreamer(LimitLadderStreamer):
             return [Action(symbol, qty)]  # 시장가 진입
         avg = status.position_for(symbol).avg_price
         # 일부러 포지션보다 큰 수량을 건다 — reduce_only clamp가 안 걸리면 반대 포지션이 열린다.
+        # 롱만 잡으므로 손절은 항상 진입가 아래 (trigger_above=False).
         return [Action(symbol, -position * 3, order_type=ActionType.STOP_MARKET,
-                       trigger_price=avg * (1 - self.spread), reduce_only=True,
-                       client_id="stop")]
+                       trigger_price=avg * (1 - self.spread), trigger_above=False,
+                       reduce_only=True, client_id="stop")]
 
 
 def compare_reports(label, ref_report, fast_report) -> bool:
@@ -333,8 +334,8 @@ class FakeOrderClient:
         self.calls = []
         self.success = success
 
-    def execute_action(self, action, client_order_id=None, reference_price=None):
-        self.calls.append((action, reference_price))
+    def execute_action(self, action, client_order_id=None):
+        self.calls.append((action, client_order_id))
         f = Future()
         f.set_result(OrderResult(success=self.success, order_id="1",
                                  error=None if self.success else "rejected"))
@@ -544,7 +545,7 @@ async def check_live_executor():
     ex.status.last_close[SYM] = 100.0
     ex.submit(Action(SYM, 1.0), event_time=1)
     ex.submit(Action(SYM, -1.0, order_type=ActionType.STOP_MARKET,
-                     trigger_price=90.0, client_id="stop-x"), event_time=1)
+                     trigger_price=90.0, trigger_above=False, client_id="stop-x"), event_time=1)
     ex.begin_event(2, {SYM: Candle(1, 1, 1, 1, 1, 0, MIN)})
     left = list(ex._pending_decision.values())
     # 미체결 주문은 몇 봉 뒤 체결이 정상이므로 캔들 경계에서 버리면 안 된다.
@@ -560,13 +561,6 @@ async def check_live_executor():
     ex.submit(Action(SYM, 1.0), event_time=1)
     await ex.drain_pending_orders()
     check("executor: 주문 실패는 on_error로", len(errors) == 1, f"{errors}")
-
-    ex, _, _, _ = await make_live_executor()
-    ex.status.last_close[SYM] = 100.0
-    ex.status.last_close[SYM2] = 200.0
-    ex.submit(Action(SYM2, 1.0), event_time=1)
-    check("executor: reference_price = 액션 대상 심볼의 종가",
-          ex._orders.calls[-1][1] == 200.0)
 
 
 # ============================================================ 3. 드라이런 == 백테스트

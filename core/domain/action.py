@@ -49,9 +49,10 @@ class Action:
         :param price: LIMIT 지정가. LIMIT이면 필수.
         :param trigger_price: STOP_MARKET 트리거 가격. STOP_MARKET이면 필수.
         :param trigger_above: True면 가격이 트리거 **이상**으로 올라올 때, False면 트리거
-            **이하**로 내려갈 때 발동한다. None이면 등록 시점의 ``status.last_close``와
-            비교해 자동으로 정한다 (트리거가 현재가보다 높으면 위로 관통) — Binance가
-            STOP_MARKET / TAKE_PROFIT_MARKET을 암묵적으로 갈라내는 것과 같은 규칙이다.
+            **이하**로 내려갈 때 발동한다. STOP_MARKET이면 필수다 — 전략은 트리거를 만들 때
+            현재가(``candle.close``)를 이미 쥐고 있으므로 ``trigger_price > candle.close``로
+            바로 정할 수 있다. 이 값과 주문 방향(수량 부호)이 Binance의 STOP_MARKET /
+            TAKE_PROFIT_MARKET 선택을 결정한다.
         :param reduce_only: 체결 시 현재 포지션 크기로 수량을 clamp하고, flat이면 체결하지
             않는다. 조건부 주문에는 사실상 필수다 — 없으면 이미 청산된 포지션에 걸어둔
             손절이 반대 방향 포지션을 새로 열어버린다.
@@ -69,6 +70,10 @@ class Action:
             raise ValueError("LIMIT 주문에는 price가 필요하다")
         if order_type is ActionType.STOP_MARKET and trigger_price is None:
             raise ValueError("STOP_MARKET 주문에는 trigger_price가 필요하다")
+        if order_type is ActionType.STOP_MARKET and trigger_above is None:
+            raise ValueError(
+                "STOP_MARKET 주문에는 trigger_above가 필요하다 "
+                "(트리거가 현재가 위/아래인지 — trigger_price > candle.close)")
         if order_type is ActionType.CANCEL and quantity != 0:
             raise ValueError("CANCEL 액션의 quantity는 0이어야 한다")
         if expire_after_candles is not None and expire_after_candles < 1:
