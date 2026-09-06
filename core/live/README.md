@@ -123,9 +123,10 @@ Low-level order client, off the asyncio loop:
 - Retries with exponential backoff (`max_retries`, `base_retry_delay`), and returns
   `success=False` rather than raising once retries are exhausted.
 - `execute_action(action)` maps `ActionType` onto exchange order types: `LIMIT` gains
-  `timeInForce=GTC`, and a `STOP_MARKET` becomes `STOP_MARKET` or `TAKE_PROFIT_MARKET` depending on
-  which side of `reference_price` its trigger sits. `Action.quantity` is a signed delta to apply to
-  `action.symbol`'s current position — the same meaning the simulated executor gives it.
+  `timeInForce=GTC`, and a `STOP_MARKET` becomes `STOP_MARKET` or `TAKE_PROFIT_MARKET` from
+  `action.trigger_above` and the order side (`(quantity > 0) != trigger_above`). `Action.quantity`
+  is a signed delta to apply to `action.symbol`'s current position — the same meaning the
+  simulated executor gives it.
 
 ### `reliable_websocket.py`
 
@@ -143,7 +144,7 @@ reconnect count.
 | User-data socket | not opened | opened; `ACCOUNT_UPDATE` / `ORDER_TRADE_UPDATE` keep `Status` in sync |
 | Orders | none sent; resting orders live in `Status.open_orders` and are matched against each candle | submitted through `BinanceOrderClient`; the exchange owns the book |
 | Position / avg price | updated through `Status.apply_fill` | updated from exchange fills |
-| Recorded trades | local fill at `status.last_close[action.symbol]` | real exchange fill (`ap` / `z` / `rp` / `n`) |
+| Recorded trades | local fill at `executor.last_close[action.symbol]` | real exchange fill (`ap` / `z` / `rp` / `n`) |
 | Forced liquidation | simulated when equity ≤ 0 | the exchange's |
 | Recorded run id | `dry_<Streamer>_<SYM1-SYM2-...>_<INTERVAL>` | `live_<Streamer>_<SYM1-SYM2-...>_<INTERVAL>` |
 

@@ -27,9 +27,9 @@ from core.streamer import BaseStreamer
 class BacktestRecorder(Recorder):
     """백테스트 한 번의 결과를 메모리에 모으고, :meth:`close`에서 산출물을 쓴다.
 
-    :param status: 실행기의 ``Status`` **객체 자체**. ``Report.status``가 최종 상태여야 하고
-        심볼별 종가를 매 이벤트 읽어야 하므로 참조로 들고 있는다. 진입 시점의 시가평가 자본
-        (수익률 기준선이자 buy & hold 곡선의 원금)도 **여기서, 즉 실행 전에** 잡는다.
+    :param status: 실행기의 ``Status`` **객체 자체**. ``Report.status``가 최종 상태여야 하므로
+        참조로 들고 있는다. 진입 시점의 시가평가 자본 (수익률 기준선이자 buy & hold 곡선의
+        원금)도 **여기서, 즉 실행 전에** 잡는다.
     :param interval_ms: 캔들 간격. 보통 ``producer.interval_ms``를 그대로 넘긴다 — 샤드 메타와
         Sharpe 리샘플링 주기가 여기서 나온다.
     :param metadata: 주면 런 JSON을 쓴다. 없으면 순수 메모리 실행이다 (대조 검사가 쓰는 경로).
@@ -50,6 +50,8 @@ class BacktestRecorder(Recorder):
         self.equity_curve: List[Tuple[int, float]] = []
         #: buy & hold 기준선을 만들기 위한 심볼별 종가 (구멍은 None) — equity_curve와 같은 길이
         self.closes_by_symbol: Dict[str, List[Optional[float]]] = {s: [] for s in self.symbols}
+        #: 심볼별 최근 종가 캐리포워드. 캔들이 없는 이벤트에서도 직전 값을 이어 붙인다.
+        self._latest_close: Dict[str, float] = {}
         self.trades: List[Trade] = []
         self.max_leverage = 0.0
         self.event_count = 0
@@ -75,8 +77,10 @@ class BacktestRecorder(Recorder):
                      candles: Dict[str, Candle]) -> None:
         # 자본과 종가는 **항상 같이** 늘어나야 한다. buy & hold 곡선이 인덱스로 짝을 맞춘다.
         self.equity_curve.append((event_time, equity))
+        for symbol, candle in candles.items():
+            self._latest_close[symbol] = candle.close
         for symbol in self.symbols:
-            self.closes_by_symbol[symbol].append(self._status.last_close.get(symbol))
+            self.closes_by_symbol[symbol].append(self._latest_close.get(symbol))
         self.event_count += 1
 
         if self._shard_writer is not None:

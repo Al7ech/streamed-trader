@@ -84,13 +84,10 @@ class TradingEngine:
         """
         st = self.executor.status
 
-        # 0. 실행기가 이벤트 경계에서 정리할 것이 있으면 (라이브의 미체결 결정 폐기 등)
+        # 0-1. 이벤트 경계 훅. 실행기가 심볼별 최근 종가 캐시를 이 이벤트 캔들로 **먼저 전부**
+        #      갱신하고 (라이브는 미체결 결정 폐기도 여기서). 다른 심볼을 겨냥한 액션의 체결가가
+        #      그 캐시에서 정해지므로, 매칭·결정보다 앞서 확정돼야 심볼 순서와 무관하게 결정적이다.
         self.executor.begin_event(event_time, candles)
-
-        # 1. 이 이벤트의 종가를 **먼저 전부** 동결한다. 다른 심볼을 겨냥한 액션의 체결가가
-        #    여기서 정해지므로, 심볼 처리 순서와 무관하게 결정적이어야 한다.
-        for symbol, candle in candles.items():
-            st.last_close[symbol] = candle.close
 
         # 2. 미체결 주문 매칭. 심볼 순회는 streamer.symbols 순서다 — 지표 갱신 루프와 같은
         #    순서를 써야 어떤 실행 경로에서도 같은 결과가 나온다.

@@ -282,8 +282,8 @@ implements one method, `__aiter__` — nothing else in the codebase has to know 
 `process_event(event_time, candles)` — the contract every mode goes through:
 
 ```
-0. executor.begin_event()          # live: drop unmatched market decisions from the last candle
-1. freeze status.last_close[symbol] for every symbol in the event
+0. executor.begin_event()          # refresh executor.last_close from this event's candles (all symbols, up front); live also drops unmatched market decisions from the last candle
+1. (folded into step 0 — see above)
 2. executor.match_resting()        # fills happen here (sim only; live's exchange does it)
 3. executor.mark_to_market()       # -> equity for this event
 4. executor.force_liquidation()    # sim: equity <= 0 -> cancel_all + flatten every symbol
@@ -422,7 +422,7 @@ existing ragged-series contract with no changes needed there.
   adds, a terminal state removes), and `_reconcile_resumed_orders` warns when the resumed book and
   the exchange's actual book disagree — the exchange keeps working a stop while this process is
   down, which makes that reconciliation matter more than the position one.
-- **Fills.** Dry-run records the local `Status.apply_fill` result at `status.last_close[action.
+- **Fills.** Dry-run records the local `Status.apply_fill` result at `executor.last_close[action.
   symbol]` (the action's *target* symbol's last known close, not necessarily the triggering
   candle's own close — see the cross-symbol note below), so a dry run and a backtest of the same
   candles produce identical trades. Live records **real exchange fills** from
@@ -558,9 +558,10 @@ those check scripts default to WARNING.
   one thing, in the backtester and in the live trader alike.
 
   Look-ahead is actually held out elsewhere: a fill uses its target symbol's decision-candle
-  `close` when that symbol is the trigger, or `Status.last_close[symbol]` — frozen before any
-  symbol in the current merged event is processed — for a same-event action targeting a different
-  symbol; the `Status` handed to both `decide_action` and `update` is the pre-trade snapshot; and
+  `close` when that symbol is the trigger, or `executor.last_close[symbol]` — refreshed by
+  `begin_event` before any symbol in the current merged event is processed — for a same-event
+  action targeting a different symbol; the `Status` handed to both `decide_action` and `update` is
+  the pre-trade snapshot; and
   path-dependent indicators delay their own confirmation internally (`PivotTrendlineIndicator`
   only confirms a fractal pivot k bars later).
 - `Action(symbol, quantity, ...)` is a signed `quantity` delta to apply to `symbol`'s current
@@ -570,9 +571,10 @@ those check scripts default to WARNING.
   candle's close", so every pre-existing strategy is unchanged. Beyond them it carries an
   `order_type: ActionType` (`MARKET`/`LIMIT`/`STOP_MARKET`/`CANCEL`) plus `price` (LIMIT),
   `trigger_price`/`trigger_above` (STOP_MARKET, which covers stop-loss *and* take-profit — the
-  trigger direction is what separates them, and `trigger_above=None` derives it by comparing the
-  trigger to `status.last_close`, the same rule Binance applies implicitly), `reduce_only`,
-  `client_id` and `expire_after_candles`. See "Resting orders" below.
+  trigger direction is what separates them; `trigger_above` is **required** for STOP_MARKET, and
+  the strategy sets it directly since it has `candle.close` in hand when it builds the action.
+  `trigger_above` + order side is what Binance's STOP_MARKET / TAKE_PROFIT_MARKET split encodes),
+  `reduce_only`, `client_id` and `expire_after_candles`. See "Resting orders" below.
 
   `Action.cancel(symbol, client_id=None)` is the cancel form (a `CANCEL`-typed action with
   `quantity=0`; `client_id=None` cancels every resting order on that symbol). All three engines
@@ -674,16 +676,17 @@ one symbol draws down the same pool a profit on another symbol credits. `status.
 symbol)` lazily creates a flat `PositionState` for a symbol not yet touched, so callers never
 `KeyError` on a symbol they haven't traded. `total_margin()` sums `margin` plus every symbol's
 `unrealised_pnl`; `update_leverage()` sums notional (`avg_price * abs(position)`) across every
-symbol over that. `status.last_close: Dict[str, float]` is engine-maintained — every symbol's close in an event is
-frozen into it up front (`process_event` step 1), and it **persists across events**, so a symbol
-keeps its last known close on events where it has no candle. That persistence is why it can't be
-replaced by reading the event's `candles` dict: it is the price source for
-`Executor.mark_to_market()` (marks every open position, including symbols absent from this event),
-for the `SimulatedExecutor` MARKET fill price of an action's *target* symbol (which, for a
-cross-symbol action, is not the symbol whose candle triggered the decision), and for deriving a
-`STOP_MARKET`'s trigger direction when the strategy leaves `Action.trigger_above=None`
-(`order_book.register_order`; live's `LiveExecutor` uses it the same way to pick STOP_MARKET vs
-TAKE_PROFIT_MARKET). No strategy reads it directly.
+symbol over that. `executor.last_close: Dict[str, float]` — **not on `Status`**, because it is a
+price cache, not account state, and it is written by the executor, not by `apply_fill`.
+`Executor.begin_event` refreshes it from every candle in the event, up front (before matching or
+decisions), and it **persists across events**, so a symbol keeps its last known close on events
+where it has no candle. That persistence is why it can't be replaced by reading the event's
+`candles` dict. Two consumers: `Executor.mark_to_market()` (marks every open position, including
+symbols absent from this event — runs in live too, as a between-`ACCOUNT_UPDATE` approximation),
+and the `SimulatedExecutor` MARKET fill price of an action's *target* symbol (which, for a
+cross-symbol action, is not the symbol whose candle triggered the decision). No strategy reads it,
+and STOP_MARKET trigger direction no longer comes from it — `Action.trigger_above` is required and
+carries it.
 `status.fee_ratio` is the account's fee rate — a `Status` field (default `DEFAULT_FEE_RATIO` in
 `core/domain/status.py`) the executor sets: `SimulatedExecutor` from its constructor arg,
 `LiveExecutor` from `futures_commission_rate`. Strategies read it when sizing (`price * (1/lev +
@@ -821,9 +824,11 @@ straight to `executor.on_user_data(...)`.
   that, routing the failure to `on_error` — otherwise a permanently rejected order passes without a
   trace and the strategy drifts from the exchange. `execute_action` maps `ActionType` onto the exchange's
   order types: `LIMIT` gains `timeInForce=GTC` (Binance rejects a LIMIT without it), and a
-  `STOP_MARKET` becomes `STOP_MARKET` or `TAKE_PROFIT_MARKET` depending on which side of
-  `reference_price` its trigger sits — the exchange rejects a conditional order whose trigger is on
-  the wrong side, so the caller passes `status.last_close[symbol]` as that reference. A `CANCEL`
+  `STOP_MARKET` action becomes `STOP_MARKET` or `TAKE_PROFIT_MARKET` from `action.trigger_above`
+  and the order side (`takes_profit = (quantity > 0) != trigger_above`) — the exchange rejects a
+  conditional order whose trigger is on the wrong side, and `trigger_above` + side is exactly what
+  that split encodes, so no reference price is needed. `order_from_exchange` recovers
+  `trigger_above` the same way in reverse, from the payload's `type` + `side`. A `CANCEL`
   action routes to `cancel_order`, which also accepts `origClientOrderId` (how a strategy addresses
   its own order) and cancels every open order on the symbol when given neither id.
 

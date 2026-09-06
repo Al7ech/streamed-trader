@@ -95,6 +95,8 @@ class LiveRecorder(Recorder):
         self._equity: List[Tuple[int, float]] = []
         self._closes_by_symbol: Dict[str, List[Optional[float]]] = {
             s: [] for s in self.symbols}
+        #: 심볼별 최근 종가 캐리포워드 (캔들이 없는 이벤트에서도 직전 값을 잇는다).
+        self._latest_close: Dict[str, float] = {}
         self._trades: List[Trade] = []
         self._max_leverage = 0.0
         self._candles_since_shard_flush = 0
@@ -141,8 +143,10 @@ class LiveRecorder(Recorder):
         # 자본과 종가는 **항상 같이** 늘어나야 한다. _downsample_equity가 길이로 stride를
         # 정하므로 어긋나면 equity와 benchmark의 인덱스 짝이 조용히 밀린다.
         self._equity.append((event_time, equity))
+        for symbol, candle in candles.items():
+            self._latest_close[symbol] = candle.close
         for s in self.symbols:
-            self._closes_by_symbol[s].append(self._status.last_close.get(s))
+            self._closes_by_symbol[s].append(self._latest_close.get(s))
 
         symbol_data = {
             symbol: (candle, {name: ind.get_latest() for name, ind

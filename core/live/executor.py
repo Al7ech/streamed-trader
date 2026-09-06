@@ -372,7 +372,8 @@ class LiveExecutor(Executor):
     # ------------------------------------------------------- Executor 인터페이스
 
     def begin_event(self, event_time: int, candles: Dict[str, Candle]) -> None:
-        """지난 캔들의 시장가 결정 중 체결 이벤트를 못 받은 것을 버린다.
+        """최근 종가 캐시를 갱신하고(base), 지난 캔들의 시장가 결정 중 체결 이벤트를 못 받은
+        것을 버린다.
 
         그대로 두면 이번 캔들의 체결에 엉뚱한 거래 전 스냅샷이 붙는다. 미체결(지정가/조건부)
         주문은 몇 봉 뒤에 체결되는 게 정상이므로 버리면 안 된다 — 그 항목은 주문이 종결될 때
@@ -381,6 +382,7 @@ class LiveExecutor(Executor):
         액션은 다른 심볼을 겨냥할 수 있으므로(교차 심볼 전략) pending은 **대상 심볼** 기준으로
         키가 잡혀 있다 — 여기서는 이번 이벤트에 등장한 심볼 몫만 지운다.
         """
+        super().begin_event(event_time, candles)
         for key in [k for k, p in self._pending_decision.items()
                     if k[0] in candles and not p.resting]:
             self.logger.warning(

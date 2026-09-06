@@ -94,7 +94,7 @@ class SimulatedExecutor(Executor):
 
         # 체결가는 액션의 **대상 심볼**의 마지막 알려진 종가다 — 트리거 심볼의 종가가 아니다.
         # 교차 심볼 액션이면 둘이 다르다.
-        price = self.status.last_close.get(action.symbol)
+        price = self.last_close.get(action.symbol)
         if price is None:
             self.logger.warning("%s가격을 알 수 없는 심볼 %s 에 대한 액션을 건너뛴다: %s",
                                 self._prefix, action.symbol, action)

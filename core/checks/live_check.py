@@ -114,8 +114,8 @@ class LimitLadderStreamer(BaseStreamer):
 class StopLadderStreamer(LimitLadderStreamer):
     """위와 같지만 청산을 ``reduce_only`` 조건부 시장가(손절)로 건다.
 
-    ``reduce_only`` clamp, 트리거 방향 자동 유도, 갭 관통 체결(트리거보다 아래에서 봉이
-    시작하면 시가 체결)을 모두 태운다.
+    ``reduce_only`` clamp와 갭 관통 체결(트리거보다 아래에서 봉이 시작하면 시가 체결)을
+    태운다.
     """
 
     def _decide_symbol(self, symbol, candle: Candle, status: Status):
@@ -335,7 +335,7 @@ class FakeOrderClient:
         self.success = success
 
     def execute_action(self, action, client_order_id=None):
-        self.calls.append((action, client_order_id))
+        self.calls.append(action)
         f = Future()
         f.set_result(OrderResult(success=self.success, order_id="1",
                                  error=None if self.success else "rejected"))
@@ -475,9 +475,8 @@ async def check_live_executor():
     # 거래소는 한 주문을 여러 번에 나눠 채울 수 있는데, 부분 체결마다 Trade를 만들면
     # "액션 하나 = 체결 하나"인 백테스트와 모양이 달라진다.
     ex, trades, _, _ = await make_live_executor()
-    ex.status.last_close[SYM] = 100.0
     ex.submit(Action(SYM, 2.0), event_time=5000)
-    cid = ex._orders.calls[0][0].client_id
+    cid = ex._orders.calls[0].client_id
     await ex.on_user_data(order_msg(status="PARTIALLY_FILLED", z=1.0, ap=100.0, rp=1.0,
                                     n=0.04, c=cid))
     check("executor: 부분 체결은 아직 Trade 아님", not trades)
@@ -491,15 +490,13 @@ async def check_live_executor():
           trades[0].timestamp == 5000 and trades[0].submitted_at == 5000)
 
     ex, trades, _, _ = await make_live_executor()
-    ex.status.last_close[SYM] = 100.0
     ex.submit(Action(SYM, 1.0), event_time=1)
-    cid = ex._orders.calls[0][0].client_id
+    cid = ex._orders.calls[0].client_id
     await ex.on_user_data(order_msg(status="CANCELED", x="CANCELED", z=0.0, c=cid))
     check("executor: 미체결 취소는 Trade 없이 pending 정리",
           not trades and not ex._pending_decision)
 
     ex, trades, _, _ = await make_live_executor()
-    ex.status.last_close[SYM] = 100.0
     await ex.on_user_data(order_msg(status="NEW", x="NEW", z=0.0, otype="STOP_MARKET",
                                     sp=95.0, side="SELL", c="stop-1"))
     book = ex.status.open_orders_for(SYM)
@@ -520,21 +517,19 @@ async def check_live_executor():
 
     # BNB 수수료 할인을 켜면 n이 BNB 단위로 온다. 마진 자산 손익에 더하면 wnl - fee 가 오염된다.
     ex, trades, _, meta = await make_live_executor()
-    ex.status.last_close[SYM] = 100.0
     ex.submit(Action(SYM, 1.0), event_time=1)
-    cid = ex._orders.calls[0][0].client_id
+    cid = ex._orders.calls[0].client_id
     await ex.on_user_data(order_msg(status="FILLED", z=1.0, n=0.5, N="BNB", c=cid))
     check("executor: 다른 자산 수수료 분리",
           trades[0].fee == 0.0 and meta == [("fee_asset_mismatch", "BNB")])
 
     ex, _, _, _ = await make_live_executor()
-    ex.status.last_close[SYM] = 100.0
     await ex.on_user_data(order_msg(status="NEW", x="NEW", z=0.0, otype="STOP_MARKET",
                                     sp=95.0, side="SELL", c="stop-1"))
     ex.submit(Action.cancel(SYM, "stop-1"), event_time=1)
     check("executor: CANCEL은 장부를 비우고 거래소로도 나간다",
           ex.status.total_open_orders() == 0
-          and ex._orders.calls[-1][0].order_type is ActionType.CANCEL)
+          and ex._orders.calls[-1].order_type is ActionType.CANCEL)
 
     ex, trades, _, _ = await make_live_executor()
     ex.match_resting(SYM, Candle(1, 1, 1, 1, 1, 0, MIN), MIN)
@@ -542,7 +537,6 @@ async def check_live_executor():
     check("executor: 강제청산은 거래소 몫", ex.force_liquidation(-100.0) is False)
 
     ex, _, _, _ = await make_live_executor()
-    ex.status.last_close[SYM] = 100.0
     ex.submit(Action(SYM, 1.0), event_time=1)
     ex.submit(Action(SYM, -1.0, order_type=ActionType.STOP_MARKET,
                      trigger_price=90.0, trigger_above=False, client_id="stop-x"), event_time=1)
@@ -554,7 +548,6 @@ async def check_live_executor():
 
     ex, _, errors, _ = await make_live_executor()
     ex._orders.success = False
-    ex.status.last_close[SYM] = 100.0
     # 실행기는 재시도 소진 후 예외 대신 success=False를 반환한다 — 확인하지 않으면 영구 거부된
     # 주문이 아무 흔적 없이 지나가고 전략이 거래소와 어긋난다. submit은 결과-대기를 detached
     # 태스크로 띄우므로 drain_pending_orders로 끝날 때까지 기다린 뒤 확인한다.

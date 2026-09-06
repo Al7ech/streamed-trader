@@ -24,7 +24,6 @@ class Status:
                  margin: float = 0.0,
                  positions: Optional[Dict[str, PositionState]] = None,
                  leverage: float = 0.0,
-                 last_close: Optional[Dict[str, float]] = None,
                  open_orders: Optional[Dict[str, List["OpenOrder"]]] = None,
                  fee_ratio: float = DEFAULT_FEE_RATIO):
         self.margin = margin
@@ -33,9 +32,6 @@ class Status:
         #: 명목가치에 곱할 수수료율. 계좌 속성이라 여기 둔다 — 실행기가 채우고
         #: (백테스트: 생성자 인자, 라이브: 거래소 커미션 티어), 전략은 사이징 시 이 값을 읽는다.
         self.fee_ratio = fee_ratio
-        #: 심볼별 최근 알려진 종가. 엔진이 매 이벤트마다 갱신한다 — 트리거 심볼이 아닌
-        #: 다른 심볼을 대상으로 하는 Action의 체결가/시가평가에 쓰인다.
-        self.last_close: Dict[str, float] = last_close if last_close is not None else {}
         #: 심볼별 미체결(resting) 주문. 거래소에서 미체결 주문은 실제로 계좌 상태의 일부이고,
         #: Status는 백테스터와 라이브 트레이더가 공유하는 단일 계좌 상태 표현이므로 여기 둔다.
         #: 덕분에 decide_action(candles, status) 시그니처를 바꾸지 않고도 전략이 자기
