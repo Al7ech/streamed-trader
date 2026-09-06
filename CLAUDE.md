@@ -169,15 +169,20 @@ carrying a frontend hint (`scale_group`) would blur what `domain/` means.
    ends. It returns `List[Candle]` only. `fetcher/binance/candle_storage.py` is an older
    CSV(.gz) load/save path for the same `Candle` objects.
 
-   **Moving a pickled class breaks the whole cache.** Pickle stores a class as its `(module path,
-   name)` string, so relocating `Candle` makes every already-cached `.pkl` raise
-   `ModuleNotFoundError` and the entire history has to be re-downloaded. `pickle_storage`
-   therefore loads through `_CompatUnpickler`, whose `_MOVED` table maps old class paths onto the
-   current class (currently one entry: `core.streamer.candle.Candle`, moved to `core.domain.candle`
-   in 2026-09). Add an entry there before moving any class that ends up inside a `.pkl`; newly
-   written chunks always use the current path, so entries are only needed until the old files age
-   out. `Candle` also keeps class-attribute defaults for fields added after older chunks were
-   written — same idea, one layer down.
+   **Moving `Candle` to another module invalidates every cached chunk.** Pickle stores a class as
+   its `(module path, name)` string, so a relocation makes `pickle.load` raise
+   `ModuleNotFoundError` — loudly, since neither `pickle_storage` nor `get_candles_with_cache`
+   catches it, so it is a crash rather than a silent multi-GB re-download. The fix is a throwaway
+   migration, not a permanent shim: alias the old path (`sys.modules["core.streamer.candle"] =
+   core.domain.candle`), then load-and-re-save each `.pkl`. `save_to_pickle` is tmp + `os.replace`,
+   so it is atomic per file and the script is safe to interrupt and re-run. That is how the
+   2026-09 `core.streamer.candle` → `core.domain.candle` move was handled, and no compatibility
+   code was left behind.
+
+   Adding a *field* is different: older chunks simply lack it in `__dict__` and `Candle`'s
+   class-attribute defaults cover it, so no migration is needed. Only a class **move or rename**
+   forces one. Note this applies to the backtest cache only — the live trader's indicator prefeed
+   calls `get_candles` directly and never touches a `.pkl`.
 
 3. **Backtest.** `backtest/run.run_backtest(streamer, candles_by_symbol=None, *, producer=None,
    ...)` is the entry point. It is multi-symbol. The candle source is one of:

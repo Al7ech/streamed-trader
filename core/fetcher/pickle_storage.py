@@ -10,31 +10,22 @@ from core.domain import Candle
 _logger = logging.getLogger(__name__)
 
 
-class _CompatUnpickler(pickle.Unpickler):
-    """옮겨간 클래스 경로를 되짚어 옛 캐시를 계속 읽는다.
+class PickleStorage:
+    """``Candle`` 리스트의 pickle 저장/로드.
 
-    pickle은 클래스를 ``(모듈 경로, 이름)`` 문자열로 저장한다. 그래서 클래스를 다른 모듈로
-    옮기면 **이미 캐시된 월 청크 전부**가 ``ModuleNotFoundError``로 죽고, 수백 GB가 될 수도
-    있는 캔들을 다시 받아야 한다. 여기서 옛 경로를 새 클래스로 이어붙인다.
+    **``Candle``을 다른 모듈로 옮기면 이미 캐시된 청크 전부가 못 읽게 된다.** pickle은 클래스를
+    ``(모듈 경로, 이름)`` 문자열로 저장하므로, 경로가 바뀌면 로드가 ``ModuleNotFoundError``로
+    죽는다 (여기에 try/except가 없고 호출부에도 없으니 조용한 재다운로드가 아니라 즉시 실패다).
+    그때는 옛 경로를 새 클래스에 이어붙이는 일회용 스크립트로 캐시를 다시 저장하면 된다 —
+    ``sys.modules["<옛 모듈>"] = <새 모듈>`` 로 별칭을 걸고 파일마다 load → save 하면 끝이고,
+    ``save_to_pickle``이 tmp + ``os.replace``라 중간에 끊겨도 손상된 파일은 남지 않는다.
+    (2026-09에 ``core.streamer.candle`` → ``core.domain.candle`` 이전을 그렇게 처리했다.)
 
-    ``Candle``이 이미 "옛 pickle에는 이 필드가 없다 → 클래스 속성 기본값으로 폴백"이라는
-    같은 성격의 하위호환 장치를 갖고 있다. 새로 저장되는 청크는 새 경로로 기록되므로, 이
-    표는 옛 파일이 소진될 때까지만 의미가 있다.
+    필드 **추가**는 이야기가 다르다. 옛 pickle의 ``__dict__``에는 그 필드가 없으므로
+    ``Candle``이 클래스 속성 기본값으로 폴백시킨다 — 캐시를 다시 만들 필요가 없다.
     """
 
-    #: (옛 모듈 경로, 클래스 이름) -> 지금 클래스
-    _MOVED = {
-        ("core.streamer.candle", "Candle"): Candle,  # 2026-09: core.domain.candle 로 이전
-    }
 
-    def find_class(self, module: str, name: str):
-        moved = self._MOVED.get((module, name))
-        if moved is not None:
-            return moved
-        return super().find_class(module, name)
-
-
-class PickleStorage:
     @staticmethod
     def save_to_pickle(candles: List[Candle], file_path: str, protocol: int = 5) -> None:
         """
@@ -62,7 +53,7 @@ class PickleStorage:
         """
         start_time = datetime.now()
         with open(file_path, "rb", buffering=io.DEFAULT_BUFFER_SIZE) as f:
-            candles = _CompatUnpickler(f).load()
+            candles = pickle.load(f)
 
         if verbose:
             _logger.info("loaded %s in %.0fms", os.path.basename(file_path),
