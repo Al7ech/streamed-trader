@@ -23,13 +23,12 @@ class CrossMovingAverageStreamer(BaseStreamer):
     이라는 점에 주의 (`target_qty - position`).
     """
 
-    def __init__(self, symbol: str, fee_ratio: float):
+    def __init__(self, symbol: str):
         super().__init__([symbol], {symbol: {
             "ma10": MovingAverage(10),
             "ma25": MovingAverage(25),
         }})
         self.symbol = symbol
-        self.fee_ratio = fee_ratio
 
     def decide_action(self, symbol: str, candle: Candle, status: Status) -> List[Action]:
         ind = self.indicators[symbol]
@@ -47,11 +46,11 @@ class CrossMovingAverageStreamer(BaseStreamer):
         # 크로스가 발생할 때만 매수/매도
         if prev_ma10 <= prev_ma25 and ma10 > ma25:  # 골든크로스
             target_qty = long_safe_qty(status.total_margin(), position, candle.close, 3,
-                                       self.fee_ratio)
+                                       status.fee_ratio)
             return [Action(symbol, target_qty - position)]
         if prev_ma10 >= prev_ma25 and ma10 < ma25:  # 데드크로스
             target_qty = short_safe_qty(status.total_margin(), position, candle.close, 3,
-                                        self.fee_ratio)
+                                        status.fee_ratio)
             return [Action(symbol, target_qty - position)]
 
         return []

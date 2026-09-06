@@ -54,7 +54,6 @@ class TrendlineBounceStreamer(BaseStreamer):
                  lines: str = "res",
                  stop_atr_mult: float = 15.0,
                  max_loss: float = 0.08,
-                 fee_ratio: float = 0.0004,
                  use_stop: bool = False):
         assert side in ("inverse", "bounce")
         assert lines in ("res", "sup", "both")
@@ -72,7 +71,6 @@ class TrendlineBounceStreamer(BaseStreamer):
         self.lines = lines
         self.stop_atr_mult = stop_atr_mult
         self.max_loss = max_loss
-        self.fee_ratio = fee_ratio
         self.use_stop = use_stop
 
         self._hold_remaining = 0
@@ -139,7 +137,7 @@ class TrendlineBounceStreamer(BaseStreamer):
         price = candle.close
         stop_frac = self.stop_atr_mult * atr / price
         lev = min(6.0, self.max_loss / stop_frac)
-        qty = trunc_by_sign(sign * status.total_margin() / (price * (1 / lev + self.fee_ratio)), 3)
+        qty = trunc_by_sign(sign * status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
 
         self._hold_remaining = self.hold_candles
         self._stop_price = price * (1 - sign * stop_frac)

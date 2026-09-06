@@ -23,14 +23,12 @@ class SupertrendStreamer(BaseStreamer):
     def __init__(self, symbol: str,
                  atr_window: int = 24 * 60,
                  multiplier: float = 3.0,
-                 max_loss: float = 0.08,
-                 fee_ratio: float = 0.0004):
+                 max_loss: float = 0.08):
         super().__init__([symbol], {symbol: {
             "ST": SupertrendIndicator(atr_window, multiplier),
         }})
         self.symbol = symbol
         self.max_loss = max_loss
-        self.fee_ratio = fee_ratio
 
         self.logger = logging.getLogger(__name__)
         self.logger.info(
@@ -58,5 +56,5 @@ class SupertrendStreamer(BaseStreamer):
 
         lev = min(6.0, self.max_loss * price / dist)
         target_qty = trunc_by_sign(
-            direction * status.total_margin() / (price * (1 / lev + self.fee_ratio)), 3)
+            direction * status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
         return [Action(symbol, target_qty - position)]

@@ -12,6 +12,13 @@
   ``ORDER_TRADE_UPDATE``가 동기화한다. 여기서 ``apply_fill``을 부르지 않는다.
 - **미체결 주문을 시뮬레이션하지 않는다.** ``match_resting``은 no-op이고, 강제청산도 거래소가
   한다 (``force_liquidation``이 항상 False).
+- **생성이 곧 수화(hydration)다.** 유일한 생성 경로인 :meth:`LiveExecutor.create`가 거래소에서
+  지갑/포지션/미체결 주문을 읽어 **완성된** ``Status``를 만들어 들고 돌아온다. 그래서 "아직
+  채워지지 않은 ``Status``"라는 중간 상태가 존재하지 않는다 — 예전에는 호출자가
+  ``Status(margin=0.0)``을 만들어 넘기고 나중에 ``load_account()``가 덮었기 때문에, 그 사이에
+  누가 읽어도 예외 없이 통과했다 (런 JSON의 ``init_margin``이 조용히 0이 되는 식으로).
+  거래소 응답의 해석은 :func:`build_status`/:func:`order_from_exchange`라는 순수 함수에 있어
+  클라이언트 없이도 검증할 수 있다.
 
 유저 데이터 소켓의 **수명주기**는 :class:`~core.live.trader.BinanceTrader`가 들고
 있고, 받은 메시지만 :meth:`LiveExecutor.on_user_data`로 넘어온다.
@@ -24,11 +31,13 @@ import math
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
+from binance import AsyncClient
+
 from core.domain import order_book
 from core.domain.action import Action, ActionType
 from core.domain.candle import Candle
 from core.domain.order_book import OpenOrder
-from core.domain.status import Status
+from core.domain.status import DEFAULT_FEE_RATIO, Status
 from core.domain.trade import Trade
 from core.engine.executor import Executor
 from core.live.binance_order_client import BinanceOrderClient, OrderResult
@@ -88,6 +97,102 @@ def resolve_margin_asset(symbols: List[str]) -> str:
     return next(iter(unique))
 
 
+def order_from_exchange(o: Dict, last_close: Optional[Dict[str, float]] = None
+                        ) -> Optional[OpenOrder]:
+    """거래소 주문 표현(REST의 open order, 또는 ``ORDER_TRADE_UPDATE``의 ``o``)을 OpenOrder로.
+
+    REST와 스트림이 필드 이름을 다르게 쓰므로 (``origQty``/``q``, ``type``/``o`` …) 둘 다
+    받는다. 이 엔진이 모르는 주문 타입(트레일링 스탑 등, 사람이 앱에서 낸 것)은 None을
+    돌려 장부에 넣지 않는다 — 체결 판정 규칙이 없는 주문을 들고 있어봐야 오해만 낳는다.
+
+    :param last_close: 트리거 방향을 유추할 기준가. 기동 시점의 적재에는 아직 종가가 없어
+        비어 있고, 그때는 수량 부호로 방향을 잡는다.
+    """
+    raw_type = o.get("type") or o.get("o") or ""
+    if raw_type in ("LIMIT", "STOP", "TAKE_PROFIT"):
+        order_type = ActionType.LIMIT
+    elif raw_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+        order_type = ActionType.STOP_MARKET
+    else:
+        return None
+
+    side = o.get("side") or o.get("S") or ""
+    try:
+        qty = float(o.get("origQty", o.get("q", 0.0)) or 0.0)
+        price = float(o.get("price", o.get("p", 0.0)) or 0.0)
+        trigger = float(o.get("stopPrice", o.get("sp", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if qty <= 0:
+        return None
+
+    quantity = -qty if side == "SELL" else qty
+    reference = (last_close or {}).get(o.get("symbol") or o.get("s") or "")
+    trigger_above = trigger >= reference if (reference and trigger) else quantity > 0
+    return OpenOrder(
+        symbol=o.get("symbol") or o.get("s") or "",
+        quantity=quantity,
+        order_type=order_type,
+        price=price or None,
+        trigger_price=trigger or None,
+        trigger_above=bool(trigger_above),
+        reduce_only=bool(o.get("reduceOnly", o.get("R", False))),
+        client_id=o.get("clientOrderId") or o.get("c") or None,
+        created_at=int(o.get("time", o.get("T", 0)) or 0),
+        exchange_order_id=str(o.get("orderId", o.get("i", "")) or ""),
+    )
+
+
+def build_status(account_info: Dict, raw_open_orders: List[Dict], symbols: List[str],
+                 margin_asset: str, fee_ratio: float = DEFAULT_FEE_RATIO) -> Status:
+    """거래소 응답을 계좌 상태로 옮긴다 — **I/O 없는 순수 함수**.
+
+    :meth:`LiveExecutor.create`가 받아온 ``futures_account()`` / ``futures_get_open_orders()``
+    응답을 그대로 넣으면 완성된 ``Status``가 나온다. I/O와 해석을 갈라 둔 덕에 회계 규칙
+    (아래 walletBalance 선택 등)을 클라이언트 없이 검증할 수 있다.
+
+    ``fee_ratio``는 거래소 커미션 티어(``futures_commission_rate``의 taker 값)에서 온다 —
+    라이브 사이징이 계좌 실제 수수료율을 쓰도록 ``Status``에 실어 준다. 회계는 여기서
+    쓰지 않는다 (라이브 체결은 ``ORDER_TRADE_UPDATE``의 실제 ``n`` 금액이 정답).
+    """
+    if "error" in account_info:
+        raise RuntimeError(f"Failed to get account info: {account_info['error']}")
+
+    # walletBalance를 쓴다 — marginBalance는 walletBalance + unrealizedProfit 이고
+    # status.total_margin()이 margin + unrealised_pnl 이라서, 아래에서 미실현을 따로
+    # 넣는 순간 미실현이 두 번 세어진다. 스트림의 `wb`와도 이쪽이 같은 뜻이다.
+    margin_balance = 0.0
+    for asset in account_info["assets"]:
+        if asset["asset"] == margin_asset:
+            margin_balance = float(asset.get("walletBalance", 0.0))
+            break
+    status = Status(margin=margin_balance, fee_ratio=fee_ratio)
+
+    positions_by_symbol = {p["symbol"]: p for p in account_info.get("positions", [])}
+    for symbol in symbols:
+        pos = status.position_for(symbol)
+        info = positions_by_symbol.get(symbol)
+        pos.avg_price = float(info.get("entryPrice", 0.0)) if info else 0.0
+        pos.unrealised_pnl = float(info.get("unrealizedProfit", 0.0)) if info else 0.0
+        pos.position = float(info.get("positionAmt", 0.0)) if info else 0.0
+    # 레버리지는 전 심볼을 다 채운 뒤 한 번만 계산한다 — 심볼별로 부르면 아직 값을 채우지
+    # 않은 다른 심볼 때문에 중간값이 잘못 계산된다.
+    status.update_leverage()
+
+    # 미체결 주문도 거래소에서 끌어온다. 프로세스가 죽어 있어도 걸어둔 손절은 거래소에서
+    # 계속 살아 있으므로, 이걸 안 하면 전략이 "손절이 없다"고 보고 하나 더 걸어 이중으로
+    # 청산된다.
+    symbol_set = set(symbols)
+    for o in raw_open_orders:
+        symbol = o.get("symbol", "")
+        if symbol not in symbol_set:
+            continue
+        order = order_from_exchange(o, status.last_close)
+        if order is not None:
+            status.open_orders_for(symbol).append(order)
+    return status
+
+
 @dataclass
 class _PendingDecision:
     """주문을 내보내기 직전의 스냅샷. 나중에 도착할 체결 이벤트와 짝짓는다."""
@@ -116,13 +221,21 @@ class _OrderAggregate:
 class LiveExecutor(Executor):
     """실제 바이낸스 선물 계좌에 대고 주문을 실행한다.
 
+    **직접 만들지 말고 :meth:`create`를 쓴다.** 이 생성자는 이미 수화된 ``status``와 이미
+    연결된 클라이언트를 전제하므로, 그 둘을 마련하는 유일한 경로인 ``create``만 부른다.
+
     :param order_client: 저수준 주문 클라이언트 (스레드풀 + 재시도).
+    :param status: :func:`build_status`가 거래소 응답으로 만든 **완성된** 계좌 상태.
+    :param client: 계좌/주문 조회에 쓰는 ``AsyncClient``.
+    :param owns_order_client: True면 :meth:`close`가 ``order_client``를 정리한다.
+    :param owns_client: True면 :meth:`close`가 ``client``의 연결을 닫는다.
     :param on_error: 주문 실패/처리 오류를 흘려보낼 곳.
     :param on_metadata: 런 메타데이터에 남길 사실을 흘려보낼 곳 (수수료 자산 불일치 등).
     """
 
     def __init__(self, order_client: BinanceOrderClient, status: Status, symbols: List[str],
-                 margin_asset: str,
+                 margin_asset: str, client: Optional[AsyncClient] = None,
+                 owns_order_client: bool = False, owns_client: bool = False,
                  on_trade: Optional[Callable[[Trade], None]] = None,
                  on_error: Optional[Callable[[Exception], Awaitable[None]]] = None,
                  on_metadata: Optional[Callable[[str, object], None]] = None):
@@ -133,7 +246,11 @@ class LiveExecutor(Executor):
         self.margin_asset = margin_asset
         self._on_error = on_error or self._default_on_error
         self.on_metadata = on_metadata or (lambda key, value: None)
-        self.client = None  # AsyncClient — start()에서 붙는다
+        self.client = client
+        #: 소유권은 "만든 쪽이 닫는다". 주입받은 클라이언트는 close()에서 건드리지 않는다 —
+        #: 트레이더는 자기 AsyncClient를 소켓 매니저와 공유하므로 여기서 닫으면 안 된다.
+        self._owns_order_client = owns_order_client
+        self._owns_client = owns_client
 
         #: 키는 (심볼, client order id). 심볼만으로는 심볼당 in-flight 결정이 하나로 제한되고,
         #: 무엇보다 몇 봉 뒤에 체결되는 미체결 주문을 짝지을 수 없다.
@@ -146,12 +263,113 @@ class LiveExecutor(Executor):
         self._client_order_seq = 0
         self._warned_fee_asset = False
 
+    @classmethod
+    async def create(cls, symbols: List[str], *, margin_asset: Optional[str] = None,
+                     order_client: Optional[BinanceOrderClient] = None,
+                     client: Optional[AsyncClient] = None,
+                     api_key: Optional[str] = None, api_secret: Optional[str] = None,
+                     testnet: bool = False,
+                     on_trade: Optional[Callable[[Trade], None]] = None,
+                     on_error: Optional[Callable[[Exception], Awaitable[None]]] = None,
+                     on_metadata: Optional[Callable[[str, object], None]] = None
+                     ) -> "LiveExecutor":
+        """거래소에서 계좌를 읽어 **완성된** 실행기를 만든다. 라이브 실행기의 유일한 생성 경로.
+
+        클라이언트는 **주지 않으면 스스로 만들고, 주면 그것을 쓴다** — 만든 것만
+        :meth:`close`에서 정리한다. 트레이더는 소켓 매니저와 공유해야 하므로 자기
+        ``AsyncClient``를 넘기고, 주문 클라이언트는 넘기지 않는다 (라이브에서만 필요한
+        스레드풀이라 실행기가 만드는 게 맞다 — 예전에는 드라이런에서도 만들어졌다).
+
+        ``futures_account()`` 실패는 치명적이지만 미체결 주문 조회 실패는 아니다
+        (:meth:`_fetch_open_orders` 참고).
+        """
+        margin_asset = margin_asset or resolve_margin_asset(symbols)
+        owns_order_client = order_client is None
+        owns_client = client is None
+
+        if owns_order_client:
+            # binance.Client 생성자가 블로킹 HTTP(서버 시간/거래소 정보)를 친다 — 이벤트
+            # 루프에서 그냥 부르면 그동안 소켓 수신이 멈춘다.
+            order_client = await asyncio.to_thread(
+                BinanceOrderClient, api_key=api_key, api_secret=api_secret,
+                testnet=testnet, max_workers=2)
+        try:
+            if owns_client:
+                client = await AsyncClient.create(api_key=api_key, api_secret=api_secret,
+                                                  testnet=testnet)
+            _logger.info("Loading futures wallet status...")
+            account_info = await client.futures_account()
+            fee_ratio = await cls._fetch_taker_commission(client, symbols)
+            status = build_status(account_info, await cls._fetch_open_orders(client),
+                                  symbols, margin_asset, fee_ratio)
+        except Exception:
+            # 기동에 실패했으면 **우리가 만든 것만** 되돌린다. 주입받은 것은 호출자 것이다.
+            if owns_order_client:
+                await asyncio.to_thread(order_client.shutdown)
+            if owns_client and client is not None:
+                await client.close_connection()
+            raise
+
+        executor = cls(order_client, status, symbols, margin_asset, client=client,
+                       owns_order_client=owns_order_client, owns_client=owns_client,
+                       on_trade=on_trade, on_error=on_error, on_metadata=on_metadata)
+        executor.logger.info("successfully loaded status: %s (fee_ratio=%s)",
+                             status, status.fee_ratio)
+        if status.total_open_orders():
+            executor.logger.info("거래소의 미체결 주문 %d건을 불러왔다: %s",
+                                 status.total_open_orders(),
+                                 {s: len(v) for s, v in status.open_orders.items() if v})
+        return executor
+
+    @staticmethod
+    async def _fetch_open_orders(client: AsyncClient) -> List[Dict]:
+        """거래소의 미체결 주문. 실패는 **치명적이지 않다** — 장부가 비어 보일 뿐이고 이후
+        ``ORDER_TRADE_UPDATE``로 채워진다. 다만 그 사이 전략이 손절을 중복으로 걸 수 있으므로
+        조용히 넘기지 않는다.
+        """
+        try:
+            return await client.futures_get_open_orders()
+        except Exception as e:
+            _logger.error("미체결 주문을 불러오지 못했다: %s", e, exc_info=True)
+            return []
+
+    @staticmethod
+    async def _fetch_taker_commission(client: AsyncClient, symbols: List[str]) -> float:
+        """계좌의 taker 커미션율. ``Status.fee_ratio``로 실려 라이브 사이징이 실제 티어를 쓴다.
+
+        커미션율은 심볼별이지만 ``Status.fee_ratio``는 하나뿐이라 ``symbols[0]``의 값을 쓰고,
+        심볼끼리 다르면 경고한다 (``resolve_margin_asset``과 같은 "하나로 합의, 어긋나면 경고"
+        관용구). 조회 실패는 **치명적이지 않다** — 기본값으로 떨어져도 사이징은 돈다.
+        """
+        try:
+            rates = {}
+            for symbol in symbols:
+                resp = await client.futures_commission_rate(symbol=symbol)
+                rates[symbol] = float(resp["takerCommissionRate"])
+        except Exception as e:
+            _logger.warning("커미션율을 불러오지 못했다 (기본값 %s 사용): %s",
+                            DEFAULT_FEE_RATIO, e)
+            return DEFAULT_FEE_RATIO
+        chosen = rates[symbols[0]]
+        if len(set(rates.values())) > 1:
+            _logger.warning("심볼별 taker 커미션율이 다르다: %s — %s의 %s를 쓴다",
+                            rates, symbols[0], chosen)
+        return chosen
+
+    async def close(self) -> None:
+        """**자기가 만든** 자원만 정리한다. 주입받은 클라이언트는 만든 쪽이 닫는다."""
+        if self._owns_order_client:
+            # shutdown()의 기본값은 wait=True라 스레드가 끝날 때까지 이벤트 루프를 막는다.
+            await asyncio.to_thread(self._orders.shutdown)
+        # 풀이 모든 주문 future를 resolve한 뒤라, 결과-대기 태스크들은 한 틱이면 끝난다.
+        # 마지막 실패 로그를 확실히 흘리고 shutdown을 deterministic하게 만든다.
+        await self.drain_pending_orders()
+        if self._owns_client and self.client is not None:
+            await self.client.close_connection()
+            self.client = None
+
     async def _default_on_error(self, error: Exception) -> None:
         self.logger.error(f"LiveExecutor error: {error}")
-
-    def attach_client(self, client) -> None:
-        """계좌/주문 조회에 쓸 ``AsyncClient``를 붙인다 (트레이더 기동 시)."""
-        self.client = client
 
     # ------------------------------------------------------- Executor 인터페이스
 
@@ -264,104 +482,10 @@ class LiveExecutor(Executor):
 
     # ------------------------------------------------------- 계좌 상태 적재
 
-    async def load_account(self) -> None:
-        """거래소 지갑/포지션으로 ``status``를 채운다."""
-        self.logger.info("Loading futures wallet status...")
-        account_info = await self.client.futures_account()
-        if "error" in account_info:
-            raise RuntimeError(f"Failed to get account info: {account_info['error']}")
-
-        # walletBalance를 쓴다 — marginBalance는 walletBalance + unrealizedProfit 이고
-        # status.total_margin()이 margin + unrealised_pnl 이라서, 아래에서 미실현을 따로
-        # 넣는 순간 미실현이 두 번 세어진다. 스트림의 `wb`와도 이쪽이 같은 뜻이다.
-        margin_balance = 0.0
-        for asset in account_info["assets"]:
-            if asset["asset"] == self.margin_asset:
-                margin_balance = float(asset.get("walletBalance", 0.0))
-                break
-        self.status.margin = margin_balance
-
-        positions_by_symbol = {p["symbol"]: p for p in account_info.get("positions", [])}
-        for symbol in self.symbols:
-            pos = self.status.position_for(symbol)
-            info = positions_by_symbol.get(symbol)
-            pos.avg_price = float(info.get("entryPrice", 0.0)) if info else 0.0
-            pos.unrealised_pnl = float(info.get("unrealizedProfit", 0.0)) if info else 0.0
-            pos.position = float(info.get("positionAmt", 0.0)) if info else 0.0
-        # 레버리지는 전 심볼을 다 채운 뒤 한 번만 계산한다 — 심볼별로 부르면 아직 값을 채우지
-        # 않은 다른 심볼 때문에 중간값이 잘못 계산된다.
-        self.status.update_leverage()
-        self.logger.info(f"successfully loaded status: {self.status}")
-
-    async def load_open_orders(self) -> None:
-        """거래소의 미체결 주문을 ``status.open_orders``로 끌어온다.
-
-        프로세스가 죽어 있어도 걸어둔 손절은 거래소에서 계속 살아 있으므로, 이걸 안 하면
-        전략이 "손절이 없다"고 보고 하나 더 걸어 이중으로 청산된다.
-        """
-        try:
-            raw = await self.client.futures_get_open_orders()
-        except Exception as e:
-            # 치명적이지 않다 — 장부가 비어 보일 뿐이고, 이후 ORDER_TRADE_UPDATE로 채워진다.
-            # 다만 그 사이 전략이 손절을 중복으로 걸 수 있으므로 조용히 넘기면 안 된다.
-            self.logger.error("미체결 주문을 불러오지 못했다: %s", e, exc_info=True)
-            return
-
-        self.status.open_orders = {}
-        loaded = 0
-        for o in raw:
-            symbol = o.get("symbol", "")
-            if symbol not in self._symbol_set:
-                continue
-            order = self._order_from_exchange(o)
-            if order is None:
-                continue
-            self.status.open_orders_for(symbol).append(order)
-            loaded += 1
-        if loaded:
-            self.logger.info("거래소의 미체결 주문 %d건을 불러왔다: %s", loaded,
-                             {s: len(v) for s, v in self.status.open_orders.items() if v})
-
     def _order_from_exchange(self, o: Dict) -> Optional[OpenOrder]:
-        """거래소 주문 표현(REST의 open order, 또는 ORDER_TRADE_UPDATE의 ``o``)을 OpenOrder로.
-
-        REST와 스트림이 필드 이름을 다르게 쓰므로 (``origQty``/``q``, ``type``/``o`` …) 둘 다
-        받는다. 이 엔진이 모르는 주문 타입(트레일링 스탑 등, 사람이 앱에서 낸 것)은 None을
-        돌려 장부에 넣지 않는다 — 체결 판정 규칙이 없는 주문을 들고 있어봐야 오해만 낳는다.
-        """
-        raw_type = o.get("type") or o.get("o") or ""
-        if raw_type in ("LIMIT", "STOP", "TAKE_PROFIT"):
-            order_type = ActionType.LIMIT
-        elif raw_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
-            order_type = ActionType.STOP_MARKET
-        else:
-            return None
-
-        side = o.get("side") or o.get("S") or ""
-        try:
-            qty = float(o.get("origQty", o.get("q", 0.0)) or 0.0)
-            price = float(o.get("price", o.get("p", 0.0)) or 0.0)
-            trigger = float(o.get("stopPrice", o.get("sp", 0.0)) or 0.0)
-        except (TypeError, ValueError):
-            return None
-        if qty <= 0:
-            return None
-
-        quantity = -qty if side == "SELL" else qty
-        reference = self.status.last_close.get(o.get("symbol") or o.get("s") or "")
-        trigger_above = trigger >= reference if (reference and trigger) else quantity > 0
-        return OpenOrder(
-            symbol=o.get("symbol") or o.get("s") or "",
-            quantity=quantity,
-            order_type=order_type,
-            price=price or None,
-            trigger_price=trigger or None,
-            trigger_above=bool(trigger_above),
-            reduce_only=bool(o.get("reduceOnly", o.get("R", False))),
-            client_id=o.get("clientOrderId") or o.get("c") or None,
-            created_at=int(o.get("time", o.get("T", 0)) or 0),
-            exchange_order_id=str(o.get("orderId", o.get("i", "")) or ""),
-        )
+        """스트림이 준 주문 표현을 OpenOrder로. 해석 규칙은 :func:`order_from_exchange`에 있다
+        (기동 시점의 적재와 같은 한 벌을 쓴다)."""
+        return order_from_exchange(o, self.status.last_close)
 
     def reconcile_resumed(self, saved: Optional[Status]) -> None:
         """재개한 런이 기억하는 포지션/미체결 주문을 거래소의 실제 값과 대조한다.

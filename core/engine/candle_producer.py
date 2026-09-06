@@ -4,7 +4,8 @@
 
 모든 구현체가 **비동기 iterator**(``__aiter__``)로 이벤트를 내주고,
 :meth:`~core.engine.engine.TradingEngine.run_async`가 그것을 소비한다. 백테스트/드라이런/
-라이브가 같은 소비 경로를 지나가고, 백테스트 진입점만 그 코루틴을 ``asyncio.run``으로 감싼다:
+라이브가 같은 소비 경로를 지나가고, 이벤트 루프가 없는 호출자(백테스트)만 그 코루틴을
+``asyncio.run``으로 감싼 :meth:`~core.engine.engine.TradingEngine.run`을 쓴다:
 
 - :class:`~core.backtest.in_memory_candle_producer.InMemoryCandleProducer` — 이미 메모리에
   로딩된 캔들을 병합해 내준다 (내부에서 아무것도 ``await``하지 않는 async generator).

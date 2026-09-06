@@ -14,7 +14,11 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 from dotenv import load_dotenv
 
-from core.backtest.run import DEFAULT_INIT_MARGIN, run_backtest
+from core.backtest import DEFAULT_INIT_MARGIN
+from core.backtest.in_memory_candle_producer import InMemoryCandleProducer
+from core.backtest.recorder import BacktestRecorder
+from core.backtest.simulated_executor import SimulatedExecutor
+from core.engine.engine import TradingEngine
 from core.fetcher.stock import nyse_session
 from core.fetcher.stock.massive_fetcher import MassiveStockFetcher
 from core.logging_config import setup_logging
@@ -113,9 +117,13 @@ def main():
 
     # 6. 파이프라인 통합 — 크래시 없이 도는지만 (파라미터 튜닝은 범위 밖)
     streamer = KeltnerStreamer(symbols=[symbol], window=120, m_entry=2.0, m_exit=0.0,
-                               fee_ratio=0.0005, max_loss=0.08)
-    report = run_backtest(streamer, candles)
+                               max_loss=0.08)
     init_margin = DEFAULT_INIT_MARGIN
+    # 이미 손에 든 캔들을 그대로 흘려보낸다 — 심볼별 dict가 공급자의 입력이다.
+    producer = InMemoryCandleProducer({symbol: candles})
+    executor = SimulatedExecutor(init_margin, 0.0005)
+    recorder = BacktestRecorder(streamer, executor.status, interval_ms=producer.interval_ms)
+    report = TradingEngine(streamer, producer, executor, recorder).run()
     # Trade.status는 거래 전 스냅샷이므로 최종 상태를 쓴다 (마지막 거래 손익/수수료 포함)
     final = report.status.total_margin()
     print(f"[6] 백테스트 파이프라인 OK — {len(report.trades)} trades, "

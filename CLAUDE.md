@@ -26,7 +26,7 @@ There is no automated test suite (no `pytest`/`unittest` files in `core/`, only 
   account/fill handling, and that **a dry run produces exactly the trades a backtest of the same
   candles does** (over Keltner, a stateful mean-reversion strategy, and toy limit/stop-ladder
   fixtures). The vectorized backtest path and its `backtest_fast_check.py` parity harness were
-  removed pending reintroduction on the current producer structure — `run_backtest` now has a
+  removed pending reintroduction on the current producer structure — the backtest now has a
   single reference path.
 
 ## Commands
@@ -95,7 +95,7 @@ avoid name collisions with the `core/engine/` and `core/backtest/` packages. Rel
 (`from .foo import Bar`) are not used anywhere — everything is the full `core.`-rooted path.
 
 Default paths like `BaseCandleFetcher(save_path="../asset/")` and
-`run_backtest(result_path="../asset/")` are relative to the *current working directory*, not the
+`BacktestRecorder(result_path="../asset/")` are relative to the *current working directory*, not the
 script location — so they only land in the repo-root `asset/` (gitignored) when the process is
 launched with cwd = `core/`.
 
@@ -108,7 +108,7 @@ core/
   fetcher/    BaseCandleFetcher + pickle cache; binance/ and stock/ under it
   engine/     TradingEngine + the three ports: CandleProducer, Executor, Recorder
   result/     writer.py (run JSON + shards), metrics.py, indicator_columns.py
-  backtest/   run_backtest, SimulatedExecutor, BacktestRecorder, the two backtest producers
+  backtest/   SimulatedExecutor, BacktestRecorder, the two backtest producers
   live/       BinanceTrader, LiveCandleProducer/Executor/Recorder, BinanceOrderClient
   checks/     live_check.py, fetch_stock_check.py
   examples/   backtest.py, trader.py
@@ -130,8 +130,11 @@ Three rules hold this together, and a change that breaks one is a design change,
   importing the strategy framework, which it used to have to do when `Candle` lived under
   `core/streamer/`.
 - **`engine/` holds the contract, not the implementations.** `TradingEngine` plus the three ABCs.
-  It imports neither `backtest/` nor `live/`; the modes are assembled by their own entry points
-  (`backtest/run.py`, `live/trader.py`).
+  It imports neither `backtest/` nor `live/`. `TradingEngine` wires the parts together and runs
+  them, but it never *constructs* them — the caller does that (`core/examples/backtest.py`,
+  `live/trader.py`), which is exactly what lets the engine stay ignorant of both mode packages.
+  Moving that construction into `engine/` would make `engine ↔ backtest` circular, so it is a
+  design change, not a tidy-up.
 - **`live/` importing `backtest/` is deliberate.** Dry run uses `SimulatedExecutor` — the
   backtest's own class, not a copy of it — so the import is the invariant made visible. It is the
   only edge that runs "backwards" and it is acyclic.
@@ -184,18 +187,41 @@ carrying a frontend hint (`scale_group`) would blur what `domain/` means.
    forces one. Note this applies to the backtest cache only — the live trader's indicator prefeed
    calls `get_candles` directly and never touches a `.pkl`.
 
-3. **Backtest.** `backtest/run.run_backtest(streamer, candles_by_symbol=None, *, producer=None,
-   ...)` is the entry point. It is multi-symbol. The candle source is one of:
-   - `candles_by_symbol: Dict[str, List[Candle]]` (one ragged list per symbol — symbols don't need
-     to start/end at the same time), which `InMemoryCandleProducer`
-     (`backtest/in_memory_candle_producer.py`) merges via `backtest/candle_merge.merge_candle_timeline`
-     into one chronological stream of **events**. Used by the check scripts and non-Binance
-     sources.
-   - `producer=` — a `CandleProducer` passed directly, normally
-     `BinanceBacktestCandleProducer` (`backtest/binance_candle_producer.py`), which
-     subclasses `InMemoryCandleProducer` and fetches the `[start, end)` range itself (default
-     fetcher `BinanceVisionFetcher`, injectable) before merging. This is what
-     `core/examples/backtest.py` uses.
+3. **Backtest.** There is no `run_backtest` function any more — a backtest *is* the four engine
+   parts assembled by the caller (`core/examples/backtest.py` is the reference; see "The trading
+   engine" below):
+
+   ```python
+   # DEFAULT_INIT_MARGIN is core.backtest's; the executor builds and owns the Status.
+   executor = SimulatedExecutor(DEFAULT_INIT_MARGIN, fee_ratio)
+   recorder = BacktestRecorder(streamer, executor.status, interval_ms=producer.interval_ms,
+                               metadata=metadata, save_series=True)
+   report   = TradingEngine(streamer, producer, executor, recorder).run()
+   ```
+
+   `fee_ratio` is a `Status` field the executor sets — `SimulatedExecutor` from its constructor
+   arg (default `DEFAULT_FEE_RATIO` in `core/domain/status.py`), `LiveExecutor.create` from the
+   exchange's own taker commission rate (`futures_commission_rate`). Strategies read
+   `status.fee_ratio` when sizing, so the fee the account is charged and the fee the strategy
+   sized against are one value by construction — the old `resolve_fee_ratio`/`resolve_slippage_ratio`
+   reconciliation is gone. `slippage_ratio` stays a `SimulatedExecutor` argument only (a
+   simulation modelling knob, not account state; no strategy sizes with it).
+
+   It is multi-symbol. The candle source is one of:
+   - `InMemoryCandleProducer(candles_by_symbol)` (`backtest/in_memory_candle_producer.py`) —
+     `Dict[str, List[Candle]]`, one ragged list per symbol (symbols don't need to start/end at the
+     same time), merged by its own `merge_by_end_time` (same module — same `end_time` is one
+     event) into one chronological stream of **events**. Used by the check scripts and
+     non-Binance sources.
+   - `BinanceBacktestCandleProducer` (`backtest/binance_candle_producer.py`), which subclasses
+     `InMemoryCandleProducer` and fetches the `[start, end)` range itself (default fetcher
+     `BinanceVisionFetcher`, injectable) before merging. This is what `core/examples/backtest.py`
+     uses.
+
+   `BacktestRecorder` owns the output as well as the in-memory `Report`: give it `metadata` and it
+   writes the run JSON on `close()` (which the engine calls at the end of the run), plus the
+   time-series shards when `save_series=True`. Without `metadata` it is a pure in-memory run. The
+   `Report` comes back from `TradingEngine.run()` (it is `recorder.report`).
 
    An event bundles every symbol whose candle closes at that exact timestamp; the per-event
    ordering is `TradingEngine.process_event`'s (see "The trading engine" below). Indicators are
@@ -220,6 +246,15 @@ Backtest, dry run and live are **one domain**. The order-of-operations exists ex
 `core/engine/` holds only `TradingEngine` and the three ABCs the columns above name; every
 implementation lives in `core/backtest/` or `core/live/`, and the engine imports neither.
 
+**Assembling and running is the engine's job too.** The caller builds the four parts and hands them
+over — `TradingEngine(streamer, producer, executor, recorder, on_error=...)` — and the engine does
+the wiring (`executor.on_trade = recorder.record_trade`, `NullRecorder` when no recorder is given),
+the indicator warm-up, the event loop, and the finish (`recorder.close()`), returning
+`recorder.report`. That wiring used to be hand-repeated at each of the three entry points; the
+`on_trade` line alone existed in three places. Only *constructing* the parts stays with the caller,
+because those implementations live in the mode packages — which is what keeps the engine from
+importing `backtest/` or `live/`.
+
 Dry run and backtest share the executor **class**, not merely equivalent code — which is why
 `core/live/trader.py` imports `SimulatedExecutor` out of `core/backtest/`. Dry run exists to be
 compared against a backtest, so the fill rules, accounting and resting-order book have to be one
@@ -230,8 +265,10 @@ kept in sync by attention alone.
 the executor and moves on, never waiting for a result. All three modes go through the single
 driver `run_async`, which iterates the producer with `async for` and routes any exception
 `process_event` raises to `on_error` (so one transient strategy bug can't kill a weeks-long
-process). The backtest path wraps that coroutine in `asyncio.run(...)` inside a sync function, so
-`run_backtest` stays a synchronous call; `InMemoryCandleProducer.__aiter__` (which the Binance
+process). `TradingEngine.run()` is the sync wrapper around it (`asyncio.run(...)`) for callers with
+no event loop, which is how a backtest stays a synchronous call — inside one, use `run_async`
+directly (that is what `live_check.py`'s parity harness does, and it no longer needs the
+`asyncio.to_thread` hop it used to). `InMemoryCandleProducer.__aiter__` (which the Binance
 subclass inherits) is an async generator that never `await`s anything, so no event loop scheduling
 actually happens on that path — only `async for`'s protocol cost (~100ns/event, measured <2% of
 `process_event`).
@@ -420,8 +457,11 @@ existing ragged-series contract with no changes needed there.
   `_QUANTITY_DIVERGENCE_TOLERANCE`, 1%, so the size of that drift is visible rather than
   merely expected); prefeed candles are not recorded, so live indicator columns have no
   NaN warm-up prefix; `update_unrealised_pnl` marks with last price while the exchange marks with
-  mark price; and BNB-denominated commissions (`N` != margin asset) are excluded from `fee` and
-  flagged as `metadata.fee_asset_mismatch`.
+  mark price; live sizing uses `status.fee_ratio` from the account's real taker commission tier
+  (`futures_commission_rate`) while a backtest uses whatever `fee_ratio` the caller passed
+  `SimulatedExecutor`, so position sizes can differ if the two rates differ; and BNB-denominated
+  commissions (`N` != margin asset) are excluded from `fee` and flagged as
+  `metadata.fee_asset_mismatch`.
 
 ### Logging (`core/logging_config.py`)
 
@@ -583,9 +623,9 @@ diverge. That matters because dry run exists to be comparable to a backtest.
 | STOP_MARKET, not `trigger_above` | `o <= T` | `o` |
 | | else `l <= T` | `T` |
 
-`slippage_ratio` (an argument to `run_backtest` and `SimulatedExecutor`, resolved from the
-streamer by the same rule as `fee_ratio` — see `engine/executor.resolve_slippage_ratio`, default
-`0.0`) is applied **only to STOP_MARKET**, in the adverse
+`slippage_ratio` (a `SimulatedExecutor` constructor argument, default `0.0` — a simulation
+modelling knob only this executor and `order_book` see, never on `Status`, never read by a
+strategy) is applied **only to STOP_MARKET**, in the adverse
 direction. LIMIT fills at your price or better by definition, and MARKET is left alone so existing
 backtests are bit-identical.
 
@@ -616,8 +656,12 @@ book, hydrated at startup from `futures_get_open_orders()` and kept in sync by
 
 ### Position & PnL accounting (`core/domain/status.py`, `trade.py`, `report.py`)
 
-`Status` is the single shared representation of account state, **owned by the executor**
-(`executor.status`) and modelling one **shared cross-margin pool** (`margin`, a bare scalar)
+`Status` is the single shared representation of account state, **created and owned by the
+executor** (`executor.status` — nothing outside an executor constructs one: `SimulatedExecutor`
+takes an `init_margin` scalar and a `fee_ratio` and builds it, `LiveExecutor.create()` reads the
+exchange — wallet balance, positions, open orders, **and the taker commission rate** — and builds
+it, so a `Status` that has not yet been filled in cannot be observed) and modelling one
+**shared cross-margin pool** (`margin`, a bare scalar)
 across per-symbol positions (`positions: Dict[str, PositionState]`, each holding `avg_price`,
 `position`, `unrealised_pnl`) — matching how Binance USD-M cross margin actually works: a loss on
 one symbol draws down the same pool a profit on another symbol credits. `status.position_for(
@@ -627,8 +671,15 @@ symbol)` lazily creates a flat `PositionState` for a symbol not yet touched, so 
 symbol over that. `status.last_close: Dict[str, float]` is engine-maintained (set to each
 symbol's close as it's processed within a merged event, before any symbol's own `decide_action`
 runs that event) — it's what lets a cross-symbol action price a non-trigger symbol correctly.
-`Status.apply_fill(symbol, quantity, price, fee_ratio)` holds the one copy of the averaging/PNL
-math — and it derives realised PnL by **pro-rating `unrealised_pnl`**, which is only correct when
+`status.fee_ratio` is the account's fee rate — a `Status` field (default `DEFAULT_FEE_RATIO` in
+`core/domain/status.py`) the executor sets: `SimulatedExecutor` from its constructor arg,
+`LiveExecutor` from `futures_commission_rate`. Strategies read it when sizing (`price * (1/lev +
+status.fee_ratio)`), so the fee the account is charged and the fee the position was sized against
+are the same number — this is why the `resolve_fee_ratio` streamer-reconciliation helper no longer
+exists.
+`Status.apply_fill(symbol, quantity, price)` holds the one copy of the averaging/PNL
+math (charging `self.fee_ratio` on the notional) — and it derives realised PnL by **pro-rating
+`unrealised_pnl`**, which is only correct when
 that field is marked at the fill price. For a market fill that is automatic (the fill price *is*
 the close the engine just marked at); for a resting fill at a trigger or limit price it is not, so
 `SimulatedExecutor._fill` — the **one** fill path for backtest and dry run alike — calls
@@ -698,9 +749,22 @@ straight to `executor.on_user_data(...)`.
   gets a `newClientOrderId` (auto-generated for market orders, the strategy's `client_id` for
   resting ones) which the exchange echoes back as `c`, so a resting order that fills hours later is
   still paired with the decision that created it.
-  - `Status` is hydrated from `futures_account()` at startup for every traded symbol (from
-    `walletBalance`, not `marginBalance` — the latter already includes unrealised PnL, which
-    `total_margin()` adds again) and then kept in sync by `ACCOUNT_UPDATE`/`ORDER_TRADE_UPDATE`.
+  - **Construction is hydration.** `LiveExecutor.create()` is the only way to build one: it reads
+    `futures_account()` and `futures_get_open_orders()` and hands those payloads to `build_status`
+    / `order_from_exchange` — pure functions, so the accounting rules are checkable without a
+    client — and returns an executor whose `Status` is already exchange truth. An unhydrated
+    `Status` therefore cannot be observed; before this the caller passed in a placeholder
+    `Status(margin=0.0)` that a later `load_account()` overwrote, and reading it in between (the
+    live recorder takes `init_margin` from it) silently produced a run with `init_margin` 0.
+    Balance comes from `walletBalance`, not `marginBalance` — the latter already includes
+    unrealised PnL, which `total_margin()` adds again. A `futures_account()` failure is fatal; a
+    `futures_get_open_orders()` failure is not (the book looks empty and `ORDER_TRADE_UPDATE`
+    refills it). After startup the state is kept in sync by `ACCOUNT_UPDATE`/`ORDER_TRADE_UPDATE`.
+  - **Clients are self-created unless injected**, and `close()` only tears down what it created.
+    `BinanceTrader` passes its own `AsyncClient` (the socket manager shares it) but not the
+    `BinanceOrderClient`, so that thread pool now exists only in live mode — it used to be built
+    in `BinanceTrader.__init__` for dry run too, which never sends an order. The check scripts use
+    the injection path with fakes.
     `ACCOUNT_UPDATE` carries **only changed** balances/positions, so the handler leaves `Status`
     untouched for symbols/assets absent from the event rather than zeroing them, and iterates the
     full `P` array without stopping at the first match — one event can carry position deltas for
@@ -722,8 +786,10 @@ straight to `executor.on_user_data(...)`.
   synthetic `1e6`, no user-data socket is opened, no orders are sent, and fills/resting orders go
   through exactly the code a backtest runs. `core/checks/live_check.py` asserts that a dry run and a
   backtest of the same candles produce identical trades.
-- `start()` builds the `BinanceSocketManager` first, hydrates the account (live), sets up the
-  recorder and engine, warms up indicators *before* opening any socket (so the user-data queue
+- `start()` builds the `BinanceSocketManager` first, then **the executor** (`__init__` no longer
+  builds one — `BinanceTrader.executor` is `None` until `start()`, because building the live one
+  reads the exchange and so needs the `AsyncClient`; `trader.status` is a property onto
+  `executor.status`), then the recorder and engine, warms up indicators *before* opening any socket (so the user-data queue
   can't overflow during a long backfill), sets `is_running = True` *before* spawning listener tasks
   (they loop on that flag), and **re-raises** on failure — a trader that could not start must not
   look like one that did. Listener tasks are kept in `self._tasks` so asyncio can't garbage-collect

@@ -12,11 +12,17 @@
 라이브       LiveCandleProducer              LiveExecutor        LiveRecorder
 ===========  ==============================  ==================  ================
 
+**부품을 엮는 것도 엔진의 일이다.** 호출자는 네 부품(스트리머·공급자·실행기·레코더)을
+생성자에 넘기기만 하고, 체결 싱크 연결(``executor.on_trade``), 레코더 기본값, 워밍업,
+루프, 마무리(``recorder.close()``)는 엔진이 한다. 예전에는 이 배선이 진입점마다 손으로
+반복됐다. 실행기와 레코더의 **구현체**는 여전히 :mod:`core.backtest`/:mod:`core.live`에
+있고 엔진은 그 어느 쪽도 import하지 않는다 — 만들어 넘기는 것은 호출자다.
+
 **엔진은 완전히 동기다.** ``process_event``는 평범한 메서드고, 액션을 실행기에 넘기면 그걸로
 끝이다 — 결과를 기다리지 않는다. 세 모드 모두 유일한 드라이버 :meth:`run_async`를 지나가고
-(producer를 ``async for``로 순회한다), 백테스트 경로는 그 코루틴을 ``asyncio.run``으로
-감싼다 (:func:`~core.backtest.run.run_backtest`는 여전히 동기 함수다). ``run_async``만이
-``process_event`` 안에서 터진 예외를 ``on_error``로 넘긴다.
+(producer를 ``async for``로 순회한다), 이벤트 루프가 없는 호출자를 위해 그것을 ``asyncio.run``
+으로 감싼 :meth:`run`이 따로 있다 (백테스트가 쓴다). ``run_async``만이 ``process_event`` 안에서
+터진 예외를 ``on_error``로 넘긴다.
 
 라이브에서 주문 제출은 :class:`~core.live.executor.LiveExecutor` 안에서 fire-and-forget이다.
 예전의 "주문 N의 결과를 확인한 뒤 N+1을 보낸다"는 보장은 **의도적으로 없앴다** — 라이브 ``status``
@@ -25,24 +31,49 @@
 은 ``SimulatedExecutor``가 동기라 리스트 순서를 지킨다).
 """
 
+import asyncio
 import logging
 from typing import Awaitable, Callable, Dict, List, Optional
 
 from core.domain.action import Action
 from core.domain.candle import Candle
+from core.domain.report import Report
 from core.engine.candle_producer import CandleProducer
 from core.engine.executor import Executor
-from core.engine.recorder import Recorder
+from core.engine.recorder import NullRecorder, Recorder
 from core.streamer import BaseStreamer
 from core.utils import generate_dict_string
 
 
 class TradingEngine:
-    def __init__(self, streamer: BaseStreamer, executor: Executor, recorder: Recorder):
+    """네 부품을 엮어 매매 루프를 돌린다.
+
+    :param producer: 캔들 공급자. 워밍업 캔들도 여기서 나온다.
+    :param recorder: None이면 :class:`~core.engine.recorder.NullRecorder` — 기록이 꺼진
+        라이브 실행처럼 엔진은 돌려야 하지만 적재할 필요가 없을 때다.
+    :param on_error: 주면 한 이벤트의 처리 실패가 루프를 끝내지 않고 여기로 넘어간다.
+        None이면 그대로 올라간다 (:meth:`run_async` 참고).
+
+    **생성자가 ``executor.on_trade``를 레코더로 덮어쓴다.** 체결 싱크를 잇는 이 한 줄은
+    예전에 백테스트/드라이런/라이브 진입점 세 곳에 각각 있었다 — 배선을 한 곳으로 모으는 것이
+    이 클래스가 조립까지 맡는 이유다. 엔진을 거치지 않고 실행기만 단독으로 쓰는 경로
+    (검사 스크립트 등)는 여전히 실행기 생성자의 ``on_trade``를 그대로 쓴다.
+    """
+
+    def __init__(self, streamer: BaseStreamer, producer: CandleProducer, executor: Executor,
+                 recorder: Optional[Recorder] = None, *,
+                 on_error: Optional[Callable[[Exception], Awaitable[None]]] = None):
         self.streamer = streamer
+        self.producer = producer
         self.executor = executor
-        self.recorder = recorder
+        self.recorder = recorder if recorder is not None else NullRecorder()
+        self.on_error = on_error
         self.logger = logging.getLogger(__name__)
+
+        self.executor.on_trade = self.recorder.record_trade
+        #: 워밍업을 이미 했는지. 라이브는 소켓을 열기 전에 명시적으로 워밍업해야 하므로
+        #: (:meth:`warmup_from_producer` 참고) 이 플래그로 이중 주입을 막는다.
+        self._warmed_up = False
 
     def process_event(self, event_time: int, candles: Dict[str, Candle]) -> None:
         """이벤트 하나를 처리한다.
@@ -139,27 +170,55 @@ class TradingEngine:
                 self.logger.info("[%s] Pre-fed indicators: %s", symbol,
                                  generate_dict_string(indicators))
 
-    async def run_async(self, producer: CandleProducer,
-                        on_error: Optional[Callable[[Exception], Awaitable[None]]] = None
-                        ) -> None:
-        """producer를 끝까지 흘려보낸다 — 백테스트/드라이런/라이브의 **유일한 드라이버**다.
+    async def warmup_from_producer(self) -> None:
+        """공급자에게 과거 캔들을 받아 지표에만 먹인다. **멱등**이다.
 
-        백테스트/벡터화 경로는 동기 함수 안에서 이걸 ``asyncio.run``으로 감싸 부른다.
+        :meth:`run_async`가 루프에 들어가기 전에 부르므로 보통은 신경 쓸 필요가 없다. 라이브만
+        예외로 이걸 **직접, 더 이른 시점에** 부른다 — 워밍업은 소켓을 열기 전에 끝나야 하는데
+        (수십 초짜리 백필 동안 유저 데이터 스트림을 읽지 않으면 python-binance의 큐가 넘친다)
+        엔진 루프는 소켓이 열린 뒤에야 돌기 때문이다. 그 경우 ``run_async``의 호출은 no-op이 된다.
+        """
+        if self._warmed_up:
+            return
+        self._warmed_up = True
+        self.warmup(await self.producer.warmup_candles(self.warmup_windows()))
 
-        :param on_error: 주면 한 이벤트의 처리 실패(전략/지표 버그 등)가 루프를 끝내지 않고
-            여기로 넘어간다 — 몇 주씩 사는 프로세스가 일시적 버그 하나로 죽으면 안 되기
-            때문이다. None이면 그대로 올라간다 (테스트/백필 재생에서 쓴다).
+    async def run_async(self) -> Optional[Report]:
+        """공급자를 끝까지 흘려보낸다 — 백테스트/드라이런/라이브의 **유일한 드라이버**다.
+
+        워밍업 → 이벤트 루프 → ``recorder.close()`` 순서로, 한 번의 실행 전체를 여기가 갖는다.
+        이벤트 루프가 없는 호출자는 동기 래퍼 :meth:`run`을 쓴다.
+
+        생성자의 ``on_error``를 주면 한 이벤트의 처리 실패(전략/지표 버그 등)가 루프를 끝내지
+        않는다 — 몇 주씩 사는 프로세스가 일시적 버그 하나로 죽으면 안 되기 때문이다. None이면
+        그대로 올라간다 (검사/백필 재생에서 쓴다).
+
+        ``recorder.close()``를 ``finally``가 아니라 루프 **뒤**에 두는 것은 의도적이다: 실행이
+        예외로 끝났다면 반쪽짜리 산출물을 남기지 않는다.
 
         주문 제출 결과는 여기서 기다리지 않는다. 라이브에서 주문 실패는 실행기가 비동기로
         자기 에러 싱크에 흘려보내고, 거래소 진실인 ``status``가 다음 캔들에 스스로 복구한다.
+
+        :return: 레코더가 결과를 들고 있으면 그것 (백테스트의 ``Report``), 아니면 None.
         """
-        async for event_time, candles in producer:
+        await self.warmup_from_producer()
+        async for event_time, candles in self.producer:
             try:
                 self.process_event(event_time, candles)
             except Exception as e:
-                if on_error is None:
+                if self.on_error is None:
                     raise
                 # exception()으로 스택트레이스까지 남긴다 — 한 줄만으로는 핸들러 안 어느
                 # 줄에서 터졌는지 알 수 없다.
                 self.logger.exception("이벤트 처리 실패 — 다음 캔들로 넘어간다: %s", e)
-                await on_error(e)
+                await self.on_error(e)
+        self.recorder.close()
+        return self.recorder.report
+
+    def run(self) -> Optional[Report]:
+        """:meth:`run_async`의 동기 래퍼. 백테스트처럼 이벤트 루프가 없는 호출자용이다.
+
+        **이미 도는 이벤트 루프 안에서 부르면 ``RuntimeError``다** — 그 경우는 ``run_async``를
+        직접 await하면 된다.
+        """
+        return asyncio.run(self.run_async())

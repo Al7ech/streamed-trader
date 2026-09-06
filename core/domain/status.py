@@ -4,6 +4,12 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 if TYPE_CHECKING:  # 런타임 임포트는 순환을 만든다 (order_book이 Status를 쓴다)
     from core.domain.order_book import OpenOrder
 
+#: 계좌 수수료율의 기본값. 실제로는 거래소가 VIP/커미션 티어로 정하는 계좌 속성이라
+#: ``Status``에 얹혀 있고, 실행기가 자기 생성 경로에서 이 값을 채운다 —
+#: ``SimulatedExecutor``는 생성자 인자로, ``LiveExecutor``는 ``futures_commission_rate``로.
+#: 전략은 사이징할 때 ``status.fee_ratio``를 읽는다.
+DEFAULT_FEE_RATIO = 0.0004
+
 
 @dataclass
 class PositionState:
@@ -19,10 +25,14 @@ class Status:
                  positions: Optional[Dict[str, PositionState]] = None,
                  leverage: float = 0.0,
                  last_close: Optional[Dict[str, float]] = None,
-                 open_orders: Optional[Dict[str, List["OpenOrder"]]] = None):
+                 open_orders: Optional[Dict[str, List["OpenOrder"]]] = None,
+                 fee_ratio: float = DEFAULT_FEE_RATIO):
         self.margin = margin
         self.positions: Dict[str, PositionState] = positions if positions is not None else {}
         self.leverage = leverage
+        #: 명목가치에 곱할 수수료율. 계좌 속성이라 여기 둔다 — 실행기가 채우고
+        #: (백테스트: 생성자 인자, 라이브: 거래소 커미션 티어), 전략은 사이징 시 이 값을 읽는다.
+        self.fee_ratio = fee_ratio
         #: 심볼별 최근 알려진 종가. 엔진이 매 이벤트마다 갱신한다 — 트리거 심볼이 아닌
         #: 다른 심볼을 대상으로 하는 Action의 체결가/시가평가에 쓰인다.
         self.last_close: Dict[str, float] = last_close if last_close is not None else {}
@@ -88,8 +98,8 @@ class Status:
             self.leverage = notional / equity
         return self.leverage
 
-    def apply_fill(self, symbol: str, quantity: float, price: float,
-                    fee_ratio: float) -> Tuple[float, float]:
+    def apply_fill(self, symbol: str, quantity: float,
+                   price: float) -> Tuple[float, float]:
         """체결 하나를 이 Status에 반영한다. 반환값은 (wnl, fee).
 
         가상 실행기(``SimulatedExecutor._fill``)와 라이브 트레이더의 체결 경로가
@@ -99,17 +109,16 @@ class Status:
         ``wnl``은 **수수료 차감 전** 실현손익이고 ``fee``는 별도로 반환한다. margin에는 둘 다
         반영된다(실현손익 가산 후 수수료 차감). margin은 전 심볼이 공유하는 증거금 풀이라
         어느 심볼의 체결이든 같은 ``self.margin``을 갱신한다 — 심볼별로 분리되는 것은
-        position/avg_price/unrealised_pnl 뿐이다.
+        position/avg_price/unrealised_pnl 뿐이다. 수수료율은 ``self.fee_ratio``를 쓴다.
 
         :param symbol: 체결이 일어난 심볼.
         :param quantity: 현재 포지션에 더할 부호 있는 수량 (양수=매수, 음수=매도)
         :param price: 체결가
-        :param fee_ratio: 명목가치에 곱할 수수료율
         """
         p = self.position_for(symbol)
         qty = quantity
         wnl = 0.0
-        fee = price * abs(qty) * fee_ratio
+        fee = price * abs(qty) * self.fee_ratio
 
         # 신규 진입 (롱/숏 방향 동일하게 처리)
         if p.position == 0.0:

@@ -31,11 +31,8 @@ class KeltnerStopStreamer(KeltnerStreamer):
     #: 손절 주문의 client_id. 심볼별 장부 안에서만 유일하면 되므로 상수로 충분하다.
     STOP_ID = "keltner-stop"
 
-    def __init__(self, *args, slippage_ratio: float = 0.0, **kwargs):
-        """:param slippage_ratio: 조건부 시장가 체결에 얹을 슬리피지. 백테스터가
-            ``fee_ratio``와 같은 규칙으로 이 값을 읽어간다."""
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.slippage_ratio = slippage_ratio
         self.logger = logging.getLogger(__name__)
 
     def _stop(self, symbol: str, quantity: float, level: float) -> Action:
@@ -72,7 +69,7 @@ class KeltnerStopStreamer(KeltnerStreamer):
             if dist <= 0:
                 return []
             lev = min(6.0, self.max_loss * price / dist)
-            qty = trunc_by_sign(status.total_margin() / (price * (1 / lev + self.fee_ratio)), 3)
+            qty = trunc_by_sign(status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
             if qty == 0:
                 return []
             return [Action(symbol, qty), self._stop(symbol, -qty, long_stop)]
@@ -82,7 +79,7 @@ class KeltnerStopStreamer(KeltnerStreamer):
             if dist <= 0:
                 return []
             lev = min(6.0, self.max_loss * price / dist)
-            qty = trunc_by_sign(-status.total_margin() / (price * (1 / lev + self.fee_ratio)), 3)
+            qty = trunc_by_sign(-status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
             if qty == 0:
                 return []
             return [Action(symbol, qty), self._stop(symbol, -qty, short_stop)]

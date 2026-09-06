@@ -24,15 +24,14 @@ from concurrent.futures import Future
 from datetime import datetime, timezone
 from typing import List
 
+from core.backtest.in_memory_candle_producer import InMemoryCandleProducer
 from core.backtest.recorder import BacktestRecorder
-from core.backtest.run import run_backtest
 from core.backtest.simulated_executor import SimulatedExecutor
 from core.domain.action import Action, ActionType
 from core.domain.candle import Candle
 from core.domain.status import Status
 from core.engine.candle_producer import CandleProducer
 from core.engine.engine import TradingEngine
-from core.engine.executor import resolve_fee_ratio, resolve_slippage_ratio
 from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
 from core.live import candle_producer as lcp
 from core.live.binance_order_client import OrderResult
@@ -74,12 +73,10 @@ class LimitLadderStreamer(BaseStreamer):
     체결가가 비트 단위로 같다 — 구조적 버그가 float 반올림에 묻히지 않는다.
     """
 
-    def __init__(self, symbols: List[str], spread: float = 0.002, ttl: int = 30,
-                 fee_ratio: float = 0.0004):
+    def __init__(self, symbols: List[str], spread: float = 0.002, ttl: int = 30):
         super().__init__(symbols, {s: {} for s in symbols})
         self.spread = spread
         self.ttl = ttl
-        self.fee_ratio = fee_ratio
         self._bar = 0
 
     def decide_action(self, symbol, candle: Candle, status: Status):
@@ -337,15 +334,55 @@ class FakeOrderClient:
         return f
 
 
-def make_live_executor(margin=10_000.0):
+class FakeAsyncClient:
+    """``LiveExecutor.create()``가 쓰는 엔드포인트에만 답하는 가짜 AsyncClient.
+
+    ``marginBalance``를 일부러 ``walletBalance``와 다르게 실어 둔다 — 그쪽을 쓰면 미실현
+    손익이 두 번 세어지므로, 어느 필드를 골랐는지가 검증 대상이다.
+    """
+
+    def __init__(self, margin=10_000.0, positions=None, open_orders=None, error=None,
+                 orders_boom=False, taker_rate="0.0004"):
+        self.margin = margin
+        self.positions = positions or {}
+        self.open_orders = open_orders or []
+        self.error = error
+        self.orders_boom = orders_boom
+        self.taker_rate = taker_rate
+
+    async def futures_account(self):
+        if self.error:
+            return {"error": self.error}
+        return {
+            "assets": [{"asset": "USDT", "walletBalance": str(self.margin),
+                        "marginBalance": str(self.margin + 777.0)}],
+            "positions": [{"symbol": s, "positionAmt": str(pa), "entryPrice": str(ep),
+                           "unrealizedProfit": str(up)}
+                          for s, (pa, ep, up) in self.positions.items()],
+        }
+
+    async def futures_get_open_orders(self):
+        if self.orders_boom:
+            raise RuntimeError("REST 실패")
+        return self.open_orders
+
+    async def futures_commission_rate(self, symbol=None):
+        return {"symbol": symbol, "makerCommissionRate": "0.0002",
+                "takerCommissionRate": self.taker_rate}
+
+
+async def make_live_executor(margin=10_000.0, client=None):
     trades, errors, meta = [], [], []
 
     async def on_error(e):
         errors.append(e)
 
-    ex = LiveExecutor(FakeOrderClient(), Status(margin=margin), [SYM, SYM2], "USDT",
-                      on_trade=trades.append, on_error=on_error,
-                      on_metadata=lambda k, v: meta.append((k, v)))
+    # 생성 경로는 create() 하나뿐이다 — 계좌가 적재되지 않은 실행기는 만들 수 없다.
+    ex = await LiveExecutor.create(
+        [SYM, SYM2], order_client=FakeOrderClient(),
+        client=client or FakeAsyncClient(margin=margin),
+        on_trade=trades.append, on_error=on_error,
+        on_metadata=lambda k, v: meta.append((k, v)))
     return ex, trades, errors, meta
 
 
@@ -378,9 +415,37 @@ async def check_live_executor():
     except ValueError:
         check("executor: 혼합 정산 자산 거부", True)
 
+    # 생성이 곧 계좌 적재다 — 수화되지 않은 Status를 든 실행기는 존재할 수 없어야 한다.
+    # walletBalance를 골라야 한다: marginBalance는 미실현을 이미 포함하고 total_margin()이
+    # 그걸 또 더하므로, 잘못 고르면 자본이 조용히 부풀어 사이징 전체가 어긋난다.
+    ex, _, _, _ = await make_live_executor(client=FakeAsyncClient(
+        margin=7_000.0, positions={SYM: (2.0, 100.0, 10.0)},
+        open_orders=[{"symbol": SYM, "type": "STOP_MARKET", "side": "SELL", "origQty": "2",
+                      "stopPrice": "90", "reduceOnly": True, "clientOrderId": "stop-r",
+                      "orderId": 11, "time": 500}]))
+    book = ex.status.open_orders_for(SYM)
+    check("executor: 생성 시점에 계좌/장부가 이미 채워져 있다",
+          ex.status.margin == 7_000.0 and ex.status.position_for(SYM).position == 2.0
+          and ex.status.position_for(SYM).avg_price == 100.0 and len(book) == 1
+          and book[0].trigger_price == 90.0 and book[0].reduce_only,
+          f"margin={ex.status.margin} book={book}")
+
+    # 미체결 조회 실패는 치명적이지 않다 — 장부가 비어 보일 뿐이고 ORDER_TRADE_UPDATE가 채운다.
+    ex, _, _, _ = await make_live_executor(client=FakeAsyncClient(margin=3_000.0,
+                                                                 orders_boom=True))
+    check("executor: 미체결 조회 실패는 치명적이지 않다",
+          ex.status.margin == 3_000.0 and ex.status.total_open_orders() == 0)
+
+    # 반대로 계좌 조회 실패는 치명적이다 — 잔고를 모르는 채로 사이징하면 안 된다.
+    try:
+        await make_live_executor(client=FakeAsyncClient(error="permission denied"))
+        check("executor: 계좌 조회 실패는 치명적", False)
+    except RuntimeError:
+        check("executor: 계좌 조회 실패는 치명적", True)
+
     # ACCOUNT_UPDATE는 **변경된 항목만** 싣는다. 없는 항목을 0으로 덮으면 마진이 0이 되어
     # 모든 사이징이 붕괴하거나, 포지션이 0으로 보여 재진입해 실제 포지션이 2배가 된다.
-    ex, _, _, _ = make_live_executor()
+    ex, _, _, _ = await make_live_executor()
     await ex.on_user_data(acct_msg(margin=5000.0, positions={SYM: (2.0, 100.0, 10.0)}))
     check("executor: ACCOUNT_UPDATE 반영",
           ex.status.margin == 5000.0 and ex.status.position_for(SYM).position == 2.0
@@ -401,7 +466,7 @@ async def check_live_executor():
 
     # 거래소는 한 주문을 여러 번에 나눠 채울 수 있는데, 부분 체결마다 Trade를 만들면
     # "액션 하나 = 체결 하나"인 백테스트와 모양이 달라진다.
-    ex, trades, _, _ = make_live_executor()
+    ex, trades, _, _ = await make_live_executor()
     ex.status.last_close[SYM] = 100.0
     ex.submit(Action(SYM, 2.0), event_time=5000)
     cid = ex._orders.calls[0][0].client_id
@@ -417,7 +482,7 @@ async def check_live_executor():
     check("executor: 시장가 timestamp = 결정 캔들 마감 시각",
           trades[0].timestamp == 5000 and trades[0].submitted_at == 5000)
 
-    ex, trades, _, _ = make_live_executor()
+    ex, trades, _, _ = await make_live_executor()
     ex.status.last_close[SYM] = 100.0
     ex.submit(Action(SYM, 1.0), event_time=1)
     cid = ex._orders.calls[0][0].client_id
@@ -425,7 +490,7 @@ async def check_live_executor():
     check("executor: 미체결 취소는 Trade 없이 pending 정리",
           not trades and not ex._pending_decision)
 
-    ex, trades, _, _ = make_live_executor()
+    ex, trades, _, _ = await make_live_executor()
     ex.status.last_close[SYM] = 100.0
     await ex.on_user_data(order_msg(status="NEW", x="NEW", z=0.0, otype="STOP_MARKET",
                                     sp=95.0, side="SELL", c="stop-1"))
@@ -441,12 +506,12 @@ async def check_live_executor():
           len(trades) == 1 and trades[0].timestamp == 1000)
 
     # 청산/ADL/앱에서 낸 수동 주문 — 실제 자본을 움직이므로 기록은 해야 한다.
-    ex, trades, _, _ = make_live_executor()
+    ex, trades, _, _ = await make_live_executor()
     await ex.on_user_data(order_msg(status="FILLED", z=1.0, ap=50.0, c="unknown-id"))
     check("executor: 짝지어지지 않은 체결도 기록", len(trades) == 1 and trades[0].price == 50.0)
 
     # BNB 수수료 할인을 켜면 n이 BNB 단위로 온다. 마진 자산 손익에 더하면 wnl - fee 가 오염된다.
-    ex, trades, _, meta = make_live_executor()
+    ex, trades, _, meta = await make_live_executor()
     ex.status.last_close[SYM] = 100.0
     ex.submit(Action(SYM, 1.0), event_time=1)
     cid = ex._orders.calls[0][0].client_id
@@ -454,7 +519,7 @@ async def check_live_executor():
     check("executor: 다른 자산 수수료 분리",
           trades[0].fee == 0.0 and meta == [("fee_asset_mismatch", "BNB")])
 
-    ex, _, _, _ = make_live_executor()
+    ex, _, _, _ = await make_live_executor()
     ex.status.last_close[SYM] = 100.0
     await ex.on_user_data(order_msg(status="NEW", x="NEW", z=0.0, otype="STOP_MARKET",
                                     sp=95.0, side="SELL", c="stop-1"))
@@ -463,12 +528,12 @@ async def check_live_executor():
           ex.status.total_open_orders() == 0
           and ex._orders.calls[-1][0].order_type is ActionType.CANCEL)
 
-    ex, trades, _, _ = make_live_executor()
+    ex, trades, _, _ = await make_live_executor()
     ex.match_resting(SYM, Candle(1, 1, 1, 1, 1, 0, MIN), MIN)
     check("executor: 미체결 주문을 시뮬레이션하지 않는다", not trades)
     check("executor: 강제청산은 거래소 몫", ex.force_liquidation(-100.0) is False)
 
-    ex, _, _, _ = make_live_executor()
+    ex, _, _, _ = await make_live_executor()
     ex.status.last_close[SYM] = 100.0
     ex.submit(Action(SYM, 1.0), event_time=1)
     ex.submit(Action(SYM, -1.0, order_type=ActionType.STOP_MARKET,
@@ -479,7 +544,7 @@ async def check_live_executor():
     check("executor: 캔들 경계에서 시장가 결정만 폐기",
           len(left) == 1 and left[0].resting is True)
 
-    ex, _, errors, _ = make_live_executor()
+    ex, _, errors, _ = await make_live_executor()
     ex._orders.success = False
     ex.status.last_close[SYM] = 100.0
     # 실행기는 재시도 소진 후 예외 대신 success=False를 반환한다 — 확인하지 않으면 영구 거부된
@@ -489,7 +554,7 @@ async def check_live_executor():
     await ex.drain_pending_orders()
     check("executor: 주문 실패는 on_error로", len(errors) == 1, f"{errors}")
 
-    ex, _, _, _ = make_live_executor()
+    ex, _, _, _ = await make_live_executor()
     ex.status.last_close[SYM] = 100.0
     ex.status.last_close[SYM2] = 200.0
     ex.submit(Action(SYM2, 1.0), event_time=1)
@@ -514,17 +579,27 @@ class ReplayProducer(CandleProducer):
             yield end_time, {symbol: candle}
 
 
+def _assemble(streamer, producer, slippage_ratio, log_label=""):
+    """부품을 조립해 엔진을 만든다. 백테스트와 드라이런의 **차이는 공급자뿐**이다.
+
+    ``on_trade``는 엔진 생성자가 레코더로 이어 준다.
+    """
+    executor = SimulatedExecutor(
+        INIT_MARGIN, slippage_ratio=(slippage_ratio or 0.0), log_label=log_label)
+    recorder = BacktestRecorder(streamer, executor.status, interval_ms=producer.interval_ms)
+    return TradingEngine(streamer, producer, executor, recorder)
+
+
 async def run_dry(streamer, candles_by_symbol, interval_ms, slippage_ratio=None):
     """``BinanceTrader``의 드라이런과 **같은 부품 구성**으로 돌린다."""
-    status = Status(margin=INIT_MARGIN)
-    recorder = BacktestRecorder(streamer, status)
-    executor = SimulatedExecutor(
-        status, resolve_fee_ratio(streamer),
-        resolve_slippage_ratio(streamer, slippage_ratio),
-        on_trade=recorder.record_trade, log_label="dry-run")
-    engine = TradingEngine(streamer, executor, recorder)
-    await engine.run_async(ReplayProducer(candles_by_symbol, interval_ms))
-    return recorder.build_report(INIT_MARGIN)
+    producer = ReplayProducer(candles_by_symbol, interval_ms)
+    return await _assemble(streamer, producer, slippage_ratio, "dry-run").run_async()
+
+
+async def run_bt(streamer, candles_by_symbol, slippage_ratio=None):
+    """드라이런과 같은 조립, 공급자만 백테스트의 병합 타임라인이다."""
+    producer = InMemoryCandleProducer(candles_by_symbol, progress=False)
+    return await _assemble(streamer, producer, slippage_ratio).run_async()
 
 
 async def check_dry_run_parity():
@@ -534,29 +609,23 @@ async def check_dry_run_parity():
         datetime(2026, 2, 1, tzinfo=timezone.utc), interval)
     print(f"Loaded {len(candles)} candles for dry-run parity")
     by_symbol = {SYM: candles}
-    kp = dict(window=20 * 60, m_entry=2.0, m_exit=0.0, max_loss=0.02, fee_ratio=0.0004)
+    kp = dict(window=20 * 60, m_entry=2.0, m_exit=0.0, max_loss=0.02)
 
     cases = [
         ("dry-run: Keltner (시장가)", lambda: KeltnerStreamer(symbols=[SYM], **kp), None),
         ("dry-run: MeanReversionZScore (상태 있는 전략)",
          lambda: MeanReversionZScoreStreamer(symbol=SYM, window=60, entry_z=2.0,
-                                             timeout_candles=60, max_loss=0.02,
-                                             fee_ratio=0.0004), None),
+                                             timeout_candles=60, max_loss=0.02), None),
         ("dry-run: KeltnerStop (조건부 주문)",
          lambda: KeltnerStopStreamer(symbols=[SYM], window=72 * 60, m_entry=4.0,
-                                     m_exit=3.0, max_loss=0.005, fee_ratio=0.0004), None),
+                                     m_exit=3.0, max_loss=0.005), None),
         ("dry-run: LimitLadder (지정가 + 취소)", lambda: LimitLadderStreamer([SYM]), None),
         ("dry-run: StopLadder (reduce_only + 슬리피지)",
          lambda: StopLadderStreamer([SYM]), 0.0005),
     ]
 
     for label, make_streamer, slippage in cases:
-        # run_backtest는 내부에서 asyncio.run을 부르므로, 이미 도는 이벤트 루프 안에서
-        # 직접 부르면 RuntimeError. 워커 스레드(루프 없음)로 던진다.
-        bt = await asyncio.to_thread(
-            run_backtest, make_streamer(), by_symbol, progress=False,
-            init_margin=INIT_MARGIN,
-            **({"slippage_ratio": slippage} if slippage is not None else {}))
+        bt = await run_bt(make_streamer(), by_symbol, slippage)
         dry = await run_dry(make_streamer(), by_symbol, MIN, slippage)
         check(label, compare_reports(label, bt, dry),
               f"trades={len(bt.trades)} final={bt.status.total_margin():.2f}")

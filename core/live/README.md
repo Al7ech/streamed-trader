@@ -34,8 +34,11 @@ its meaning — messages are routed straight to `executor.on_user_data(...)`.
 - Every traded symbol must settle in the same margin asset, since `Status.margin` is one pool
   shared across all of them; this is asserted at construction in **both** modes.
 - Startup order is load-bearing and commented in `start()`: client → socket manager + producer →
-  (live) account/open-order hydration → recorder → engine → indicator warm-up → `is_running` →
-  sockets. Warm-up happens before any socket opens because it can take tens of seconds, and an
+  executor (live: building it *is* the account/open-order hydration) → recorder → engine →
+  indicator warm-up → `is_running` → sockets. The executor is built here rather than in `__init__`
+  precisely because the live one reads the exchange; `trader.status` is a property onto
+  `executor.status`, so the recorder cannot pick up an `init_margin` from an unhydrated account.
+  Warm-up happens before any socket opens because it can take tens of seconds, and an
   unread user-data stream overflows python-binance's queue.
 - `start()` re-raises on failure — a trader that could not start must not look like one that did.
 
@@ -67,6 +70,15 @@ land after later candles; that is tolerated because `status` is exchange truth.
 
 Order execution and account state, against the real exchange:
 
+- **`LiveExecutor.create()` is the only constructor path**, and it reads the exchange: the executor
+  comes back with a `Status` already built from `futures_account()`, `futures_get_open_orders()`
+  and `futures_commission_rate()` — the last supplies `status.fee_ratio` (the account's real taker
+  rate) so live position sizing uses the actual tier; a failed commission fetch is non-fatal and
+  falls back to `DEFAULT_FEE_RATIO`. The parsing itself is in `build_status` / `order_from_exchange`,
+  pure functions taking those payloads. There is no window in which an unhydrated `Status` can be
+  read — which is what the live recorder's `init_margin` depends on. It creates its own `BinanceOrderClient` and
+  `AsyncClient` unless they are passed in, and `close()` tears down only what it created; the
+  trader passes its own `AsyncClient` because the socket manager shares it.
 - `submit(action)` fires the order and returns `None`; a detached task (`_await_order_result`)
   awaits the submission result and routes a failure to `on_error`. The **fill arrives later** on
   the user-data stream. The pre-trade `Status` snapshot is deep-copied before the order is sent and
@@ -127,6 +139,7 @@ reconnect count.
 |---|---|---|
 | Executor | `SimulatedExecutor` (the backtest's) | `LiveExecutor` |
 | Margin | synthetic `1e6` at startup, restored from the saved run on restart | hydrated from `futures_account()` |
+| `status.fee_ratio` | the trader's `fee_ratio` (default `DEFAULT_FEE_RATIO`) | the account's taker rate from `futures_commission_rate()` |
 | User-data socket | not opened | opened; `ACCOUNT_UPDATE` / `ORDER_TRADE_UPDATE` keep `Status` in sync |
 | Orders | none sent; resting orders live in `Status.open_orders` and are matched against each candle | submitted through `BinanceOrderClient`; the exchange owns the book |
 | Position / avg price | updated through `Status.apply_fill` | updated from exchange fills |
@@ -175,14 +188,17 @@ To observe or alter what gets executed, wrap the executor rather than registerin
 `trader.executor` is the seam, and `Executor.submit` sees every action. `add_error_callback` is
 still there for error notification.
 
-`BinanceTrader` constructs its own `BinanceOrderClient` internally, so you only need to instantiate
-one directly if you want to place orders outside the trader's loop.
+The `BinanceOrderClient` is created by `LiveExecutor` (live mode only — dry run never sends an
+order, so no thread pool is built for it), so you only need to instantiate one directly if you want
+to place orders outside the trader's loop.
 
 ## Constructor parameters
 
 **`BinanceTrader`** — `api_key`, `api_secret`, `interval`, `streamer` (traded symbols are taken
 from `streamer.symbols` — there is no separate `symbol`/`symbols` argument),
-`dry_run` (default `False`), `testnet` (default `True`), `fee_ratio` (default: the streamer's),
+`dry_run` (default `False`), `testnet` (default `True`), `fee_ratio` (dry-run sizing/accounting
+rate; default `DEFAULT_FEE_RATIO` — live ignores it and uses the exchange's taker rate),
+`slippage_ratio` (dry-run STOP_MARKET slippage; default `0.0`),
 `record` (default `False`), `result_path` (`"asset/"`), `run_id` (default: derived and stable
 across restarts), `run_metadata` (extra keys for the run JSON, e.g. `{"params": {...}}`),
 `shard_flush_every` (`60`).

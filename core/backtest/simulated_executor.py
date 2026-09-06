@@ -15,7 +15,7 @@ from typing import Callable, Optional
 from core.domain import order_book
 from core.domain.action import Action, ActionType
 from core.domain.candle import Candle
-from core.domain.status import Status
+from core.domain.status import DEFAULT_FEE_RATIO, Status
 from core.domain.trade import Trade
 from core.engine.executor import Executor
 
@@ -23,14 +23,20 @@ from core.engine.executor import Executor
 class SimulatedExecutor(Executor):
     """캔들로 체결을 판정하는 가상 실행기. 백테스트와 드라이런이 공유한다.
 
+    :param init_margin: 초기 증거금. 계좌 ``Status``는 여기서 만들어지고 이 실행기가 소유한다 —
+        호출자는 ``executor.status``로 읽는다 (레코더에 넘길 때도 그 참조를 쓴다).
+    :param fee_ratio: 명목가치에 곱할 수수료율. 이 값이 ``Status.fee_ratio``에 실려 회계
+        (``apply_fill``)와 전략 사이징(``status.fee_ratio``)이 같은 값을 본다.
+    :param slippage_ratio: 조건부 시장가(STOP_MARKET) 체결에 불리하게 얹을 비율. 순전히
+        백테스트 모델링 값이라 ``Status``에 얹지 않고 여기서만 들고 있다 — 전략은 읽지 않는다.
     :param log_label: 체결 로그에 붙일 접두사. 드라이런은 ``"dry-run"``을 넘겨 실제 돈이 걸린
         체결과 구분되게 한다 (백테스트는 접두사가 없다).
     """
 
-    def __init__(self, status: Status, fee_ratio: float, slippage_ratio: float = 0.0,
+    def __init__(self, init_margin: float, fee_ratio: float = DEFAULT_FEE_RATIO,
+                 slippage_ratio: float = 0.0,
                  on_trade: Optional[Callable[[Trade], None]] = None, log_label: str = ""):
-        super().__init__(status, on_trade)
-        self.fee_ratio = fee_ratio
+        super().__init__(Status(margin=init_margin, fee_ratio=fee_ratio), on_trade)
         self.slippage_ratio = slippage_ratio
         #: 미체결 주문 제출 순서. 같은 봉 안의 체결 순서를 결정적으로 만든다.
         self._order_seq = 0
@@ -112,7 +118,7 @@ class SimulatedExecutor(Executor):
         """
         self.status.update_unrealised_pnl(symbol, price)
         prev_status = copy.deepcopy(self.status)
-        wnl, fee = self.status.apply_fill(symbol, quantity, price, self.fee_ratio)
+        wnl, fee = self.status.apply_fill(symbol, quantity, price)
         leverage = self.status.update_leverage()
         trade = Trade(
             timestamp=event_time,

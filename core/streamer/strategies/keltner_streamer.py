@@ -27,8 +27,7 @@ class KeltnerStreamer(BaseStreamer):
                  window: int = 20 * 60,
                  m_entry: float = 2.0,
                  m_exit: float = 0.0,
-                 max_loss: float = 0.08,
-                 fee_ratio: float = 0.0004):
+                 max_loss: float = 0.08):
         super().__init__(symbols, {s: {
             "MA": MovingAverage(window),
             "ATR": ATRIndicator(window),
@@ -36,7 +35,6 @@ class KeltnerStreamer(BaseStreamer):
         self.m_entry = m_entry
         self.m_exit = m_exit
         self.max_loss = max_loss
-        self.fee_ratio = fee_ratio
 
         self.logger = logging.getLogger(__name__)
         self.logger.info(
@@ -60,10 +58,10 @@ class KeltnerStreamer(BaseStreamer):
             lev = min(6.0, self.max_loss * price / dist)
 
             if upper <= price:
-                qty = trunc_by_sign(status.total_margin() / (price * (1 / lev + self.fee_ratio)), 3)
+                qty = trunc_by_sign(status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
                 return [Action(symbol, qty)]
             if price <= lower:
-                qty = trunc_by_sign(-status.total_margin() / (price * (1 / lev + self.fee_ratio)), 3)
+                qty = trunc_by_sign(-status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
                 return [Action(symbol, qty)]
 
         if position > 0 and candle.low < ma - self.m_exit * atr:

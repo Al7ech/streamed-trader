@@ -28,7 +28,6 @@ class WickRejectionStreamer(BaseStreamer):
                  hold_candles: int = 15,
                  stop_atr_mult: float = 2.0,
                  max_loss: float = 0.08,
-                 fee_ratio: float = 0.0004,
                  use_stop: bool = True,
                  side: int = 1):
         super().__init__([symbol], {symbol: {
@@ -40,7 +39,6 @@ class WickRejectionStreamer(BaseStreamer):
         self.hold_candles = hold_candles
         self.stop_atr_mult = stop_atr_mult
         self.max_loss = max_loss
-        self.fee_ratio = fee_ratio
         self.use_stop = use_stop
         self.side = side  # 1=아래꼬리 롱, -1=윗꼬리 숏 (대칭 진단용)
 
@@ -88,7 +86,7 @@ class WickRejectionStreamer(BaseStreamer):
         price = candle.close
         stop_frac = self.stop_atr_mult * atr / price
         lev = min(6.0, self.max_loss / stop_frac)
-        qty = trunc_by_sign(self.side * status.total_margin() / (price * (1 / lev + self.fee_ratio)), 3)
+        qty = trunc_by_sign(self.side * status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
 
         self._hold_remaining = self.hold_candles
         self._stop_price = price * (1 - self.side * stop_frac)

@@ -23,11 +23,9 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional
 from binance import AsyncClient, BinanceSocketManager
 
 from core.backtest.simulated_executor import SimulatedExecutor
-from core.domain.status import Status
+from core.domain.status import DEFAULT_FEE_RATIO, Status
 from core.engine.engine import TradingEngine
-from core.engine.executor import Executor, resolve_fee_ratio, resolve_slippage_ratio
-from core.engine.recorder import NullRecorder
-from core.live.binance_order_client import BinanceOrderClient
+from core.engine.executor import Executor
 from core.live.candle_producer import LiveCandleProducer
 from core.live.executor import LiveExecutor, resolve_margin_asset
 from core.live.recorder import DEFAULT_SHARD_FLUSH_EVERY, LiveRecorder, default_run_id
@@ -50,6 +48,7 @@ class BinanceTrader:
                  dry_run: bool = False,
                  testnet: bool = True,
                  fee_ratio: Optional[float] = None,
+                 slippage_ratio: float = 0.0,
                  record: bool = False,
                  result_path: str = "asset/",
                  run_id: Optional[str] = None,
@@ -59,8 +58,11 @@ class BinanceTrader:
         :param streamer: 매매 결정을 내리는 스트리머. 다루는 심볼은 ``streamer.symbols``에서
             가져오므로 별도 인자가 없다 — 트레이더가 스트리머와 무엇을 거래하는지에 대해
             어긋날 수 없다.
-        :param fee_ratio: 드라이런 회계에 적용할 수수료율. None이면 **스트리머의 값을
-            따라간다**. 라이브에서는 거래소 체결이 정답이라 쓰이지 않는다.
+        :param fee_ratio: 드라이런 회계/사이징에 적용할 수수료율 (``Status.fee_ratio``로 실린다).
+            None이면 ``DEFAULT_FEE_RATIO``. 라이브에서는 ``LiveExecutor.create``가 거래소
+            커미션 티어에서 직접 채우므로 이 값은 쓰이지 않는다.
+        :param slippage_ratio: 드라이런에서 조건부 시장가 체결에 얹을 슬리피지. 백테스트와
+            대조할 때 그쪽 설정과 맞춘다.
         :param record: True면 실행 결과를 ``<result_path>/live/`` 에 **백테스트와 같은
             포맷**으로 기록한다.
         :param run_id: 기록에 쓸 런 식별자. None이면 전략/심볼/인터벌에서 고정 id를 만들어
@@ -83,23 +85,13 @@ class BinanceTrader:
         # 정산 자산은 **두 모드 모두** 검증한다 — Status.margin이 전 심볼 공유 풀이라는 전제가
         # 드라이런에서도 똑같이 성립해야 하고, 설정 오류는 일찍 잡을수록 좋다.
         self._margin_asset = resolve_margin_asset(self.symbols)
-        self.status = Status(margin=DRY_RUN_MARGIN if dry_run else 0.0)
-        self.fee_ratio = resolve_fee_ratio(streamer, fee_ratio)
-        self.slippage_ratio = resolve_slippage_ratio(streamer)
-
-        self._order_client = BinanceOrderClient(
-            api_key=api_key, api_secret=api_secret, testnet=testnet, max_workers=2)
+        self.fee_ratio = fee_ratio if fee_ratio is not None else DEFAULT_FEE_RATIO
+        self.slippage_ratio = slippage_ratio
 
         #: 액션을 체결로 바꾸는 실행기. 드라이런과 라이브의 차이는 **거의 전부** 여기 있다.
-        self.executor: Executor
-        if dry_run:
-            # 백테스트와 같은 클래스다. 체결 규칙·회계·미체결 장부가 한 벌이라 드라이런 결과를
-            # 같은 구간의 백테스트와 그대로 대조할 수 있다.
-            self.executor = SimulatedExecutor(self.status, self.fee_ratio, self.slippage_ratio,
-                                              log_label="dry-run")
-        else:
-            self.executor = LiveExecutor(self._order_client, self.status, self.symbols,
-                                         self._margin_asset, on_error=self._handle_error)
+        #: ``start()``에서 만들어진다 — 라이브 실행기는 생성 시점에 거래소에서 계좌를 읽어
+        #: ``Status``를 완성하므로, 클라이언트가 생긴 뒤에야 만들 수 있다.
+        self.executor: Optional[Executor] = None
 
         self.client: Optional[AsyncClient] = None
         self.socket_manager: Optional[BinanceSocketManager] = None
@@ -125,6 +117,11 @@ class BinanceTrader:
         self.on_error_callbacks: List[Callable[[Exception], Coroutine[None, None, None]]] = [
             self._on_error]
 
+    @property
+    def status(self) -> Status:
+        """계좌 상태. **실행기가 소유한다** — 여기 있는 것은 그 참조를 읽는 통로다."""
+        return self.executor.status
+
     # ----------------------------------------------------------------- 수명주기
 
     async def start(self):
@@ -142,25 +139,35 @@ class BinanceTrader:
             self.producer = LiveCandleProducer(self.socket_manager, self.symbols,
                                                self.interval, self._handle_error)
 
-            # 2. 라이브는 거래소가 계좌의 정답이다. 걸어둔 미체결 주문까지 끌어온다 — 프로세스가
-            #    죽어 있어도 손절은 거래소에서 계속 살아 있으므로, 이걸 안 하면 전략이
-            #    "손절이 없다"고 보고 하나 더 걸어 이중으로 청산된다.
-            if not self.dry_run:
-                self.executor.attach_client(self.client)
-                await self.executor.load_account()
-                await self.executor.load_open_orders()
+            # 2. 실행기. 라이브는 **생성이 곧 계좌 적재다** — create()가 거래소에서 지갑과
+            #    미체결 주문까지 읽어 완성된 Status를 들고 돌아온다. 걸어둔 손절은 프로세스가
+            #    죽어 있어도 거래소에서 계속 살아 있으므로, 그걸 안 읽으면 전략이 "손절이
+            #    없다"고 보고 하나 더 걸어 이중으로 청산된다.
+            #    AsyncClient는 소켓 매니저와 공유해야 하므로 넘겨주고, 주문 클라이언트는
+            #    실행기가 직접 만든다 (라이브에서만 필요한 스레드풀이다).
+            if self.dry_run:
+                # 백테스트와 같은 클래스다. 체결 규칙·회계·미체결 장부가 한 벌이라 드라이런
+                # 결과를 같은 구간의 백테스트와 그대로 대조할 수 있다.
+                self.executor = SimulatedExecutor(DRY_RUN_MARGIN, self.fee_ratio,
+                                                  self.slippage_ratio, log_label="dry-run")
+            else:
+                self.executor = await LiveExecutor.create(
+                    self.symbols, margin_asset=self._margin_asset, client=self.client,
+                    api_key=self.api_key, api_secret=self.api_secret, testnet=self.testnet,
+                    on_error=self._handle_error)
 
-            # 3. 결과 레코더. 지갑 조회(2) 뒤여야 라이브 init_margin이 실제 잔고다.
+            # 3. 결과 레코더. 실행기(2) 뒤여야 라이브 init_margin이 실제 잔고다 — 이제 그건
+            #    순서에 기대는 규약이 아니라, 실행기가 존재하면 이미 참인 사실이다.
             self._setup_recorder()
-            recorder = self.recorder or NullRecorder()
-            self.executor.on_trade = recorder.record_trade
             if not self.dry_run:
                 self.executor.on_metadata = (
                     self.recorder.set_metadata if self.recorder else (lambda k, v: None))
                 self.executor.reconcile_resumed(
                     self.recorder.resumed_status if self.recorder else None)
 
-            self.engine = TradingEngine(self.streamer, self.executor, recorder)
+            # 부품을 넘기면 배선(체결 싱크, 레코더 기본값)과 실행은 엔진이 갖는다.
+            self.engine = TradingEngine(self.streamer, self.producer, self.executor,
+                                        self.recorder, on_error=self._handle_error)
 
             # 4. 지표 워밍업. 소켓을 열기 **전에** 한다 — 수십 초가 걸릴 수 있는데 그동안
             #    유저 데이터 스트림을 읽지 않으면 python-binance의 큐가 넘쳐 죽는다.
@@ -183,7 +190,7 @@ class BinanceTrader:
                 "BinanceTrader started: mode=%s symbols=%s interval=%s testnet=%s "
                 "streamer=%s fee_ratio=%s slippage_ratio=%s open_orders=%d record=%s run_id=%s",
                 "DRY-RUN" if self.dry_run else "LIVE", self.symbols, self.interval,
-                self.testnet, type(self.streamer).__name__, self.fee_ratio,
+                self.testnet, type(self.streamer).__name__, self.status.fee_ratio,
                 self.slippage_ratio, self.status.total_open_orders(),
                 bool(self.recorder), self.recorder.run_id if self.recorder else None)
 
@@ -223,17 +230,14 @@ class BinanceTrader:
                 await self.user_socket.close()
                 self.user_socket = None
 
+            # 실행기가 만든 것(주문 클라이언트의 스레드풀)은 실행기가 정리한다. 여기서 넘긴
+            # AsyncClient는 우리 것이라 실행기가 건드리지 않으므로 아래에서 우리가 닫는다.
+            if isinstance(self.executor, LiveExecutor):
+                await self.executor.close()
+
             if self.client:
                 await self.client.close_connection()
                 self.client = None
-
-            # shutdown()의 기본값은 wait=True라 스레드가 끝날 때까지 이벤트 루프를 막는다.
-            await asyncio.to_thread(self._order_client.shutdown)
-
-            # 풀이 모든 주문 future를 resolve한 뒤라, 결과-대기 태스크들은 한 틱이면 끝난다.
-            # 마지막 실패 로그를 확실히 흘리고 shutdown을 deterministic하게 만든다.
-            if isinstance(self.executor, LiveExecutor):
-                await self.executor.drain_pending_orders()
 
             self.logger.info("BinanceTrader stopped")
 
@@ -250,8 +254,8 @@ class BinanceTrader:
     # ----------------------------------------------------------------- 매매 루프
 
     async def _run_engine(self):
-        """캔들 공급자를 엔진에 흘려보낸다. 스트림이 끝나면 트레이더를 멈춘다."""
-        await self.engine.run_async(self.producer, on_error=self._handle_error)
+        """엔진을 돌린다. 스트림이 끝나면 트레이더를 멈춘다."""
+        await self.engine.run_async()
         if self.is_running:
             await self.stop()
 
@@ -261,11 +265,13 @@ class BinanceTrader:
         과거 캔들을 어디서 어떻게 가져오는지는 :class:`LiveCandleProducer`가 알고, 그것을
         지표에 먹이는 것은 엔진이 안다. ``status``는 넘어가지 않는다: 이 구간에는 대응하는
         계좌 상태가 없으므로 status를 읽는 지표는 ``None``을 워밍업으로 다뤄야 한다.
+
+        엔진의 ``run_async``도 시작할 때 같은 것을 부르지만(멱등), 여기서 **미리** 부르는 게
+        중요하다 — 워밍업은 소켓을 열기 전에 끝나야 하고 엔진 루프는 그 뒤에야 돈다.
         """
         try:
             self.logger.info("Pre-feeding indicators with historical data...")
-            windows = self.engine.warmup_windows()
-            self.engine.warmup(await self.producer.warmup_candles(windows))
+            await self.engine.warmup_from_producer()
         except Exception as e:
             self.logger.error(f"Failed to pre-feed indicators: {e}")
             raise
@@ -306,7 +312,9 @@ class BinanceTrader:
         상태만 초기화되면 재기동 지점에서 곡선이 초기값으로 튀어, 재개형 런이 만들어내는
         데이터가 통째로 못 쓰게 된다. 라이브는 거래소가 정답이므로 절대 여기서 덮지 않는다.
 
-        실행기와 레코더가 ``self.status``를 참조로 들고 있으므로 **제자리에서** 갱신한다.
+        ``Status``는 실행기가 소유하고 레코더도 같은 객체를 참조로 들고 있으므로 **제자리에서**
+        갱신한다. 저장된 상태는 레코더가 읽어오는데 레코더는 실행기보다 뒤에 만들어지므로
+        (라이브 ``init_margin``이 계좌 적재 뒤에야 정해진다), 생성자에 넘겨 끝낼 수는 없다.
         """
         if not self.dry_run or not self.recorder or not self.recorder.resumed_status:
             return

@@ -14,9 +14,10 @@
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict
+from typing import Dict, Optional
 
 from core.domain.candle import Candle
+from core.domain.report import Report
 from core.domain.trade import Trade
 
 
@@ -44,7 +45,24 @@ class Recorder(ABC):
         """이벤트의 모든 액션 처리가 끝난 뒤. 기본은 아무것도 하지 않는다."""
 
     def close(self) -> None:
-        """더 이상 기록하지 않는다. 기본은 아무것도 하지 않는다."""
+        """더 이상 기록하지 않는다. 기본은 아무것도 하지 않는다.
+
+        엔진이 루프를 정상적으로 마친 뒤 불러 준다
+        (:meth:`~core.engine.engine.TradingEngine.run_async`). 산출물을 파일로 남기는
+        레코더는 여기서 마무리한다 — **멱등이어야 한다**. 엔진이 부른 뒤 호출자가 또 부를 수
+        있기 때문이다 (라이브는 ``BinanceTrader.stop()``이 다시 부른다).
+        """
+
+    @property
+    def report(self) -> Optional[Report]:
+        """실행이 끝난 뒤의 결과. 기본은 ``None``.
+
+        :meth:`~core.engine.engine.TradingEngine.run` / ``run_async``가 이것을 그대로
+        돌려주므로, 백테스트처럼 결과를 메모리로 받아야 하는 쪽은
+        (:class:`~core.backtest.recorder.BacktestRecorder`) 이 프로퍼티를 오버라이드한다.
+        라이브 레코더처럼 파일로만 남기는 구현은 ``None``인 채로 둔다.
+        """
+        return None
 
 
 class NullRecorder(Recorder):

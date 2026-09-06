@@ -30,7 +30,6 @@ class MeanReversionZScoreStreamer(BaseStreamer):
                  entry_z: float = 2.0,
                  timeout_candles: int = 60,
                  max_loss: float = 0.08,
-                 fee_ratio: float = 0.0004,
                  use_stop: bool = True):
         super().__init__([symbol], {symbol: {
             "MA": MovingAverage(window),
@@ -40,7 +39,6 @@ class MeanReversionZScoreStreamer(BaseStreamer):
         self.entry_z = entry_z
         self.timeout_candles = timeout_candles
         self.max_loss = max_loss
-        self.fee_ratio = fee_ratio
         # 스탑 없이 z-복귀/타임아웃 청산만 쓰는 진단 모드 (인트라바 꼬리 체결 효과 분리용)
         self.use_stop = use_stop
 
@@ -89,7 +87,7 @@ class MeanReversionZScoreStreamer(BaseStreamer):
         sign = -1 if z > 0 else 1  # 이탈의 역방향 (fade)
         stop_frac = self.entry_z * std / price
         lev = min(6.0, self.max_loss / stop_frac)
-        qty = trunc_by_sign(sign * status.total_margin() / (price * (1 / lev + self.fee_ratio)), 3)
+        qty = trunc_by_sign(sign * status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
 
         self._timeout_remaining = self.timeout_candles
         self._stop_price = price * (1 - sign * stop_frac)

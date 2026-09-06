@@ -24,12 +24,11 @@ class VolumeConfirmedMomentumStreamer(MomentumTimeExitStreamer):
                  entry_threshold_pct: float = 1.0,
                  hold_candles: int = 120,
                  max_loss: float = 0.08,
-                 fee_ratio: float = 0.0004,
                  use_stop: bool = True,
                  vol_window: int = 24 * 60,
                  min_vol_z: Optional[float] = 2.0):
         super().__init__(symbol, mom_lookback, entry_threshold_pct, hold_candles,
-                         max_loss, fee_ratio, use_stop)
+                         max_loss, use_stop)
         self.min_vol_z = min_vol_z
         if min_vol_z is not None:
             self.indicators[symbol]["vol_MA"] = VolumeMovingAverage(vol_window)

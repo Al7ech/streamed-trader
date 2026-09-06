@@ -28,7 +28,6 @@ class MomentumTimeExitStreamer(BaseStreamer):
                  entry_threshold_pct: float = 1.0,
                  hold_candles: int = 120,
                  max_loss: float = 0.08,
-                 fee_ratio: float = 0.0004,
                  use_stop: bool = True):
         if mom_lookback < 1:
             # 0이면 read(-mom_lookback-1) == read(-1) 이 되어 "N캔들 전 제외" 라는
@@ -45,7 +44,6 @@ class MomentumTimeExitStreamer(BaseStreamer):
         self.entry_threshold_pct = entry_threshold_pct
         self.hold_candles = hold_candles
         self.max_loss = max_loss
-        self.fee_ratio = fee_ratio
         # 스탑 없이 시간 청산만 쓰는 진단 모드 (스탑의 인트라바 꼬리 체결 효과 분리용).
         # 사이징은 동일하게 유지해 비교 가능성 확보.
         self.use_stop = use_stop
@@ -86,7 +84,7 @@ class MomentumTimeExitStreamer(BaseStreamer):
         sign = 1 if momentum_pct > 0 else -1
         stop_frac = self.entry_threshold_pct / 100
         lev = min(6.0, self.max_loss / stop_frac)
-        qty = trunc_by_sign(sign * status.total_margin() / (price * (1 / lev + self.fee_ratio)), 3)
+        qty = trunc_by_sign(sign * status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
 
         self._hold_remaining = self.hold_candles
         self._stop_price = price * (1 - sign * stop_frac)

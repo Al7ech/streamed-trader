@@ -1,10 +1,17 @@
 import sys
 from datetime import datetime, timezone
 
+from core.backtest import DEFAULT_INIT_MARGIN
 from core.backtest.binance_candle_producer import BinanceBacktestCandleProducer
-from core.backtest.run import DEFAULT_INIT_MARGIN, run_backtest
+from core.backtest.recorder import BacktestRecorder
+from core.backtest.simulated_executor import SimulatedExecutor
+from core.engine.engine import TradingEngine
 from core.logging_config import setup_logging
 from core.streamer.strategies.keltner_streamer import KeltnerStreamer
+
+#: 명목가치에 곱할 수수료율. 실행기가 만드는 Status.fee_ratio에 실려 회계와 전략 사이징이
+#: 같은 값을 본다. 라이브는 이 대신 거래소 커미션 티어를 쓴다.
+FEE_RATIO = 0.0004
 
 if __name__ == "__main__":
     # 0. 로깅 설정. 이게 없으면 페처/백테스터의 경고가 lastResort 핸들러로 빠져
@@ -26,12 +33,11 @@ if __name__ == "__main__":
     #    잡으면 1m 캔들에서는 스탑 거리가 워낙 좁아 항상 6x 캡에 붙고, 왕복 수수료가
     #    자본의 ~0.5%씩 수백 번 나가면서 전략과 무관하게 계좌가 녹는다. 데모 기본값은
     #    레버리지가 ~1.6x에 머무는 값을 쓴다.
-    params = dict(window=72 * 60, m_entry=4.0, m_exit=3.0,
-                  fee_ratio=0.0004, max_loss=0.005)
+    params = dict(window=72 * 60, m_entry=4.0, m_exit=3.0, max_loss=0.005)
     streamer = KeltnerStreamer(symbols=[symbol], **params)
 
-    # 3. 백테스트 실행. producer를 직접 넘긴다 (candles_by_symbol 경로는 합성 캔들/비-바이낸스
-    #    소스 검사용으로 여전히 열려 있다).
+    # 3. 나머지 부품 조립 후 실행. 엔진에 넘기는 것은 스트리머/공급자/실행기/레코더 넷뿐이고,
+    #    순서 규약과 실행·마무리는 전부 엔진이 갖는다.
     init_margin = DEFAULT_INIT_MARGIN
     metadata = {
         "symbols": [symbol],
@@ -39,11 +45,19 @@ if __name__ == "__main__":
         "start": start_date.isoformat(),
         "end": end_date.isoformat(),
         "params": params,
+        "fee_ratio": FEE_RATIO,
     }
     # 실험 목적 한 줄 라벨: uv run python core/examples/backtest.py "ATR 채널폭 2.0 검증"
     if len(sys.argv) > 1:
         metadata["label"] = sys.argv[1]
-    report = run_backtest(streamer, producer=producer, metadata=metadata, save_series=True)
+
+    # 수수료율은 실행기가 만드는 Status.fee_ratio에 실려 회계와 전략 사이징이 같은 값을 본다.
+    # 계좌 상태는 실행기가 만들어 소유한다 — 레코더에는 그 참조(executor.status)를 넘긴다.
+    executor = SimulatedExecutor(init_margin, FEE_RATIO)
+    # metadata를 주면 런 JSON을, save_series까지 주면 시계열 샤드도 asset/backtest/ 에 쓴다.
+    recorder = BacktestRecorder(streamer, executor.status, interval_ms=producer.interval_ms,
+                                metadata=metadata, save_series=True)
+    report = TradingEngine(streamer, producer, executor, recorder).run()
 
     # 4. 결과 출력
     print(f"Max Leverage: {report.max_leverage}")

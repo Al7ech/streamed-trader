@@ -26,44 +26,22 @@ from core.domain.candle import Candle
 from core.domain.status import Status
 from core.domain.trade import Trade
 
-DEFAULT_FEE_RATIO = 0.0004
-DEFAULT_SLIPPAGE_RATIO = 0.0
-
-_logger = logging.getLogger(__name__)
-
-
-def resolve_fee_ratio(streamer, explicit: Optional[float] = None) -> float:
-    """실제로 부과할 수수료율. ``explicit``이 None이면 **스트리머의 값을 따라간다**.
-
-    스트리머는 자기 ``fee_ratio``로 사이징하고 엔진은 자기 값으로 과금하므로, 둘이 어긋나면
-    실효 레버리지가 의도와 달라진다. 그래서 기본값을 고정 상수로 두지 않고 스트리머를 따라가고,
-    명시값이 어긋나면 경고한다.
-    """
-    streamer_value = getattr(streamer, "fee_ratio", None)
-    if explicit is None:
-        return streamer_value if streamer_value is not None else DEFAULT_FEE_RATIO
-    if streamer_value is not None and streamer_value != explicit:
-        _logger.warning(
-            "수수료율 불일치: 엔진 %s vs 스트리머 %s — 스트리머는 자기 값으로 사이징하므로 "
-            "실효 레버리지가 의도와 달라진다", explicit, streamer_value)
-    return explicit
-
-
-def resolve_slippage_ratio(streamer, explicit: Optional[float] = None) -> float:
-    """조건부 시장가(STOP_MARKET) 체결에 불리한 방향으로 얹을 비율. 규칙은 수수료율과 같다."""
-    streamer_value = getattr(streamer, "slippage_ratio", None)
-    if explicit is None:
-        return streamer_value if streamer_value is not None else DEFAULT_SLIPPAGE_RATIO
-    if streamer_value is not None and streamer_value != explicit:
-        _logger.warning("슬리피지율 불일치: 엔진 %s vs 스트리머 %s", explicit, streamer_value)
-    return explicit
-
 
 class Executor(ABC):
     """계좌 상태(``status``)를 소유하고 액션을 체결로 바꾼다.
 
-    :param status: 이 실행기가 소유하는 계좌 상태. 엔진은 ``executor.status``를 통해서만
-        계좌를 읽는다.
+    **``Status``는 구현체가 자기 생성 경로에서 만든다.** 바깥에서 만들어 넘기지 않는다 —
+    초기 상태가 무엇인지는 모드마다 다르고(백테스트/드라이런은 초기 증거금이라는 숫자 하나,
+    라이브는 거래소가 정답) 그건 실행기만 아는 사실이기 때문이다. 특히 라이브에서 호출자가
+    자리채우기 ``Status(margin=0.0)``을 만들어 넘기면 수화되기 전의 그 빈 껍데기를 누가
+    읽어도 예외 없이 통과한다 — 런 JSON의 ``init_margin``이 조용히 0이 되는 식으로.
+    그래서 이 생성자는 각 구현체의 생성 경로
+    (:class:`~core.backtest.simulated_executor.SimulatedExecutor` 의 ``__init__``,
+    :meth:`~core.live.executor.LiveExecutor.create`)만 부른다.
+
+    엔진과 레코더는 ``executor.status``를 통해서만 계좌를 읽는다.
+
+    :param status: 이 실행기가 소유하는 계좌 상태. 위 설명대로 구현체가 만들어 넘긴다.
     :param on_trade: 체결 싱크. 보통 :meth:`~core.engine.recorder.Recorder.record_trade`.
     """
 

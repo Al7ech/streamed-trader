@@ -149,26 +149,38 @@ the resulting numbers as a smoke test, not as evidence.
 
 ## Backtesting
 
+A backtest is the four engine parts assembled and handed to `TradingEngine`:
+
 ```python
-from core.backtest import run_backtest
+from core.backtest import DEFAULT_INIT_MARGIN
 from core.backtest.binance_candle_producer import BinanceBacktestCandleProducer
+from core.backtest.recorder import BacktestRecorder
+from core.backtest.simulated_executor import SimulatedExecutor
+from core.engine.engine import TradingEngine
 
 producer = BinanceBacktestCandleProducer(
     start_time=start, end_time=end, symbols=["ETHUSDT"], interval="1m")
-report = run_backtest(streamer, producer=producer, fee_ratio=0.0004,
-                      metadata={...}, save_series=True)
+executor = SimulatedExecutor(DEFAULT_INIT_MARGIN, fee_ratio=0.0004)
+recorder = BacktestRecorder(streamer, executor.status, interval_ms=producer.interval_ms,
+                            metadata={...}, save_series=True)
+report = TradingEngine(streamer, producer, executor, recorder).run()
 ```
 
-`run_backtest` takes its candles either from a `producer=` (normally
-`BinanceBacktestCandleProducer`, which fetches the `[start, end)` range itself via
-`BinanceVisionFetcher` and merges) or from `candles_by_symbol=` — a `Dict[str, List[Candle]]` you
-built yourself, merged by `InMemoryCandleProducer` (used by the check scripts and non-Binance
-sources).
+The executor writes `fee_ratio` into the `Status` it builds, so the fee accounting
+(`Status.apply_fill`) and the strategy's own position sizing (`status.fee_ratio`) always read one
+value. `slippage_ratio` is a `SimulatedExecutor` argument only — it is a simulation modelling knob,
+not account state, and no strategy sizes with it.
 
-`Report` gives you `trades`, `max_leverage`, the final `Status` and the equity curve. Passing
-`metadata` writes `asset/backtest/<run_id>.json` (summary, Sharpe, max drawdown, trade list);
-adding `save_series=True` also writes month-bucketed `<run_id>.<YYYY-MM>.series.json` shards with
-per-candle OHLC and indicator values, which the frontend loads lazily per viewport.
+The candle source is either `BinanceBacktestCandleProducer` (fetches the `[start, end)` range
+itself via `BinanceVisionFetcher` and merges) or `InMemoryCandleProducer(candles_by_symbol)` — a
+`Dict[str, List[Candle]]` you built yourself (used by the check scripts and non-Binance sources).
+Everything else — wiring the fill sink, warming up indicators, driving the loop, finishing the
+recorder — is the engine's; `run()` returns the `Report`.
+
+`Report` gives you `trades`, `max_leverage`, the final `Status` and the equity curve. Giving the
+recorder `metadata` writes `asset/backtest/<run_id>.json` (summary, Sharpe, max drawdown, trade
+list); adding `save_series=True` also writes month-bucketed `<run_id>.<YYYY-MM>.series.json` shards
+with per-candle OHLC and indicator values, which the frontend loads lazily per viewport.
 
 ```bash
 uv run python core/checks/live_check.py            # live path + dry-run == backtest
@@ -177,10 +189,9 @@ uv run python core/checks/live_check.py            # live path + dry-run == back
 The engine also force-liquidates every position when mark-to-market equity falls to zero or below,
 so blown-up strategies show up as blow-ups rather than as impossible recoveries.
 
-Backtesting and live trading are the same code path: `run_backtest` and the live trader both drive
-`core/engine/`'s `TradingEngine`, and differ only in which candle source, executor and recorder are
-plugged into it. A dry run uses the *backtest's* executor, so it produces exactly the trades a
-backtest of the same candles would.
+Backtesting and live trading are the same code path: both assemble `core/engine/`'s `TradingEngine`
+and differ only in which candle source, executor and recorder are plugged into it. A dry run uses
+the *backtest's* executor, so it produces exactly the trades a backtest of the same candles would.
 
 ## Data sources
 
@@ -232,7 +243,7 @@ core/
     stock/                Massive US equities + NYSE session calendar
   engine/                 TradingEngine + the three ports (CandleProducer/Executor/Recorder)
   result/                 run JSON + series shards, Sharpe/MDD/benchmark metrics
-  backtest/              run_backtest, SimulatedExecutor, BacktestRecorder, candle producers
+  backtest/              SimulatedExecutor, BacktestRecorder, candle producers
   live/                   BinanceTrader (asyncio + websockets), LiveExecutor/Recorder/Producer,
                           BinanceOrderClient, ReliableWebsocket
   checks/                 live_check.py (the de-facto test suite), fetch_stock_check.py
