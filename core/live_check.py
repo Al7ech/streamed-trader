@@ -1,6 +1,6 @@
 """Live path check: LiveCandleProducer / LiveExecutor / 드라이런 == 백테스트.
 
-라이브 경로는 ``backtest_fast_check.py``의 패리티 검증이 닿지 않는 곳이다 — 소켓과 거래소가
+라이브 경로는 순수 백테스트 검증이 닿지 않는 곳이다 — 소켓과 거래소가
 필요하기 때문이다. 여기서는 둘 다 가짜로 세워 그 경로들을 오프라인으로 태운다:
 
 1. **캔들 공급자** — 연속/중복/구멍 백필/상한 초과/경계 불일치/에러 프레임 (가짜 소켓)
@@ -18,11 +18,12 @@
     uv run python core/live_check.py --offline  # 캔들 캐시가 필요 없는 1, 2 만
 """
 import asyncio
+import math
 import sys
 from concurrent.futures import Future
 from datetime import datetime, timezone
+from typing import List
 
-from core.backtest_fast_check import LimitLadderStreamer, StopLadderStreamer, compare_reports
 from core.binance_candle_fetcher.vision_fetcher import BinanceVisionFetcher
 from core.engine.backtest import run_backtest
 from core.engine.candle_producer import CandleProducer
@@ -33,6 +34,7 @@ from core.engine.recorder import BacktestRecorder
 from core.engine.status import Status
 from core.logging_config import setup_logging
 from core.streamer.action import Action, ActionType
+from core.streamer.base_streamer import BaseStreamer
 from core.streamer.candle import Candle
 from core.streamer.keltner_stop_streamer import KeltnerStopStreamer
 from core.streamer.keltner_streamer import KeltnerStreamer
@@ -40,6 +42,7 @@ from core.streamer.mean_reversion_zscore import MeanReversionZScoreStreamer
 from core.trader import live_candle_producer as lcp
 from core.trader.BinanceExecutor import OrderResult
 from core.trader.live_executor import LiveExecutor, resolve_margin_asset
+from core.utils import trunc_by_sign
 
 MIN = 60_000
 SYM, SYM2 = "ETHUSDT", "BTCUSDT"
@@ -53,6 +56,153 @@ def check(label, cond, detail=""):
     if not cond:
         _failures.append(label)
     print(f"[{label}] {'OK' if cond else 'FAIL'}{(' — ' + detail) if detail else ''}")
+
+
+# ==================================================== 드라이런 대조용 픽스처
+# (예전 backtest_fast_check.py에 있던 토이 전략 + Report 비교 헬퍼. 지금은 드라이런과
+#  백테스트 Report가 완전히 같은지 확인하는 데만 쓴다.)
+
+
+class LimitLadderStreamer(BaseStreamer):
+    """토이 지정가 전략 (검사 전용) — 미체결 주문이 여러 봉에 걸쳐 사는 경로를 만든다.
+
+    플랫이면 종가보다 ``spread`` 만큼 아래에 지정가 매수를 걸고, 포지션이 있으면 진입가보다
+    ``spread`` 위에 지정가 매도(익절)를 건다. 주문이 ``ttl`` 캔들 안에 안 채워지면 만료된다.
+    가끔 전량 취소를 섞어 CANCEL 경로도 태운다.
+
+    지정가는 ``candle.close``에서만 유도되므로 (지표를 거치지 않는다) 백테스트와 드라이런의
+    체결가가 비트 단위로 같다 — 구조적 버그가 float 반올림에 묻히지 않는다.
+    """
+
+    def __init__(self, symbols: List[str], spread: float = 0.002, ttl: int = 30,
+                 fee_ratio: float = 0.0004):
+        super().__init__(symbols, {s: {} for s in symbols})
+        self.spread = spread
+        self.ttl = ttl
+        self.fee_ratio = fee_ratio
+        self._bar = 0
+
+    def decide_action(self, symbol, candle: Candle, status: Status):
+        self._bar += 1
+        position = status.position_for(symbol).position
+        resting = status.open_orders_for(symbol)
+
+        # 200봉마다 전량 취소 — CANCEL 경로와, 취소 뒤 장부가 실제로 비는지를 태운다.
+        if self._bar % 200 == 0 and resting:
+            return [Action.cancel(symbol)]
+        if resting:
+            return []  # 이미 걸어둔 주문이 있으면 그대로 둔다
+
+        if position == 0:
+            qty = trunc_by_sign(status.total_margin() / len(self.symbols) / candle.close * 0.5, 3)
+            if qty == 0:
+                return []
+            return [Action(symbol, qty, order_type=ActionType.LIMIT,
+                           price=candle.close * (1 - self.spread),
+                           client_id="entry", expire_after_candles=self.ttl)]
+
+        avg = status.position_for(symbol).avg_price
+        return [Action(symbol, -position, order_type=ActionType.LIMIT,
+                       price=avg * (1 + self.spread), reduce_only=True, client_id="exit")]
+
+
+class StopLadderStreamer(LimitLadderStreamer):
+    """위와 같지만 청산을 ``reduce_only`` 조건부 시장가(손절)로 건다.
+
+    ``reduce_only`` clamp, 트리거 방향 자동 유도, 갭 관통 체결(트리거보다 아래에서 봉이
+    시작하면 시가 체결)을 모두 태운다.
+    """
+
+    def decide_action(self, symbol, candle: Candle, status: Status):
+        self._bar += 1
+        position = status.position_for(symbol).position
+        resting = status.open_orders_for(symbol)
+        if self._bar % 200 == 0 and resting:
+            return [Action.cancel(symbol)]
+        if resting:
+            return []
+        if position == 0:
+            qty = trunc_by_sign(status.total_margin() / len(self.symbols) / candle.close * 0.5, 3)
+            if qty == 0:
+                return []
+            return [Action(symbol, qty)]  # 시장가 진입
+        avg = status.position_for(symbol).avg_price
+        # 일부러 포지션보다 큰 수량을 건다 — reduce_only clamp가 안 걸리면 반대 포지션이 열린다.
+        return [Action(symbol, -position * 3, order_type=ActionType.STOP_MARKET,
+                       trigger_price=avg * (1 - self.spread), reduce_only=True,
+                       client_id="stop")]
+
+
+def compare_reports(label, ref_report, fast_report) -> bool:
+    """두 Report(백테스트 vs 드라이런)가 체결·자본곡선·벤치마크까지 같은지 확인한다."""
+    ok = True
+    ref_final = ref_report.status.total_margin()
+    fast_final = fast_report.status.total_margin()
+    if len(ref_report.trades) != len(fast_report.trades):
+        print(f"  [{label}] FAIL: trade count {len(ref_report.trades)} != {len(fast_report.trades)}")
+        return False
+    for i, (a, b) in enumerate(zip(ref_report.trades, fast_report.trades)):
+        # 실현손익은 quantity * (체결가 - 평단)이라 **거의 같은 두 수의 차**다. 체결가가
+        # 지표값인 조건부 주문에서는 지표 반올림(1e-14 상대)이 그 뺄셈에서 세 자릿수쯤
+        # 증폭되므로, wnl의 허용오차는 wnl 자신이 아니라 **명목가치**에 비례해야 한다.
+        # 구조적으로 틀린 손익은 명목가치의 유의미한 비율만큼 어긋나므로 이걸로도 충분히 걸린다.
+        notional_tol = max(1e-9, 1e-11 * abs(a.quantity * a.price))
+        if not (a.timestamp == b.timestamp and a.symbol == b.symbol and a.quantity == b.quantity
+                and a.order_type == b.order_type and a.submitted_at == b.submitted_at
+                and math.isclose(a.price, b.price, rel_tol=1e-12, abs_tol=1e-9)
+                and math.isclose(a.wnl, b.wnl, rel_tol=1e-12, abs_tol=notional_tol)
+                and math.isclose(a.fee, b.fee, rel_tol=1e-12, abs_tol=1e-9)
+                and math.isclose(a.leverage, b.leverage, rel_tol=1e-12, abs_tol=1e-9)):
+            print(f"  [{label}] FAIL: trade #{i} differs:\n    ref : {a}\n    fast: {b}")
+            ok = False
+            break
+    if not math.isclose(ref_report.max_leverage, fast_report.max_leverage, rel_tol=1e-12, abs_tol=1e-9):
+        print(f"  [{label}] FAIL: max_leverage {ref_report.max_leverage} != {fast_report.max_leverage}")
+        ok = False
+    if not math.isclose(ref_final, fast_final, rel_tol=1e-12, abs_tol=1e-6):
+        print(f"  [{label}] FAIL: final margin {ref_final} != {fast_final}")
+        ok = False
+    if len(ref_report.equity_curve) != len(fast_report.equity_curve):
+        print(f"  [{label}] FAIL: equity curve length "
+              f"{len(ref_report.equity_curve)} != {len(fast_report.equity_curve)}")
+        ok = False
+    else:
+        # 허용오차는 **상대**가 본질이다. 지표 반올림 차이가 체결가와 avg_price를 통해 자본에
+        # 누적되므로, 오차는 계좌 크기에 비례해서 커진다. 고정 1e-6 절대값만 쓰면 100배로
+        # 불어난 계좌에서 순수 반올림이 실패로 잡힌다 — 구조적 어긋남은 자본의 유의미한
+        # 비율만큼 벌어지므로 rel_tol 1e-11로도 충분히 걸린다.
+        worst = (0.0, 0.0, 0)  # (abs, rel, index)
+        for i, ((ts_a, eq_a), (ts_b, eq_b)) in enumerate(
+                zip(ref_report.equity_curve, fast_report.equity_curve)):
+            if ts_a != ts_b:
+                print(f"  [{label}] FAIL: equity curve timestamps diverge at {ts_a} vs {ts_b}")
+                ok = False
+                break
+            diff = abs(eq_a - eq_b)
+            if diff > worst[0]:
+                worst = (diff, diff / abs(eq_a) if eq_a else 0.0, i)
+            if not math.isclose(eq_a, eq_b, rel_tol=1e-11, abs_tol=1e-6):
+                print(f"  [{label}] FAIL: equity curve diverges at index {i} ({ts_a}): "
+                      f"{eq_a} vs {eq_b}")
+                ok = False
+                break
+        else:
+            if worst[0] > 1e-6:
+                print(f"  [{label}] note: equity curve max abs diff {worst[0]:.3e} "
+                      f"(relative {worst[1]:.3e}) — 지표 반올림 누적")
+    # buy & hold 기준선은 종가에서만 유도되므로 사실상 회귀 가드 — 두 경로가 같은 이벤트 구간을
+    # 잘라냈는지까지 확인한다.
+    if len(ref_report.benchmark_curve) != len(fast_report.benchmark_curve):
+        print(f"  [{label}] FAIL: benchmark curve length "
+              f"{len(ref_report.benchmark_curve)} != {len(fast_report.benchmark_curve)}")
+        ok = False
+    else:
+        for (ts_a, eq_a), (ts_b, eq_b) in zip(ref_report.benchmark_curve, fast_report.benchmark_curve):
+            if ts_a != ts_b or not math.isclose(eq_a, eq_b, rel_tol=1e-12, abs_tol=1e-6):
+                print(f"  [{label}] FAIL: benchmark curve differs at {ts_a}: {eq_a} vs {eq_b}")
+                ok = False
+                break
+    return ok
 
 
 # ============================================================ 1. 캔들 공급자
@@ -404,7 +554,7 @@ async def check_dry_run_parity():
         # run_backtest는 내부에서 asyncio.run을 부르므로, 이미 도는 이벤트 루프 안에서
         # 직접 부르면 RuntimeError. 워커 스레드(루프 없음)로 던진다.
         bt = await asyncio.to_thread(
-            run_backtest, make_streamer(), by_symbol, vectorized=False, progress=False,
+            run_backtest, make_streamer(), by_symbol, progress=False,
             init_margin=INIT_MARGIN,
             **({"slippage_ratio": slippage} if slippage is not None else {}))
         dry = await run_dry(make_streamer(), by_symbol, MIN, slippage)
@@ -413,7 +563,7 @@ async def check_dry_run_parity():
 
 
 async def main():
-    # 판정 결과를 print로 읽는 게 본론이라 기본 레벨을 WARNING으로 둔다 (backtest_fast_check와 동일).
+    # 판정 결과를 print로 읽는 게 본론이라 기본 레벨을 WARNING으로 둔다.
     setup_logging(default="WARNING")
     await check_candle_producer()
     await check_live_executor()

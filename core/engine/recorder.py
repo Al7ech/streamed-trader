@@ -4,8 +4,6 @@
 :meth:`Recorder.record_trade`를 부른다. 무엇을 어디에 남길지는 전부 구현체가 정한다:
 
 - :class:`BacktestRecorder` — 메모리에 모았다가 ``Report``를 만들고, 선택적으로 샤드를 쓴다.
-- ``VectorizedRecorder`` (:mod:`core.engine.vectorized`) — 자본 곡선을 루프 후에 벡터로
-  재구성한다.
 - ``LiveRecorder`` (:mod:`core.trader.live_recorder`) — 주기적으로 체크포인트를 남기고
   재기동 시 이어쓴다.
 

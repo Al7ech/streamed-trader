@@ -101,13 +101,14 @@ and `get_index()`. That is all you need for correctness everywhere.
 
 An indicator can additionally implement `precompute_series(open, high, low, close, volume)`,
 returning the whole series as a numpy array (element *i* = `get_latest()` after *i+1* updates, NaN
-during warm-up). The vectorized backtest path detects the method by attribute presence
+during warm-up). A vectorized backtest path detects the method by attribute presence
 (`getattr(indicator, "precompute_series", None)`) and computes those in one shot instead of
-looping, which is where most of its speedup comes from. `update()` must still work — the live
+looping. That path is currently removed pending reintroduction on the new candle-producer
+structure, but the method is kept — and `update()` must still work regardless, since the live
 trader has no future to precompute.
 
-An indicator that reads `status` **cannot** be vectorized: account state depends on the trades the
-strategy makes, which is a feedback loop. Keep those as plain `BaseIndicator` without
+An indicator that reads `status` **cannot** be precomputed this way: account state depends on the
+trades the strategy makes, which is a feedback loop. Keep those as plain `BaseIndicator` without
 `precompute_series` (`indicator/position_age.py` is the example). The two kinds mix freely in one
 strategy.
 
@@ -150,23 +151,26 @@ the resulting numbers as a smoke test, not as evidence.
 
 ```python
 from core.engine.backtest import run_backtest
+from core.engine.binance_backtest_candle_producer import BinanceBacktestCandleProducer
 
-report = run_backtest(streamer, candles, fee_ratio=0.0004,
+producer = BinanceBacktestCandleProducer(
+    start_time=start, end_time=end, symbols=["ETHUSDT"], interval="1m")
+report = run_backtest(streamer, producer=producer, fee_ratio=0.0004,
                       metadata={...}, save_series=True)
 ```
+
+`run_backtest` takes its candles either from a `producer=` (normally
+`BinanceBacktestCandleProducer`, which fetches the `[start, end)` range itself via
+`BinanceVisionFetcher` and merges) or from `candles_by_symbol=` — a `Dict[str, List[Candle]]` you
+built yourself, merged by `InMemoryCandleProducer` (used by the check scripts and non-Binance
+sources).
 
 `Report` gives you `trades`, `max_leverage`, the final `Status` and the equity curve. Passing
 `metadata` writes `asset/backtest/<run_id>.json` (summary, Sharpe, max drawdown, trade list);
 adding `save_series=True` also writes month-bucketed `<run_id>.<YYYY-MM>.series.json` shards with
 per-candle OHLC and indicator values, which the frontend loads lazily per viewport.
 
-`vectorized=True` (the default) precomputes every indicator that offers `precompute_series` and
-rebuilds the equity curve with numpy; `vectorized=False` is the plain reference path. Both run the
-**same** trading engine, so they must produce identical trades — `backtest_fast_check.py` asserts
-that and is the closest thing this repo has to a test suite:
-
 ```bash
-uv run python core/backtest_fast_check.py   # vectorized vs reference backtest
 uv run python core/live_check.py            # live path + dry-run == backtest
 ```
 
@@ -220,9 +224,10 @@ docker compose up -d --build
 pyproject.toml                 package metadata + deps (uv-managed), builds the `core` package
 core/
   examples/                    backtest.py/trader.py entry points (edit for symbol/date/strategy)
-  backtest_fast_check.py      fast-vs-reference parity check
+  live_check.py               live path + dry-run == backtest check (the de-facto test suite)
   fetch_stock_check.py        US equity data smoke test
-  backtest/                   Status/Trade/Report, the two backtesters, metrics, result writer
+  engine/                     the unified trading engine, candle producers, executors, recorders
+  backtest/                   Status/Trade/Report, metrics, result writer
   streamer/                   BaseStreamer, Candle, Action + example strategies
     indicator/                MA, ATR, Donchian, ADX, Supertrend, rolling std, volume stats, ...
   candle_fetcher/             BaseCandleFetcher + month-chunk pickle cache

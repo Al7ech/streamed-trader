@@ -13,7 +13,7 @@ This package supplies the live implementations of the three pluggable pieces aro
 
 | | CandleProducer | Executor | Recorder |
 |---|---|---|---|
-| backtest | `BacktestCandleProducer` | `SimulatedExecutor` | `BacktestRecorder` |
+| backtest | `BinanceBacktestCandleProducer` / `InMemoryCandleProducer` | `SimulatedExecutor` | `BacktestRecorder` |
 | dry run | `LiveCandleProducer` | **`SimulatedExecutor`** | `LiveRecorder` |
 | live | `LiveCandleProducer` | `LiveExecutor` | `LiveRecorder` |
 

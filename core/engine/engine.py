@@ -3,17 +3,18 @@
 백테스트, 드라이런, 라이브가 전부 :meth:`TradingEngine.process_event`를 지나간다. 셋의 차이는
 꽂히는 부품뿐이다:
 
-===========  =========================  ==================  ================
-             CandleProducer             Executor            Recorder
-===========  =========================  ==================  ================
-백테스트     BacktestCandleProducer     SimulatedExecutor   BacktestRecorder
-드라이런     LiveCandleProducer         SimulatedExecutor   LiveRecorder
-라이브       LiveCandleProducer         LiveExecutor        LiveRecorder
-===========  =========================  ==================  ================
+===========  ==============================  ==================  ================
+             CandleProducer                  Executor            Recorder
+===========  ==============================  ==================  ================
+백테스트     BinanceBacktestCandleProducer   SimulatedExecutor   BacktestRecorder
+             / InMemoryCandleProducer
+드라이런     LiveCandleProducer              SimulatedExecutor   LiveRecorder
+라이브       LiveCandleProducer              LiveExecutor        LiveRecorder
+===========  ==============================  ==================  ================
 
 **엔진은 완전히 동기다.** ``process_event``는 평범한 메서드고, 액션을 실행기에 넘기면 그걸로
 끝이다 — 결과를 기다리지 않는다. 세 모드 모두 유일한 드라이버 :meth:`run_async`를 지나가고
-(producer를 ``async for``로 순회한다), 백테스트/벡터화 경로는 그 코루틴을 ``asyncio.run``으로
+(producer를 ``async for``로 순회한다), 백테스트 경로는 그 코루틴을 ``asyncio.run``으로
 감싼다 (:func:`~core.engine.backtest.run_backtest`는 여전히 동기 함수다). ``run_async``만이
 ``process_event`` 안에서 터진 예외를 ``on_error``로 넘긴다.
 

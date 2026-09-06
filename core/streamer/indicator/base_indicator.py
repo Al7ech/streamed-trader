@@ -53,9 +53,10 @@ class BaseIndicator(ABC):
         return self.read(-1)
 
     # An indicator may additionally define `precompute_series(open, high, low, close, volume)
-    # -> np.ndarray` to compute its whole series from candle arrays in one shot; the
-    # vectorized backtest path detects this by attribute presence (`getattr(indicator, "precompute_series", None)`) and
-    # uses it as the fast path instead of looping `update()`. There is deliberately no default
+    # -> np.ndarray` to compute its whole series from candle arrays in one shot; a vectorized
+    # backtest path (to be reintroduced on the current producer structure) detects this by
+    # attribute presence (`getattr(indicator, "precompute_series", None)`) and uses it as the
+    # fast path instead of looping `update()`. There is deliberately no default
     # implementation here — only subclasses that define it opt into vectorization. Element i of
     # the returned array must equal `get_latest()` after `update()` has been called with candles
     # [0..i] — warm-up positions are NaN (the loop-based indicators return None there).
@@ -86,9 +87,9 @@ class NumericIndicator(BaseIndicator):
     #: backtester holds a value per candle per indicator over the whole history.
     #:
     #: Reads deeper than this are a programming error and raise ``IndexError`` rather than
-    #: silently returning ``None``: a silent ``None`` would make the loop path and
-    #: the vectorized path's ``ArrayIndicator`` (which mirrors this bound) disagree. Reads that
-    #: are merely still in warm-up keep returning ``None``.
+    #: silently returning ``None``: a silent ``None`` would make the loop path and a vectorized
+    #: path (whose array-backed shim mirrors this bound) disagree. Reads that are merely still
+    #: in warm-up keep returning ``None``.
     #:
     #: The default is far deeper than anything shipped reads (the deepest is
     #: ``MomentumTimeExitStreamer``'s ``mom_lookback``). Pass ``history_size`` to the
