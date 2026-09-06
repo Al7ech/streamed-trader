@@ -308,9 +308,9 @@ async def check_live_executor():
     ex.status.last_close[SYM] = 100.0
     await ex.on_user_data(order_msg(status="NEW", x="NEW", z=0.0, otype="STOP_MARKET",
                                     sp=95.0, side="SELL", c="stop-1"))
-    dispatch = ex.submit(Action.cancel(SYM, "stop-1"), event_time=1)
+    ex.submit(Action.cancel(SYM, "stop-1"), event_time=1)
     check("executor: CANCEL은 장부를 비우고 거래소로도 나간다",
-          ex.status.total_open_orders() == 0 and dispatch is not None
+          ex.status.total_open_orders() == 0
           and ex._orders.calls[-1][0].order_type is ActionType.CANCEL)
 
     ex, trades, _, _ = make_live_executor()
@@ -333,8 +333,10 @@ async def check_live_executor():
     ex._orders.success = False
     ex.status.last_close[SYM] = 100.0
     # 실행기는 재시도 소진 후 예외 대신 success=False를 반환한다 — 확인하지 않으면 영구 거부된
-    # 주문이 아무 흔적 없이 지나가고 전략이 거래소와 어긋난다.
-    await ex.submit(Action(SYM, 1.0), event_time=1).wait(1.0)
+    # 주문이 아무 흔적 없이 지나가고 전략이 거래소와 어긋난다. submit은 결과-대기를 detached
+    # 태스크로 띄우므로 drain_pending_orders로 끝날 때까지 기다린 뒤 확인한다.
+    ex.submit(Action(SYM, 1.0), event_time=1)
+    await ex.drain_pending_orders()
     check("executor: 주문 실패는 on_error로", len(errors) == 1, f"{errors}")
 
     ex, _, _, _ = make_live_executor()
@@ -399,9 +401,12 @@ async def check_dry_run_parity():
     ]
 
     for label, make_streamer, slippage in cases:
-        bt = run_backtest(make_streamer(), by_symbol, vectorized=False, progress=False,
-                          init_margin=INIT_MARGIN,
-                          **({"slippage_ratio": slippage} if slippage is not None else {}))
+        # run_backtest는 내부에서 asyncio.run을 부르므로, 이미 도는 이벤트 루프 안에서
+        # 직접 부르면 RuntimeError. 워커 스레드(루프 없음)로 던진다.
+        bt = await asyncio.to_thread(
+            run_backtest, make_streamer(), by_symbol, vectorized=False, progress=False,
+            init_margin=INIT_MARGIN,
+            **({"slippage_ratio": slippage} if slippage is not None else {}))
         dry = await run_dry(make_streamer(), by_symbol, MIN, slippage)
         check(label, compare_reports(label, bt, dry),
               f"trades={len(bt.trades)} final={bt.status.total_margin():.2f}")

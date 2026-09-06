@@ -57,18 +57,20 @@ Everything about *where candles come from*:
 - `warmup_candles(windows)` fetches each symbol's indicator history. All symbols share the same
   interval-boundary `end_time` so their windows stay aligned even though the fetches are sequential.
 
-Because a single consumer drives this source and fully awaits each event's processing (including
-order dispatch) before pulling the next message, candle processing across symbols is naturally
-serialized — no extra locking is needed.
+Because a single consumer drives this source and fully runs each `process_event` before pulling the
+next message, *decision* processing across symbols is naturally serialized — no extra locking is
+needed. Live order submissions are fired to the thread pool and not awaited, so an order result may
+land after later candles; that is tolerated because `status` is exchange truth.
 
 ### `live_executor.py`
 
 Order execution and account state, against the real exchange:
 
-- `submit(action)` sends the order and returns an `OrderDispatch`; the **fill arrives later** on
-  the user-data stream. The pre-trade `Status` snapshot is deep-copied before dispatch and keyed by
-  client order id, so a resting order that fills hours later is still paired with the decision that
-  created it.
+- `submit(action)` fires the order and returns `None`; a detached task (`_await_order_result`)
+  awaits the submission result and routes a failure to `on_error`. The **fill arrives later** on
+  the user-data stream. The pre-trade `Status` snapshot is deep-copied before the order is sent and
+  keyed by client order id, so a resting order that fills hours later is still paired with the
+  decision that created it.
 - `status` is exchange truth. `ACCOUNT_UPDATE` sets margin/positions (only for entries actually
   present in the event — it carries *changed* items only), `ORDER_TRADE_UPDATE` syncs the open-order
   book. `apply_fill` is never called here.

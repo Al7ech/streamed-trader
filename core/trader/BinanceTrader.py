@@ -38,9 +38,6 @@ from core.utils import interval_to_minutes
 #: 드라이런의 합성 초기 증거금. 실제 지갑이 없으므로 고정값에서 시작한다.
 DRY_RUN_MARGIN = 1e6
 
-#: 주문 하나의 거래소 확인을 기다리는 시간. 넘으면 오류로 보고 다음 액션으로 넘어간다.
-ORDER_RESULT_TIMEOUT = 10.0
-
 
 class BinanceTrader:
     """Real-time trader that connects to Binance WebSocket streams for live trading."""
@@ -232,6 +229,12 @@ class BinanceTrader:
 
             # shutdown()의 기본값은 wait=True라 스레드가 끝날 때까지 이벤트 루프를 막는다.
             await asyncio.to_thread(self._order_client.shutdown)
+
+            # 풀이 모든 주문 future를 resolve한 뒤라, 결과-대기 태스크들은 한 틱이면 끝난다.
+            # 마지막 실패 로그를 확실히 흘리고 shutdown을 deterministic하게 만든다.
+            if isinstance(self.executor, LiveExecutor):
+                await self.executor.drain_pending_orders()
+
             self.logger.info("BinanceTrader stopped")
 
         except Exception as e:
@@ -248,8 +251,7 @@ class BinanceTrader:
 
     async def _run_engine(self):
         """캔들 공급자를 엔진에 흘려보낸다. 스트림이 끝나면 트레이더를 멈춘다."""
-        await self.engine.run_async(self.producer, timeout=ORDER_RESULT_TIMEOUT,
-                                    on_error=self._handle_error)
+        await self.engine.run_async(self.producer, on_error=self._handle_error)
         if self.is_running:
             await self.stop()
 

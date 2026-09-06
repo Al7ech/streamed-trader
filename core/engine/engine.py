@@ -11,18 +11,24 @@
 라이브       LiveCandleProducer         LiveExecutor        LiveRecorder
 ===========  =========================  ==================  ================
 
-**엔진은 완전히 동기다.** 거래소의 확인을 기다려야 하는 주문은 :class:`~core.engine.executor.
-Dispatch`로 ``yield``해 호출자에게 넘긴다 — 동기 호출자(백테스트)는 그냥 소진하고, 비동기
-호출자(라이브)만 그 사이에서 ``await``한다. 덕분에 백테스트의 타이트한 루프에는 await 오버헤드가
-전혀 없으면서, 라이브의 "주문 N의 결과를 확인한 뒤 N+1을 보낸다"는 순서도 그대로 보존된다.
+**엔진은 완전히 동기다.** ``process_event``는 평범한 메서드고, 액션을 실행기에 넘기면 그걸로
+끝이다 — 결과를 기다리지 않는다. 세 모드 모두 유일한 드라이버 :meth:`run_async`를 지나가고
+(producer를 ``async for``로 순회한다), 백테스트/벡터화 경로는 그 코루틴을 ``asyncio.run``으로
+감싼다 (:func:`~core.engine.backtest.run_backtest`는 여전히 동기 함수다). ``run_async``만이
+``process_event`` 안에서 터진 예외를 ``on_error``로 넘긴다.
+
+라이브에서 주문 제출은 :class:`~core.trader.live_executor.LiveExecutor` 안에서 fire-and-forget이다.
+예전의 "주문 N의 결과를 확인한 뒤 N+1을 보낸다"는 보장은 **의도적으로 없앴다** — 라이브 ``status``
+는 거래소가 정답이라(유저 데이터 스트림이 이벤트 밖에서 갱신한다) 누락된 주문은 다음 캔들에 스스로
+복구된다. 그 대신 한 이벤트 안 액션들의 실행 순서도 라이브에서는 보장되지 않는다 (백테스트/드라이런
+은 ``SimulatedExecutor``가 동기라 리스트 순서를 지킨다).
 """
 
 import logging
-from collections import deque
-from typing import Awaitable, Callable, Dict, Iterator, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional
 
 from core.engine.candle_producer import CandleProducer
-from core.engine.executor import Dispatch, Executor
+from core.engine.executor import Executor
 from core.engine.recorder import Recorder
 from core.streamer import BaseStreamer
 from core.streamer.action import Action
@@ -37,12 +43,8 @@ class TradingEngine:
         self.recorder = recorder
         self.logger = logging.getLogger(__name__)
 
-    def process_event(self, event_time: int,
-                      candles: Dict[str, Candle]) -> Iterator[Dispatch]:
-        """이벤트 하나를 처리한다. 거래소 확인이 필요한 주문마다 :class:`Dispatch`를 yield.
-
-        **호출자는 제너레이터를 끝까지 소진해야 한다** — 마지막 yield 뒤에
-        ``recorder.end_event``가 있다.
+    def process_event(self, event_time: int, candles: Dict[str, Candle]) -> None:
+        """이벤트 하나를 처리한다.
 
         단계 순서가 이 클래스의 존재 이유다. 특히 미체결 주문 매칭이 ``decide_action`` **앞에**
         있는 것: 실제 거래소에서는 미체결 주문이 봉이 닫히기 전에 체결되므로, 뒤에 두면 전략이
@@ -105,12 +107,12 @@ class TradingEngine:
         #    값이 그 결정이 실제로 본 값이다.
         self.recorder.record_event(event_time, equity, candles)
 
-        # 7. 액션 처리. 리스트 안의 순서를 지켜야 한다 — 예를 들어 트레일링 스탑 전략은
-        #    [취소, 재등록] 순으로 내놓으므로 뒤집히면 client_id가 충돌한다.
+        # 7. 액션 처리. 백테스트/드라이런은 SimulatedExecutor가 동기라 리스트 순서대로
+        #    체결/등록/취소가 반영된다 — 트레일링 스탑의 [취소, 재등록]도 그 순서로 처리된다.
+        #    라이브는 LiveExecutor.submit이 주문을 스레드풀로 fire-and-forget하므로 이벤트 안
+        #    액션들의 실행 순서가 보장되지 않는다 (문서화된 라이브 한정 동작 차이).
         for action in actions:
-            dispatch = self.executor.submit(action, event_time)
-            if dispatch is not None:
-                yield dispatch
+            self.executor.submit(action, event_time)
 
         # 8. 이벤트 마무리 (라이브 레코더의 flush 등)
         self.recorder.end_event(event_time)
@@ -136,28 +138,23 @@ class TradingEngine:
                 self.logger.info("[%s] Pre-fed indicators: %s", symbol,
                                  generate_dict_string(indicators))
 
-    def run(self, producer: CandleProducer) -> None:
-        """동기 소스를 끝까지 흘려보낸다.
-
-        ``SimulatedExecutor``는 Dispatch를 만들지 않으므로 제너레이터는 아무것도 yield하지
-        않는다. ``deque(..., maxlen=0)``은 그것을 C 레벨에서 소진하는 관용구다.
-        """
-        for event_time, candles in producer:
-            deque(self.process_event(event_time, candles), maxlen=0)
-
-    async def run_async(self, producer, timeout: float = 10.0,
+    async def run_async(self, producer: CandleProducer,
                         on_error: Optional[Callable[[Exception], Awaitable[None]]] = None
                         ) -> None:
-        """비동기 소스를 끝까지 흘려보내고, 주문마다 거래소의 확인을 기다린다.
+        """producer를 끝까지 흘려보낸다 — 백테스트/드라이런/라이브의 **유일한 드라이버**다.
 
-        :param on_error: 주면 한 이벤트의 처리 실패가 루프를 끝내지 않고 여기로 넘어간다 —
-            몇 주씩 사는 프로세스에서 전략의 일시적 버그 하나가 트레이더를 죽이면 안 되기
+        백테스트/벡터화 경로는 동기 함수 안에서 이걸 ``asyncio.run``으로 감싸 부른다.
+
+        :param on_error: 주면 한 이벤트의 처리 실패(전략/지표 버그 등)가 루프를 끝내지 않고
+            여기로 넘어간다 — 몇 주씩 사는 프로세스가 일시적 버그 하나로 죽으면 안 되기
             때문이다. None이면 그대로 올라간다 (테스트/백필 재생에서 쓴다).
+
+        주문 제출 결과는 여기서 기다리지 않는다. 라이브에서 주문 실패는 실행기가 비동기로
+        자기 에러 싱크에 흘려보내고, 거래소 진실인 ``status``가 다음 캔들에 스스로 복구한다.
         """
         async for event_time, candles in producer:
             try:
-                for dispatch in self.process_event(event_time, candles):
-                    await dispatch.wait(timeout)
+                self.process_event(event_time, candles)
             except Exception as e:
                 if on_error is None:
                     raise

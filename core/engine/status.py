@@ -34,16 +34,29 @@ class Status:
             open_orders if open_orders is not None else {}
 
     def position_for(self, symbol: str) -> PositionState:
-        """해당 심볼의 PositionState. 처음 보는 심볼이면 flat 상태로 만들어 등록한다."""
-        return self.positions.setdefault(symbol, PositionState())
+        """해당 심볼의 PositionState. 처음 보는 심볼이면 flat 상태로 만들어 등록한다.
+
+        ``setdefault``가 아니라 get-후-삽입인 것은 성능 때문이다: ``setdefault(sym,
+        PositionState())``는 키가 이미 있어도 매 호출마다 ``PositionState()``를 새로
+        만들어 버린다 — 이 메서드는 이벤트·심볼당 여러 번 불려 그 낭비가 수천만 회 쌓인다.
+        """
+        p = self.positions.get(symbol)
+        if p is None:
+            p = self.positions[symbol] = PositionState()
+        return p
 
     def open_orders_for(self, symbol: str) -> List["OpenOrder"]:
         """해당 심볼의 미체결 주문 리스트. 처음 보는 심볼이면 빈 리스트를 만들어 등록한다.
 
         반환된 리스트는 살아 있는 참조다 — 전략은 **읽기만** 해야 하고, 취소는
         ``Action.cancel(symbol, client_id)``로 해야 세 엔진이 같은 의미를 갖는다.
+
+        ``position_for``와 같은 이유로 get-후-삽입을 쓴다.
         """
-        return self.open_orders.setdefault(symbol, [])
+        b = self.open_orders.get(symbol)
+        if b is None:
+            b = self.open_orders[symbol] = []
+        return b
 
     def total_open_orders(self) -> int:
         return sum(len(v) for v in self.open_orders.values())

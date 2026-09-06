@@ -13,6 +13,7 @@
 문제가 아니다.
 """
 
+import asyncio
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -216,7 +217,7 @@ def run_vectorized(streamer: BaseStreamer, producer: BacktestCandleProducer, sta
 
     streamer.indicators = run_indicators
     try:
-        TradingEngine(streamer, executor, recorder).run(producer)
+        asyncio.run(TradingEngine(streamer, executor, recorder).run_async(producer))
     finally:
         streamer.indicators = original_indicators
 

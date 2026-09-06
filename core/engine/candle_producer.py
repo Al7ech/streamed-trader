@@ -1,17 +1,22 @@
 """캔들 공급 계층.
 
-엔진에 흘려보낼 **이벤트**(같은 시각에 마감한 심볼별 캔들 묶음)를 시간순으로 내준다. 캔들을
-어디서 얻느냐가 동기/비동기를 가르는 유일한 지점이므로, 그 차이는 전부 여기 구현체 안에 갇힌다:
+엔진에 흘려보낼 **이벤트**(같은 시각에 마감한 심볼별 캔들 묶음)를 시간순으로 내준다.
 
-- :class:`BacktestCandleProducer` — 메모리에 로딩된 캔들을 병합해 동기 iterator로 내준다.
+모든 구현체가 **비동기 iterator**(``__aiter__``)로 이벤트를 내주고,
+:meth:`~core.engine.engine.TradingEngine.run_async`가 그것을 소비한다. 백테스트/드라이런/
+라이브가 같은 소비 경로를 지나가고, 백테스트 진입점만 그 코루틴을 ``asyncio.run``으로 감싼다:
+
+- :class:`BacktestCandleProducer` — 메모리에 로딩된 캔들을 병합해 내준다 (내부에서 아무것도
+  ``await``하지 않는 async generator).
 - ``LiveCandleProducer`` (:mod:`core.trader.live_candle_producer`) — 웹소켓에서 캔들이 마감할
-  때마다 비동기 iterator로 내준다.
+  때마다 내준다.
 
 의존 방향은 **엔진 → Producer 한 방향**이다. Producer는 실행기도, 레코더도, 액션도 모른다.
 """
 
 import sys
-from typing import Dict, Iterator, List, Optional, Tuple
+from abc import ABC, abstractmethod
+from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple
 
 from tqdm import tqdm
 
@@ -22,17 +27,26 @@ from core.streamer.candle import Candle
 Event = Tuple[int, Dict[str, Candle]]
 
 
-class CandleProducer:
+class CandleProducer(ABC):
     """이벤트를 시간순으로 내주는 소스.
 
-    구현체는 **동기 소스면 ``__iter__``를, 비동기 소스면 ``__aiter__``를** 제공한다. 둘 중
-    하나만 있으면 되고, 엔진의 :meth:`~core.engine.engine.TradingEngine.run`과
-    :meth:`~core.engine.engine.TradingEngine.run_async`가 각각을 받는다 — 캔들을 어디서
-    얻느냐가 동기/비동기를 가르는 유일한 지점이기 때문이다.
+    구현체는 **``__aiter__``(비동기 iterator)** 를 제공하고,
+    :meth:`~core.engine.engine.TradingEngine.run_async`가 그것을 소비한다. 동기 소스라도
+    아무것도 ``await``하지 않는 async generator로 감싸면 되고 (:class:`BacktestCandleProducer`
+    참고), 그러면 백테스트·드라이런·라이브가 단 하나의 소비 경로를 공유한다.
+
+    캔들 간격이 필요한 소비자(샤드 메타·Sharpe 리샘플링)를 위해 구현체는 ``interval_ms``
+    인스턴스 속성을 채워야 한다.
     """
 
-    #: 캔들 간격(ms). 샤드 메타와 Sharpe 리샘플링 주기를 정하는 데 쓰인다.
-    interval_ms: int = 0
+    @abstractmethod
+    def __aiter__(self) -> AsyncIterator[Event]:
+        """이벤트를 시간순으로 내주는 비동기 iterator를 돌려준다.
+
+        보통 서브클래스에서 ``async def __aiter__(self): ... yield ...`` 형태의 async
+        generator로 구현한다.
+        """
+        raise NotImplementedError
 
     async def warmup_candles(self, windows: Dict[str, int]) -> Dict[str, List[Candle]]:
         """루프를 시작하기 전 지표에만 먹일 과거 캔들. 기본은 없음.
@@ -100,11 +114,14 @@ class BacktestCandleProducer(CandleProducer):
                 break
             yield event_time, dict(batch)
 
-    def __iter__(self) -> Iterator[Event]:
+    async def __aiter__(self) -> AsyncIterator[Event]:
+        """메모리 캔들을 시간순으로 내준다. 아무것도 ``await``하지 않는 async generator라
+        이벤트 루프 스케줄러는 개입하지 않는다 — ``async for``의 프로토콜 비용만 든다."""
         if self.events is not None:
             source = tqdm(self.events, desc="Backtesting", unit="event",
                           file=sys.stdout) if self.progress else self.events
-            yield from source
+            for event in source:
+                yield event
             return
 
         source = self._iter_events()

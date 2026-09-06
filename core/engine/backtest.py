@@ -13,6 +13,7 @@
 둘이 같은 ``Report``를 내는지는 ``core/backtest_fast_check.py``가 검증한다.
 """
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -88,7 +89,7 @@ def run_backtest(streamer: BaseStreamer,
                                        indicator_names, has_ohlc, producer.interval_ms)
         recorder = BacktestRecorder(streamer, status, shard_writer)
         executor = SimulatedExecutor(status, fee, slippage, on_trade=recorder.record_trade)
-        TradingEngine(streamer, executor, recorder).run(producer)
+        asyncio.run(TradingEngine(streamer, executor, recorder).run_async(producer))
         report = recorder.build_report(entry_equity)
         shards = recorder.close_shards()
 

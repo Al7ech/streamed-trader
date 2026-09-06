@@ -2,10 +2,12 @@
 
 :class:`~core.engine.executor.SimulatedExecutor`와 대비되는 지점이 이 모듈의 요점이다:
 
-- **체결이 비동기로 도착한다.** ``submit``은 주문을 보내고 :class:`OrderDispatch`만 돌려준다.
-  실제 체결은 나중에 유저 데이터 스트림(``ORDER_TRADE_UPDATE``)으로 오고, 그때 ``on_trade``
-  싱크로 흘러간다. 그래서 결정 시점의 거래 전 스냅샷을 client order id로 보관해 뒀다가
-  체결이 왔을 때 짝짓는다.
+- **체결이 비동기로 도착한다.** ``submit``은 주문을 fire-and-forget으로 보내고 곧바로 돌아온다
+  (반환값 없음). 실제 체결은 나중에 유저 데이터 스트림(``ORDER_TRADE_UPDATE``)으로 오고, 그때
+  ``on_trade`` 싱크로 흘러간다. 그래서 결정 시점의 거래 전 스냅샷을 client order id로 보관해
+  뒀다가 체결이 왔을 때 짝짓는다. 주문 제출의 성공/실패는 detached 태스크
+  (:meth:`LiveExecutor._await_order_result`)가 기다렸다가 실패면 ``_on_error``로 흘려보낸다 —
+  엔진 루프는 그걸 기다리지 않는다.
 - **``status``는 거래소가 정답이다.** ``ACCOUNT_UPDATE``가 margin/포지션을 덮고, 미체결 장부는
   ``ORDER_TRADE_UPDATE``가 동기화한다. 여기서 ``apply_fill``을 부르지 않는다.
 - **미체결 주문을 시뮬레이션하지 않는다.** ``match_resting``은 no-op이고, 강제청산도 거래소가
@@ -23,7 +25,7 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from core.engine import order_book
-from core.engine.executor import Dispatch, Executor
+from core.engine.executor import Executor
 from core.engine.order_book import OpenOrder
 from core.engine.status import Status
 from core.engine.trade import Trade
@@ -47,6 +49,10 @@ _QUANTITY_DIVERGENCE_TOLERANCE = 0.01
 #: 종결 이벤트를 못 받은 항목이 무한히 쌓이지 않도록 하는 상한. 넘으면 가장 오래된 것부터 버린다.
 _MAX_OPEN_ORDER_AGGREGATES = 256
 _MAX_PENDING_DECISIONS = 256
+
+#: 주문 하나의 거래소 확인을 기다리는 상한. 넘으면 오류로 보고 _on_error로 흘려보낸다.
+#: 엔진 루프는 이걸 기다리지 않는다 — 결과 라우팅은 detached 태스크에서 일어난다.
+ORDER_RESULT_TIMEOUT = 10.0
 
 _logger = logging.getLogger(__name__)
 
@@ -107,36 +113,6 @@ class _OrderAggregate:
     last_trade_ms: int = 0  # T
 
 
-class OrderDispatch(Dispatch):
-    """거래소에 보낸 주문 하나. :meth:`wait`가 결과를 기다리고 실패를 자체 처리한다."""
-
-    def __init__(self, action: Action, future,
-                 on_error: Callable[[Exception], Awaitable[None]]):
-        self.action = action
-        self._future = future
-        self._on_error = on_error
-        self._logger = logging.getLogger(__name__)
-
-    async def wait(self, timeout: float) -> None:
-        # concurrent.futures.Future라서 .result()는 **블로킹**이다 — 코루틴 안에서 부르면
-        # 유저 데이터 스트림을 포함한 이벤트 루프 전체가 멈춘다. wrap_future로 감싼다.
-        try:
-            result: Optional[OrderResult] = await asyncio.wait_for(
-                asyncio.wrap_future(self._future), timeout=timeout)
-        except Exception as e:
-            self._logger.error(f"Error waiting for order result: {e}")
-            await self._on_error(e)
-            return
-
-        # 실행기는 재시도 소진 후 예외 대신 success=False를 **반환**한다. 여기서 확인하지
-        # 않으면 영구 거부된 주문이 아무 흔적 없이 지나가고 전략이 거래소와 어긋난다.
-        if result is None or not result.success:
-            error = RuntimeError(
-                f"order failed: {getattr(result, 'error', 'no result')} (action={self.action})")
-            self._logger.error(str(error))
-            await self._on_error(error)
-
-
 class LiveExecutor(Executor):
     """실제 바이낸스 선물 계좌에 대고 주문을 실행한다.
 
@@ -164,6 +140,9 @@ class LiveExecutor(Executor):
         self._pending_decision: Dict[Tuple[str, str], _PendingDecision] = {}
         #: 키에 심볼이 들어가는 이유: 주문 ID가 계좌 안에서 심볼을 가로질러 유일하다는 보장이 없다.
         self._order_agg: Dict[Tuple[str, int], _OrderAggregate] = {}
+        #: 아직 결과가 안 온 주문의 결과-대기 태스크. BinanceTrader._spawn과 같은 강한 참조 +
+        #: done_callback 관용구 (GC 방지). stop()/테스트에서 drain한다.
+        self._pending_order_tasks: Set[asyncio.Task] = set()
         self._client_order_seq = 0
         self._warned_fee_asset = False
 
@@ -192,8 +171,13 @@ class LiveExecutor(Executor):
                 f"체결되지 않은 이전 결정을 버린다 (symbol={key[0]}): "
                 f"{self._pending_decision.pop(key)}")
 
-    def submit(self, action: Action, event_time: int) -> Optional[Dispatch]:
-        """액션을 거래소로 보낸다. 실제 체결은 나중에 유저 데이터 스트림으로 온다."""
+    def submit(self, action: Action, event_time: int) -> None:
+        """액션을 거래소로 보낸다 (fire-and-forget). 실제 체결은 나중에 유저 데이터 스트림으로 온다.
+
+        주문 성공/실패를 여기서 기다리지 않는다. 실패는 :meth:`_await_order_result`가 비동기로
+        ``_on_error``에 흘려보내고, 거래소 진실인 ``status``가 다음 캔들에 스스로 복구한다.
+        한 이벤트 안 액션들의 실행 순서는 보장되지 않는다.
+        """
         if action.order_type is ActionType.CANCEL:
             # 장부는 여기서 바로 비운다. 거래소의 CANCELED 이벤트가 오면 _sync_open_order가
             # 한 번 더 지우려 하지만 이미 없으므로 무해하다.
@@ -201,18 +185,19 @@ class LiveExecutor(Executor):
             if cancelled:
                 self.logger.info("주문 취소: symbol=%s client_id=%s (%d건)",
                                  action.symbol, action.client_id or "*", len(cancelled))
-            return self._dispatch(action)
+            self._dispatch(action)
+            return
 
         if action.quantity == 0:
-            return None
+            return
 
         # 지정가/조건부는 client_id가 곧 취소 키이므로 전략의 것을 그대로 쓰고, 시장가는 여기서
         # 하나 지어 붙인다 — 체결 이벤트를 이 결정과 정확히 짝짓기 위해서다.
         if action.client_id is None:
             action.client_id = self._new_client_order_id()
 
-        # 거래 전 스냅샷은 주문을 내보내기 **전에** 떠야 한다. Dispatch를 await하는 동안 이벤트
-        # 루프가 양보되어, 그 사이 체결/계정 갱신 이벤트가 self.status를 이미 바꿔놓을 수 있다.
+        # 거래 전 스냅샷은 주문을 내보내기 **전에** 떠야 한다. 주문을 보낸 뒤 이벤트 루프가
+        # 양보되면 그 사이 체결/계정 갱신 이벤트가 self.status를 이미 바꿔놓을 수 있다.
         self._remember_decision(_PendingDecision(
             timestamp=event_time,
             quantity=action.quantity,
@@ -222,14 +207,45 @@ class LiveExecutor(Executor):
             resting=action.is_resting,
         ), action.symbol, action.client_id)
 
-        return self._dispatch(action)
+        self._dispatch(action)
 
-    def _dispatch(self, action: Action) -> OrderDispatch:
+    def _dispatch(self, action: Action) -> None:
         # reference_price는 조건부 주문을 STOP_MARKET / TAKE_PROFIT_MARKET 중 어느 쪽으로
         # 보낼지 고르는 데 쓴다 — 거래소는 트리거가 현재가의 반대쪽에 있는 주문을 거부한다.
         future = self._orders.execute_action(
             action, reference_price=self.status.last_close.get(action.symbol))
-        return OrderDispatch(action, future, self._on_error)
+        # submit은 run_async가 도는 이벤트 루프 스레드에서 불리므로 create_task가 가능하다.
+        task = asyncio.create_task(self._await_order_result(future, action))
+        self._pending_order_tasks.add(task)
+        task.add_done_callback(self._pending_order_tasks.discard)
+
+    async def _await_order_result(self, future, action: Action) -> None:
+        """스레드풀의 주문 결과를 기다렸다가 실패면 ``_on_error``로 흘려보낸다.
+
+        엔진 루프는 이걸 기다리지 않는다. ``concurrent.futures.Future.result()``는 블로킹이라
+        ``wrap_future``로 이벤트 루프에 브리지한다 — 이 저장소에서 유일하게 허용된 스레드→루프
+        다리다.
+        """
+        try:
+            result: Optional[OrderResult] = await asyncio.wait_for(
+                asyncio.wrap_future(future), timeout=ORDER_RESULT_TIMEOUT)
+        except Exception as e:
+            self.logger.error("주문 결과 대기 실패 (action=%s): %s", action, e)
+            await self._on_error(e)
+            return
+
+        # 실행기는 재시도 소진 후 예외 대신 success=False를 **반환**한다. 확인하지 않으면
+        # 영구 거부된 주문이 흔적 없이 지나가고 전략이 거래소와 어긋난다.
+        if result is None or not result.success:
+            error = RuntimeError(
+                f"order failed: {getattr(result, 'error', 'no result')} (action={action})")
+            self.logger.error(str(error))
+            await self._on_error(error)
+
+    async def drain_pending_orders(self) -> None:
+        """미해결 주문 결과-대기 태스크가 전부 끝날 때까지 기다린다 (stop / 테스트용)."""
+        if self._pending_order_tasks:
+            await asyncio.gather(*self._pending_order_tasks, return_exceptions=True)
 
     def _new_client_order_id(self) -> str:
         """시장가 주문에 붙일 client order id. 거래소 규격(``^[.A-Z:/a-z0-9_-]{1,36}$``) 이내."""

@@ -7,8 +7,9 @@ Executor만 갈아끼우는 것으로 갈린다:
 - :class:`SimulatedExecutor` — 백테스트와 드라이런. 캔들로 체결을 판정하고 ``Status``를 직접
   갱신한다. **두 경로가 문자 그대로 같은 클래스를 쓰는 것**이 요점이다 — 드라이런은 백테스트와
   대조하기 위해 존재하므로, 체결 규칙이 갈라지면 기능 자체가 무의미해진다.
-- ``LiveExecutor`` (:mod:`core.trader.live_executor`) — 실제 거래소. 주문을 보내고, 체결은
-  나중에 유저 데이터 스트림으로 도착한다.
+- ``LiveExecutor`` (:mod:`core.trader.live_executor`) — 실제 거래소. 주문을 fire-and-forget으로
+  보내고, 체결은 나중에 유저 데이터 스트림으로 도착한다. 한 이벤트 안 액션들의 실행 순서는
+  보장되지 않는다 (스레드풀) — 위 ``SimulatedExecutor``는 동기라 리스트 순서를 지킨다.
 
 **체결은 반환값이 아니라 싱크(``on_trade``)로 흐른다.** 시뮬레이션은 체결 직후 동기적으로,
 라이브는 소켓 이벤트가 도착했을 때 비동기적으로 부른다 — 이 비대칭을 인터페이스에서 지우는
@@ -59,21 +60,6 @@ def resolve_slippage_ratio(streamer, explicit: Optional[float] = None) -> float:
     return explicit
 
 
-class Dispatch(ABC):
-    """거래소의 확인을 기다려야 하는 주문 하나.
-
-    동기인 엔진이 비동기 호출자에게 "여기서 잠깐 기다려라"를 전달하는 통로다. 엔진은
-    ``process_event``에서 이것을 ``yield``하고, 백테스트는 그냥 소진하며(만들어지지도 않는다),
-    라이브 드라이버만 ``await``한다.
-    """
-
-    action: Action
-
-    @abstractmethod
-    async def wait(self, timeout: float) -> None:
-        """결과를 기다린다. 실패 처리는 이 안에서 끝낸다 — 엔진은 결과를 보지 않는다."""
-
-
 class Executor(ABC):
     """계좌 상태(``status``)를 소유하고 액션을 체결로 바꾼다.
 
@@ -99,11 +85,19 @@ class Executor(ABC):
         """열린 포지션 전부를 각자의 최근 종가로 시가평가하고 자본을 돌려준다.
 
         이 이벤트에 캔들이 없는 심볼은 직전 알려진 종가를 그대로 쓴다.
+
+        ``st.positions.items()``를 순회하며 이미 ``pos_state``를 손에 쥐고 있으므로,
+        같은 포지션을 심볼로 다시 조회하는 ``st.update_unrealised_pnl(symbol, ...)``를
+        부르지 않고 그 공식(``position * (price - avg_price)``)을 인라인한다 — 계산은 동일하다.
+        이벤트·심볼당 불리므로 조회 한 번이 수백만 회 쌓인다.
         """
         st = self.status
+        last_close = st.last_close
         for symbol, pos_state in st.positions.items():
-            if pos_state.position != 0.0 and symbol in st.last_close:
-                st.update_unrealised_pnl(symbol, st.last_close[symbol])
+            if pos_state.position != 0.0:
+                price = last_close.get(symbol)
+                if price is not None:
+                    pos_state.unrealised_pnl = pos_state.position * (price - pos_state.avg_price)
         return st.total_margin()
 
     def force_liquidation(self, equity: float) -> bool:
@@ -111,8 +105,14 @@ class Executor(ABC):
         return False
 
     @abstractmethod
-    def submit(self, action: Action, event_time: int) -> Optional[Dispatch]:
-        """액션 하나를 처리한다. 거래소 확인이 필요하면 :class:`Dispatch`, 아니면 None."""
+    def submit(self, action: Action, event_time: int) -> None:
+        """액션 하나를 처리한다. 반환값은 없다 — 체결은 ``on_trade`` 싱크로 흐른다.
+
+        백테스트/드라이런(:class:`SimulatedExecutor`)은 동기적으로 즉시 체결하거나 장부에
+        올리므로 한 이벤트 안 액션들이 리스트 순서대로 반영된다. 라이브
+        (:class:`~core.trader.live_executor.LiveExecutor`)는 주문을 스레드풀로 보내고 곧바로
+        돌아오므로 **한 이벤트 안 액션들의 실행 순서는 보장되지 않는다.**
+        """
 
 
 class SimulatedExecutor(Executor):
@@ -160,7 +160,7 @@ class SimulatedExecutor(Executor):
         return True
 
     def submit(self, action: Action, event_time: int) -> None:
-        """가상 실행기는 절대 :class:`Dispatch`를 만들지 않는다 — 즉시 체결되거나 장부에 오른다.
+        """가상 실행기는 즉시 체결하거나 장부에 올린다 — 반환값이 없다.
 
         장부 조작(취소/등록)이 수량 검사보다 **먼저**다: CANCEL은 quantity가 0이라 뒤에 두면
         조용히 사라진다.

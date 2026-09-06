@@ -166,13 +166,20 @@ compared against a backtest, so the fill rules, accounting and resting-order boo
 copy — before this, `_fill` and `_submit_book_action` were hand-copied into the live trader and
 kept in sync by attention alone.
 
-**The engine is fully synchronous.** `process_event` is a generator: an order that needs an
-exchange round-trip is `yield`ed as a `Dispatch`, and the caller decides what to do with it. The
-backtest just drains the generator (`SimulatedExecutor` never produces a `Dispatch`, so nothing is
-yielded and there is no `await` overhead in the hot loop); `run_async` awaits between yields, which
-preserves live's "confirm order N before sending N+1" ordering. The sync/async split is therefore
-8 lines (`run` / `run_async`) plus the producer implementations — nothing else in the codebase has
-to know.
+**The engine is fully synchronous.** `process_event` is a plain method — it hands each action to
+the executor and moves on, never waiting for a result. All three modes go through the single
+driver `run_async`, which iterates the producer with `async for` and routes any exception
+`process_event` raises to `on_error` (so one transient strategy bug can't kill a weeks-long
+process). The backtest/vectorized paths wrap that coroutine in `asyncio.run(...)` inside their own
+sync functions, so `run_backtest` stays a synchronous call; `BacktestCandleProducer.__aiter__` is
+an async generator that never `await`s anything, so no event loop scheduling actually happens on
+that path — only `async for`'s protocol cost (~100ns/event, measured <2% of `process_event`).
+Live order submission is fire-and-forget inside `LiveExecutor`: the old "confirm order N before
+sending N+1" guarantee is deliberately gone — live `status` is exchange truth (the user-data
+stream updates it out of band), so a dropped order self-heals on the next candle. The flip side is
+that **intra-event action execution order is not guaranteed in live** (the thread pool runs them);
+backtest/dry run keep list order because `SimulatedExecutor` is synchronous. Every `CandleProducer`
+implements one method, `__aiter__` — nothing else in the codebase has to know sync from async.
 
 `process_event(event_time, candles)` — the contract every mode goes through:
 
@@ -184,7 +191,7 @@ to know.
 4. executor.force_liquidation()    # sim: equity <= 0 -> cancel_all + flatten every symbol
 5. per symbol: update indicators -> decide_action (or flatten if bankrupt)
 6. recorder.record_event()
-7. per action: executor.submit()   # CANCEL/register/fill, or dispatch to the exchange
+7. per action: executor.submit()   # sim: CANCEL/register/fill in list order; live: fire the order, return
 8. recorder.end_event()
 ```
 
@@ -328,8 +335,9 @@ existing ragged-series contract with no changes needed there.
   `ORDER_TRADE_UPDATE`, aggregated per `(symbol, order_id)` into one `Trade` (`price` = `ap`,
   `quantity` = signed `z`, `wnl` = Σ`rp`, `fee` = Σ`n`) and emitted on a terminal order state —
   `CANCELED`/`EXPIRED` with `z > 0` included, since those are real fills. The pre-trade `Status`
-  snapshot is deep-copied *before* the order is dispatched, because `OrderDispatch.wait()` awaits
-  the order future and `ACCOUNT_UPDATE` can overwrite `status` during that await. For a **market** fill
+  snapshot is deep-copied *before* the order is sent, because sending yields the event loop and a
+  fill / `ACCOUNT_UPDATE` can overwrite `status` before the `Trade` is built; the order result is
+  awaited in a detached task (`LiveExecutor._await_order_result`), not inline. For a **market** fill
   `Trade.timestamp` is the decision candle's `end_time`, not the fill's `T`, so trades bucket with
   the candle that caused them on aggregated views; for a **resting** fill it is the real fill time
   (`T`), because the decision was bars earlier and bucketing it there would be actively wrong —
@@ -611,10 +619,11 @@ straight to `executor.on_user_data(...)`.
   operationally, and only logging the failures made that impossible to read off the log).
   Multiplexed messages arrive wrapped as `{"stream": ..., "data": <rawPayload>}`; since the
   continuousKline payload carries no top-level `s`/`k.s`, the symbol is read from `data["ps"]`.
-  Since one consumer drives this source and fully awaits each event's processing (including order
-  dispatch) before pulling the next message, candle processing across symbols is naturally
-  serialized and needs no extra locking; the only race is kline processing vs. the separate
-  user-data listener task, handled by deep-copying `Status` before an order is dispatched.
+  Since one consumer drives this source and fully runs each `process_event` before pulling the next
+  message, *decision* processing across symbols is naturally serialized and needs no extra locking.
+  Live order submissions are fired to the thread pool and not awaited, so an order result may land
+  after later candles; that race, plus the kline-vs-user-data-listener race, is tolerated because
+  `status` is exchange truth and the pre-trade snapshot is deep-copied before the order is sent.
   - **Gaps and duplicates are detected per symbol** (each tracks its own `_last_candle_start`,
     advanced *before* the candle is yielded so a consumer exception cannot cause a re-run). A gap
     is filled by **yielding the missing candles first** — so "backfilled candles take the same path
@@ -634,9 +643,11 @@ straight to `executor.on_user_data(...)`.
     `end_time` (not recomputed per symbol) so their windows stay aligned despite the sequential
     fetches, and the range is floored to the **interval** boundary, not the minute, so the
     assertion holds for every interval and not just `1m`.
-- **`live_executor.py` — orders and account state.** `submit()` sends the order and returns an
-  `OrderDispatch`; the fill arrives later on the user-data stream, so the pre-trade `Status`
-  snapshot is deep-copied *before* dispatch and keyed by `(symbol, client order id)` — every order
+- **`live_executor.py` — orders and account state.** `submit()` fires the order and returns `None`;
+  a detached task (`_await_order_result`) awaits the submission result and routes a failure to
+  `on_error`. The fill arrives later on the user-data stream, so the pre-trade `Status`
+  snapshot is deep-copied *before* the order is sent and keyed by `(symbol, client order id)` —
+  every order
   gets a `newClientOrderId` (auto-generated for market orders, the strategy's `client_id` for
   resting ones) which the exchange echoes back as `c`, so a resting order that fills hours later is
   still paired with the decision that created it.
@@ -678,10 +689,11 @@ straight to `executor.on_user_data(...)`.
   recording seams, restart-resume behaviour and the live/backtest divergences to expect.
 - `BinanceExecutor` is the low-level order client: it submits to a `ThreadPoolExecutor` (GIL-free
   from the asyncio loop) with exponential-backoff retries, returning a
-  `concurrent.futures.Future[OrderResult]` that `OrderDispatch.wait()` awaits via
-  `asyncio.wrap_future`. It returns `success=False` rather than raising once retries are exhausted,
-  and `OrderDispatch` checks that — otherwise a permanently rejected order passes without a trace
-  and the strategy drifts from the exchange. `execute_action` maps `ActionType` onto the exchange's
+  `concurrent.futures.Future[OrderResult]` that `LiveExecutor._await_order_result()` awaits via
+  `asyncio.wrap_future` in a detached task (bounded by `ORDER_RESULT_TIMEOUT`). It returns
+  `success=False` rather than raising once retries are exhausted, and `_await_order_result` checks
+  that, routing the failure to `on_error` — otherwise a permanently rejected order passes without a
+  trace and the strategy drifts from the exchange. `execute_action` maps `ActionType` onto the exchange's
   order types: `LIMIT` gains `timeInForce=GTC` (Binance rejects a LIMIT without it), and a
   `STOP_MARKET` becomes `STOP_MARKET` or `TAKE_PROFIT_MARKET` depending on which side of
   `reference_price` its trigger sits — the exchange rejects a conditional order whose trigger is on
