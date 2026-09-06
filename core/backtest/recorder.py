@@ -73,9 +73,9 @@ class BacktestRecorder(Recorder):
         self._report: Optional[Report] = None
         self._closed = False
 
-    def record_event(self, event_time: int, equity: float,
-                     candles: Dict[str, Candle]) -> None:
+    def record_event(self, event_time: int, candles: Dict[str, Candle]) -> None:
         # 자본과 종가는 **항상 같이** 늘어나야 한다. buy & hold 곡선이 인덱스로 짝을 맞춘다.
+        equity = self._status.total_margin()
         self.equity_curve.append((event_time, equity))
         for symbol, candle in candles.items():
             self._latest_close[symbol] = candle.close

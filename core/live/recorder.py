@@ -133,15 +133,16 @@ class LiveRecorder(Recorder):
 
     # ------------------------------------------------------------------ 기록
 
-    def record_event(self, event_time: int, equity: float,
-                     candles: Dict[str, Candle]) -> None:
+    def record_event(self, event_time: int, candles: Dict[str, Candle]) -> None:
         """이벤트 하나를 적재한다. 라이브 이벤트는 심볼 하나짜리다.
 
         엔진의 기록 지점이 백테스트와 1:1로 대응한다 — 모든 지표가 갱신되고 ``decide_action``이
-        반환한 직후이므로, 여기서 읽는 지표 값은 그 결정이 실제로 본 값이다.
+        반환한 직후이므로, 여기서 읽는 지표 값은 그 결정이 실제로 본 값이다. 자본은 마지막
+        ``ACCOUNT_UPDATE`` 기준 ``total_margin()``이다 (백테스트처럼 봉마다 재마킹하지 않는다).
         """
         # 자본과 종가는 **항상 같이** 늘어나야 한다. _downsample_equity가 길이로 stride를
         # 정하므로 어긋나면 equity와 benchmark의 인덱스 짝이 조용히 밀린다.
+        equity = self._status.total_margin()
         self._equity.append((event_time, equity))
         for symbol, candle in candles.items():
             self._latest_close[symbol] = candle.close

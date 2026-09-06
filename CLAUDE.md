@@ -282,20 +282,19 @@ implements one method, `__aiter__` — nothing else in the codebase has to know 
 `process_event(event_time, candles)` — the contract every mode goes through:
 
 ```
-0. executor.begin_event()          # refresh executor.last_close from this event's candles (all symbols, up front); live also drops unmatched market decisions from the last candle
-1. (folded into step 0 — see above)
-2. executor.match_resting()        # fills happen here (sim only; live's exchange does it)
-3. executor.mark_to_market()       # -> equity for this event
-4. executor.force_liquidation()    # sim: equity <= 0 -> cancel_all + flatten every symbol
+0. executor.begin_event()          # sim: refresh last_close from this event's candles (all symbols, up front) + mark every open position to it; live: drop unmatched market decisions from the last candle
+2. executor.match_resting()        # fills happen here (sim only; live's exchange does it); sim then re-marks the filled symbol to the bar close
+4. executor.force_liquidation()    # sim: status.total_margin() <= 0 -> cancel_all + flatten every symbol; live: always False
 5. update every symbol's indicators, then one streamer.decide_action(candles, status) for the whole event (engine flattens each symbol itself if bankrupt — decide_action is not called)
-6. recorder.record_event()
+6. recorder.record_event()         # the recorder reads status.total_margin() itself for the equity point
 7. per action: executor.submit()   # sim: CANCEL/register/fill in list order; live: fire the order, return
 8. recorder.end_event()
 ```
 
 Matching is at step 2, ahead of `decide_action`, because on a real exchange a resting order fills
 before the bar closes — put it after and the strategy decides while believing it still holds a
-position its stop already closed. Step 3 is where the equity point comes from, which is why a
+position its stop already closed. The equity point comes from `record_event` reading
+`status.total_margin()` after matching (step 2) and before MARKET submits (step 7), which is why a
 MARKET fill's state applies from the *next* event while a resting fill's applies from this one.
 
 **Fills flow through a sink, not a return value** (`executor.on_trade`). The simulated executor
@@ -422,7 +421,7 @@ existing ragged-series contract with no changes needed there.
   adds, a terminal state removes), and `_reconcile_resumed_orders` warns when the resumed book and
   the exchange's actual book disagree — the exchange keeps working a stop while this process is
   down, which makes that reconciliation matter more than the position one.
-- **Fills.** Dry-run records the local `Status.apply_fill` result at `executor.last_close[action.
+- **Fills.** Dry-run records the local `Status.apply_fill` result at `SimulatedExecutor.last_close[action.
   symbol]` (the action's *target* symbol's last known close, not necessarily the triggering
   candle's own close — see the cross-symbol note below), so a dry run and a backtest of the same
   candles produce identical trades. Live records **real exchange fills** from
@@ -456,8 +455,9 @@ existing ragged-series contract with no changes needed there.
   so the filled quantity can differ from the requested action (`LiveExecutor._emit_fill` warns past
   `_QUANTITY_DIVERGENCE_TOLERANCE`, 1%, so the size of that drift is visible rather than
   merely expected); prefeed candles are not recorded, so live indicator columns have no
-  NaN warm-up prefix; `update_unrealised_pnl` marks with last price while the exchange marks with
-  mark price; live sizing uses `status.fee_ratio` from the account's real taker commission tier
+  NaN warm-up prefix; the live equity curve only moves on `ACCOUNT_UPDATE` (exchange truth, mark
+  price) so it is step-shaped between account events, whereas a backtest re-marks every open
+  position to the bar close every candle; live sizing uses `status.fee_ratio` from the account's real taker commission tier
   (`futures_commission_rate`) while a backtest uses whatever `fee_ratio` the caller passed
   `SimulatedExecutor`, so position sizes can differ if the two rates differ; and BNB-denominated
   commissions (`N` != margin asset) are excluded from `fee` and flagged as
@@ -558,7 +558,7 @@ those check scripts default to WARNING.
   one thing, in the backtester and in the live trader alike.
 
   Look-ahead is actually held out elsewhere: a fill uses its target symbol's decision-candle
-  `close` when that symbol is the trigger, or `executor.last_close[symbol]` — refreshed by
+  `close` when that symbol is the trigger, or `SimulatedExecutor.last_close[symbol]` — refreshed by
   `begin_event` before any symbol in the current merged event is processed — for a same-event
   action targeting a different symbol; the `Status` handed to both `decide_action` and `update` is
   the pre-trade snapshot; and
@@ -676,17 +676,21 @@ one symbol draws down the same pool a profit on another symbol credits. `status.
 symbol)` lazily creates a flat `PositionState` for a symbol not yet touched, so callers never
 `KeyError` on a symbol they haven't traded. `total_margin()` sums `margin` plus every symbol's
 `unrealised_pnl`; `update_leverage()` sums notional (`avg_price * abs(position)`) across every
-symbol over that. `executor.last_close: Dict[str, float]` — **not on `Status`**, because it is a
-price cache, not account state, and it is written by the executor, not by `apply_fill`.
-`Executor.begin_event` refreshes it from every candle in the event, up front (before matching or
-decisions), and it **persists across events**, so a symbol keeps its last known close on events
-where it has no candle. That persistence is why it can't be replaced by reading the event's
-`candles` dict. Two consumers: `Executor.mark_to_market()` (marks every open position, including
-symbols absent from this event — runs in live too, as a between-`ACCOUNT_UPDATE` approximation),
-and the `SimulatedExecutor` MARKET fill price of an action's *target* symbol (which, for a
-cross-symbol action, is not the symbol whose candle triggered the decision). No strategy reads it,
-and STOP_MARKET trigger direction no longer comes from it — `Action.trigger_above` is required and
-carries it.
+symbol over that. `SimulatedExecutor.last_close: Dict[str, float]` — **only on the simulated
+executor**, not `Status` and not base `Executor`, because it is a price cache, not account state,
+and only the backtest/dry-run path needs it (live prices come from the exchange).
+`SimulatedExecutor.begin_event` refreshes it from every candle in the event, up front (before
+matching or decisions), and it **persists across events**, so a symbol keeps its last known close
+on events where it has no candle. That persistence is why it can't be replaced by reading the
+event's `candles` dict. Two consumers, both in `SimulatedExecutor`: `begin_event` marks every open
+position to it (that mark, re-applied to a filled symbol at the end of `match_resting`, is the
+event's equity-curve value the recorder reads at step 6), and it is the MARKET fill price of an
+action's *target* symbol (which, for a cross-symbol action, is not the symbol whose candle
+triggered the decision). No strategy reads it, and STOP_MARKET trigger direction no longer comes
+from it — `Action.trigger_above` is required and carries it. Live has no equivalent: the base
+`Executor` interface is just `begin_event`/`match_resting`/`force_liquidation`/`submit`, and
+`LiveExecutor` marks nothing — `record_event` reads `status.total_margin()` off the last
+`ACCOUNT_UPDATE`.
 `status.fee_ratio` is the account's fee rate — a `Status` field (default `DEFAULT_FEE_RATIO` in
 `core/domain/status.py`) the executor sets: `SimulatedExecutor` from its constructor arg,
 `LiveExecutor` from `futures_commission_rate`. Strategies read it when sizing (`price * (1/lev +

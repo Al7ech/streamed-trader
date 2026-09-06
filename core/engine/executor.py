@@ -49,46 +49,25 @@ class Executor(ABC):
         self.status = status
         self.on_trade: Callable[[Trade], None] = on_trade or (lambda trade: None)
         self.logger = logging.getLogger(type(self).__module__)
-        #: 심볼별 최근 알려진 종가. :meth:`begin_event`가 이벤트 캔들로 갱신하고 이벤트를
-        #: 넘어 유지된다 — 캔들이 없는 이벤트에서도 심볼이 직전 값을 들고 있다.
-        #: 계좌 상태가 아니라 시세 캐시라 ``Status``가 아니라 실행기가 소유한다.
-        #: :meth:`mark_to_market`(전 심볼 시가평가)와 시장가 체결가가 읽는다.
-        self.last_close: Dict[str, float] = {}
 
     # ------------------------------------------------------------ 이벤트 훅
 
     def begin_event(self, event_time: int, candles: Dict[str, Candle]) -> None:
-        """이벤트 처리 시작 훅. 심볼별 최근 종가 캐시를 이 이벤트의 캔들로 갱신한다.
+        """이벤트 처리 시작 훅. 기본은 아무것도 하지 않는다.
 
-        다른 심볼을 겨냥한 액션의 체결가가 심볼 처리 순서와 무관하게 결정적이려면 종가가
-        결정/매칭보다 **먼저 전부** 확정돼야 하는데, 이 훅이 이벤트의 맨 앞이다."""
-        for symbol, candle in candles.items():
-            self.last_close[symbol] = candle.close
+        :class:`~core.backtest.simulated_executor.SimulatedExecutor`는 여기서 심볼별 최근
+        종가를 갱신하고 열린 포지션을 시가평가한다 (그 결과가 이벤트의 자본곡선 값이 된다).
+        라이브는 미체결 결정 폐기에만 쓴다 — 자본은 ``ACCOUNT_UPDATE``가 정답이다.
+        """
 
     def match_resting(self, symbol: str, candle: Candle, event_time: int) -> None:
         """미체결 주문을 이 캔들로 체결시킨다. 기본은 아무것도 하지 않는다 (거래소가 채운다)."""
 
-    def mark_to_market(self) -> float:
-        """열린 포지션 전부를 각자의 최근 종가로 시가평가하고 자본을 돌려준다.
+    def force_liquidation(self) -> bool:
+        """파산이면 장부를 비우고 True. 기본은 항상 False (거래소가 청산한다).
 
-        이 이벤트에 캔들이 없는 심볼은 직전 알려진 종가를 그대로 쓴다.
-
-        ``st.positions.items()``를 순회하며 이미 ``pos_state``를 손에 쥐고 있으므로,
-        같은 포지션을 심볼로 다시 조회하는 ``st.update_unrealised_pnl(symbol, ...)``를
-        부르지 않고 그 공식(``position * (price - avg_price)``)을 인라인한다 — 계산은 동일하다.
-        이벤트·심볼당 불리므로 조회 한 번이 수백만 회 쌓인다.
+        자본은 구현이 ``self.status.total_margin()``으로 직접 잰다 — 엔진이 넘겨주지 않는다.
         """
-        st = self.status
-        last_close = self.last_close
-        for symbol, pos_state in st.positions.items():
-            if pos_state.position != 0.0:
-                price = last_close.get(symbol)
-                if price is not None:
-                    pos_state.unrealised_pnl = pos_state.position * (price - pos_state.avg_price)
-        return st.total_margin()
-
-    def force_liquidation(self, equity: float) -> bool:
-        """파산이면 장부를 비우고 True. 기본은 항상 False (거래소가 청산한다)."""
         return False
 
     @abstractmethod

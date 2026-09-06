@@ -534,7 +534,7 @@ async def check_live_executor():
     ex, trades, _, _ = await make_live_executor()
     ex.match_resting(SYM, Candle(1, 1, 1, 1, 1, 0, MIN), MIN)
     check("executor: 미체결 주문을 시뮬레이션하지 않는다", not trades)
-    check("executor: 강제청산은 거래소 몫", ex.force_liquidation(-100.0) is False)
+    check("executor: 강제청산은 거래소 몫", ex.force_liquidation() is False)
 
     ex, _, _, _ = await make_live_executor()
     ex.submit(Action(SYM, 1.0), event_time=1)

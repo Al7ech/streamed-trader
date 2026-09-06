@@ -84,26 +84,24 @@ class TradingEngine:
         """
         st = self.executor.status
 
-        # 0-1. 이벤트 경계 훅. 실행기가 심볼별 최근 종가 캐시를 이 이벤트 캔들로 **먼저 전부**
-        #      갱신하고 (라이브는 미체결 결정 폐기도 여기서). 다른 심볼을 겨냥한 액션의 체결가가
-        #      그 캐시에서 정해지므로, 매칭·결정보다 앞서 확정돼야 심볼 순서와 무관하게 결정적이다.
+        # 0-1. 이벤트 경계 훅. 실행기가 심볼별 최근 종가를 이 이벤트 캔들로 **먼저 전부**
+        #      갱신하고, 열린 포지션을 그 종가로 시가평가한다 (백테스트). 다른 심볼을 겨냥한
+        #      액션의 체결가가 그 캐시에서 정해지므로, 매칭·결정보다 앞서 확정돼야 심볼 순서와
+        #      무관하게 결정적이다. 라이브는 미체결 결정 폐기에만 쓴다.
         self.executor.begin_event(event_time, candles)
 
         # 2. 미체결 주문 매칭. 심볼 순회는 streamer.symbols 순서다 — 지표 갱신 루프와 같은
-        #    순서를 써야 어떤 실행 경로에서도 같은 결과가 나온다.
+        #    순서를 써야 어떤 실행 경로에서도 같은 결과가 나온다. 백테스트는 체결 뒤 잔여
+        #    포지션을 이벤트 종가로 다시 시가평가한다.
         for symbol in self.streamer.symbols:
             candle = candles.get(symbol)
             if candle is not None:
                 self.executor.match_resting(symbol, candle, event_time)
 
-        # 3. 시가평가. 여기서 잰 자본이 이벤트의 자본 곡선 값이 된다 — 미체결 체결은 이미
-        #    반영돼 있고, 아래 단계 7의 시장가 체결은 아직 반영되지 않은 시점이다.
-        equity = self.executor.mark_to_market()
-
         # 4. 파산 판정. flat인 심볼도 이 분기를 타는데, 그때는 flatten 액션이 만들어지지 않아
         #    "파산 후에는 스트리머를 부르지 않는다"가 유지된다. 지표 갱신과 기록은 파산 여부와
         #    무관하게 계속된다 — 건너뛰는 것은 오직 스트리머의 결정 호출뿐이다.
-        bankrupt = self.executor.force_liquidation(equity)
+        bankrupt = self.executor.force_liquidation()
 
         # 5. 이 이벤트의 **모든** 심볼 지표를 먼저 갱신한 뒤, decide_action을 이벤트당 한 번
         #    부른다 — 결정 시점에 모든 심볼 지표가 이 캔들까지 반영돼 있어 크로스심볼 결정이
@@ -138,8 +136,10 @@ class TradingEngine:
                     generate_dict_string(self.streamer.indicators.get(symbol, {})))
 
         # 6. 기록. 모든 지표가 이미 갱신되고 decide_action이 반환한 직후라, 레코더가 읽는 모든
-        #    값이 그 결정이 실제로 본 값이다.
-        self.recorder.record_event(event_time, equity, candles)
+        #    값이 그 결정이 실제로 본 값이다. 자본곡선 값은 레코더가 이 시점의
+        #    ``status.total_margin()``을 직접 읽는다 — 미체결 체결은 반영, 아래 단계 7의 시장가
+        #    체결은 아직 미반영인 시점이다.
+        self.recorder.record_event(event_time, candles)
 
         # 7. 액션 처리. 백테스트/드라이런은 SimulatedExecutor가 동기라 리스트 순서대로
         #    체결/등록/취소가 반영된다 — 트레일링 스탑의 [취소, 재등록]도 그 순서로 처리된다.

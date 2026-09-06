@@ -25,15 +25,14 @@ class Recorder(ABC):
     """엔진이 흘려보내는 이벤트/체결을 받는다."""
 
     @abstractmethod
-    def record_event(self, event_time: int, equity: float,
-                     candles: Dict[str, Candle]) -> None:
+    def record_event(self, event_time: int, candles: Dict[str, Candle]) -> None:
         """이벤트 하나를 적재한다.
 
         엔진은 모든 지표를 갱신하고 ``decide_action``을 부른 **직후**에 이것을 부른다. 따라서
-        지금 ``streamer.indicators``에서 읽는 값은 그 결정이 실제로 본 값이다.
+        지금 ``streamer.indicators``에서 읽는 값은 그 결정이 실제로 본 값이다. 자본곡선 값이
+        필요하면 이 시점의 ``self._status.total_margin()``을 읽으면 된다 — 미체결 주문 체결은
+        이미 반영돼 있고, 이번 이벤트의 시장가 체결은 아직 반영되지 않았다.
 
-        :param equity: 이 이벤트 시점의 계좌 전체 시가평가 자본. 미체결 주문 체결은 이미
-            반영돼 있고, 이번 이벤트의 시장가 체결은 아직 반영되지 않았다.
         :param candles: 이번 이벤트에 캔들이 마감한 심볼만 담긴다.
         """
 
@@ -69,8 +68,7 @@ class NullRecorder(Recorder):
     """아무것도 남기지 않는 레코더. 기록이 꺼진 라이브 실행처럼 엔진은 돌려야 하지만 결과를
     적재할 필요가 없을 때 쓴다 — 매번 ``if recorder`` 로 감싸지 않기 위한 것이다."""
 
-    def record_event(self, event_time: int, equity: float,
-                     candles: Dict[str, Candle]) -> None:
+    def record_event(self, event_time: int, candles: Dict[str, Candle]) -> None:
         pass
 
     def record_trade(self, trade: Trade) -> None:
