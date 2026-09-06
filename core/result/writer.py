@@ -248,81 +248,12 @@ class ShardWriter:
 def _clean_value(v) -> Optional[float]:
     """Falsy/NaN -> null.
 
-    Donchian/MA 류 지표는 워밍업 동안 falsy를 반환하고, 벡터화 경로는 NaN을 반환한다. 둘 다
-    null로 눕혀야 프론트가 그 지점을 건너뛴다. NaN 검사(``v == v``)가 특히 중요한데,
-    ``bool(float('nan'))``은 True라 그냥 두면 ``json.dump``가 bare ``NaN`` 토큰을 뱉고
-    ``JSON.parse``가 그 샤드 전체를 거부한다.
+    Donchian/MA 류 지표는 워밍업 동안 falsy를, 경로 의존 지표는 자기 NaN 정규화를 거쳐
+    NaN을 남길 수 있다. 둘 다 null로 눕혀야 프론트가 그 지점을 건너뛴다. NaN 검사
+    (``v == v``)가 특히 중요한데, ``bool(float('nan'))``은 True라 그냥 두면 ``json.dump``가
+    bare ``NaN`` 토큰을 뱉고 ``JSON.parse``가 그 샤드 전체를 거부한다.
     """
     return v if v and v == v else None
-
-
-def _clean_column(values: Sequence) -> List[Optional[float]]:
-    """Falsy/NaN -> null, matching ShardWriter.add (warm-up blanks skipped by the frontend)."""
-    if isinstance(values, np.ndarray):
-        values = values.tolist()
-    return [_clean_value(v) for v in values]
-
-
-def write_series_shards(dir_path: str, run_id: str, times: Sequence[int],
-                        balance: Sequence[float],
-                        symbol_columns: Dict[str, Dict[str, Optional[Dict[str, Sequence]]]],
-                        interval_ms: int, has_ohlc: bool) -> List[Dict]:
-    """Bulk counterpart of :class:`ShardWriter`: writes the same month-bucketed columnar shard
-    files from whole-run columns (numpy arrays or lists) in one pass after the backtest loop.
-
-    :param symbol_columns: ``{symbol: {"ohlc": {...} or None, "indicators": {...}}}``, every
-        array the same length as ``times``. Indicator columns must already hold decide-time
-        values (i.e. the value the streamer saw for that event, which includes the event's own
-        candle for that symbol — every indicator ingests it before ``decide_action`` runs).
-    :param has_ohlc: whether to embed OHLC per symbol (mirrors ``symbol_columns[*]["ohlc"]``
-        being non-None).
-
-    Returns the same shard index as ``ShardWriter.close()``.
-    """
-    n = len(times)
-    if n == 0:
-        return []
-    times_arr = np.asarray(times, dtype=np.int64)
-
-    # month-start boundaries (ms) covering the run, then one searchsorted to split all shards
-    first = datetime.fromtimestamp(int(times_arr[0]) / 1000, tz=timezone.utc)
-    year, month = first.year, first.month
-    last_ms = int(times_arr[-1])
-    bounds: List[int] = []
-    while True:
-        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
-        bound_ms = int(datetime(year, month, 1, tzinfo=timezone.utc).timestamp() * 1000)
-        if bound_ms > last_ms:
-            break
-        bounds.append(bound_ms)
-    splits = np.searchsorted(times_arr, bounds, side="left")
-    starts = [0] + [int(s) for s in splits]
-    ends = [int(s) for s in splits] + [n]
-
-    shards: List[Dict] = []
-    for lo, hi in zip(starts, ends):
-        if lo == hi:
-            continue
-        month_times = times_arr[lo:hi].tolist()
-        file_name = f"{run_id}.{_month_key(month_times[0])}.series.json"
-        shard = {
-            "start": month_times[0],
-            "end": month_times[-1],
-            "interval_ms": interval_ms,
-            "time": month_times,
-            "balance": _clean_column(balance[lo:hi]),
-            "symbols": {},
-        }
-        for sym, cols in symbol_columns.items():
-            entry = {"indicators": {name: _clean_column(col[lo:hi])
-                                    for name, col in cols["indicators"].items()}}
-            if has_ohlc and cols.get("ohlc") is not None:
-                entry["ohlc"] = {k: np.asarray(v[lo:hi], dtype=np.float64).tolist()
-                                 for k, v in cols["ohlc"].items()}
-            shard["symbols"][sym] = entry
-        _write_json(os.path.join(dir_path, file_name), shard)
-        shards.append({"file": file_name, "start": month_times[0], "end": month_times[-1]})
-    return shards
 
 
 def _downsample_equity(equity_curve: Sequence, max_points: int = 2000) -> Optional[Dict]:

@@ -13,5 +13,6 @@ class Report:
         self.status = status
         self.equity_curve = equity_curve or []
         # 기초자산 단순 보유(buy & hold) 곡선 — equity_curve 와 같은 길이/타임스탬프.
-        # 전략 성과가 아니라 비교 기준선이라 metrics.build_buy_and_hold_curve 로 따로 만든다.
+        # 전략 성과가 아니라 비교 기준선이라 metrics.build_multi_symbol_buy_and_hold_curve 로
+        # 따로 만든다 (동일가중 포트폴리오, 심볼 하나면 init_margin * close_i / close_0).
         self.benchmark_curve = benchmark_curve or []

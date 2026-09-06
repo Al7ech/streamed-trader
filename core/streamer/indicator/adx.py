@@ -13,8 +13,8 @@ class ADXIndicator(NumericIndicator):
     +DM/-DM과 TR을 Wilder smoothing(초기 n개 단순평균 시드 후 재귀)으로 평활,
     DI+/DI- -> DX -> DX의 Wilder smoothing = ADX.
 
-    Wilder 재귀는 경로 의존이라 벡터화하지 않는다(plain NumericIndicator,
-    벡터화 경로에서도 루프 갱신 — Supertrend와 동일 전례). 워밍업은 약 2*window 캔들.
+    Wilder 재귀는 경로 의존이라 ``precompute_series``를 정의하지 않는다(plain
+    NumericIndicator, 루프 경로로만 갱신 — Supertrend와 동일 전례). 워밍업은 약 2*window 캔들.
     """
 
     scale_group = "adx"

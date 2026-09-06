@@ -514,7 +514,7 @@ those check scripts default to WARNING.
 - Indicators come in two types. `BaseIndicator` (ABC) is a loop-updated rolling-window indicator:
   `update(candle, status=None)` ingests one candle plus the *pre-trade* `Status` snapshot — the
   same one `decide_action` sees for that event (`TradingEngine.warmup` passes `None`, so
-  status-aware indicators must treat `None` as warm-up); `get_index(idx)`/`get_latest()`
+  status-aware indicators must treat `None` as warm-up); `read(idx)`/`get_latest()`
   read back past values (`-1` = latest, `-2` = previous, ...). An indicator that reads `status`
   cannot be vectorized (account state is a feedback loop of the strategy's own trades) and must
   stay a plain `BaseIndicator` — `streamer/indicator/position_age.py` is the canonical example (it's told
@@ -539,7 +539,7 @@ those check scripts default to WARNING.
 - **Ordering matters**: `TradingEngine.process_event` — the single loop backtest, dry run and live
   all go through — updates **every** indicator for **every** symbol in the event with its closed
   candle *before* calling `streamer.decide_action(candles, status)` once for the event, so
-  `get_latest()` includes the candle being decided on and `get_index(-2)` is the previous one, and
+  `get_latest()` includes the candle being decided on and `read(-2)` is the previous one, and
   a cross-symbol strategy sees every symbol's indicators already advanced to this event —
   the current candle's OHLCV is also available directly from the `candles` dict, and every
   strategy uses it. The `Status` passed to both `update` and `decide_action` is still the
@@ -551,7 +551,7 @@ those check scripts default to WARNING.
   This ordering is a **semantic convention, not a look-ahead guard**: the candle has already
   closed by the time `decide_action` runs, so feeding it to the indicators first leaks no future
   information. It does mean any breakout/extremum comparison against the current candle's own
-  OHLC must read `get_index(-2)` instead of `get_latest()` — a Donchian max channel that includes
+  OHLC must read `read(-2)` instead of `get_latest()` — a Donchian max channel that includes
   the current bar satisfies `channel_max >= candle.high >= candle.close`, making
   `close > channel_max` unfireable. Level-style indicators (MA, ATR, rolling std) read fine at
   `get_latest()` either way. What the convention guarantees is that `get_latest()` means exactly

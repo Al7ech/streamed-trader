@@ -41,36 +41,11 @@ def compute_sharpe(equity_curve: List[Tuple[int, float]], sample_every: int = 24
     return mean / math.sqrt(var) * math.sqrt(periods_per_year)
 
 
-def build_buy_and_hold_curve(times: Sequence[int], closes: Sequence[float],
-                             init_margin: float) -> List[Tuple[int, float]]:
-    """기초자산을 첫 캔들 종가에 전액 매수해 끝까지 보유했을 때의 자산 곡선.
-
-    ``init_margin * close_i / close_0`` — 전략 equity_curve 와 같은 단위(둘 다 init_margin 에서
-    시작)이자 같은 길이/타임스탬프라, 프론트에서 별도 정규화 없이 같은 가격축에 겹쳐 그릴 수 있고
-    ``_downsample_equity`` 를 그대로 재사용해도 두 곡선의 샘플 시각이 정확히 일치한다.
-
-    :param times: 캔들별 타임스탬프(ms). equity_curve 의 타임스탬프와 같아야 한다.
-    :param closes: 같은 길이의 종가 배열 (list/numpy 모두 허용).
-    :param init_margin: 시작 자산.
-    :return: (timestamp_ms, equity) 리스트. 데이터가 없거나 첫 종가가 0 이하면 빈 리스트.
-    """
-    times_arr = np.asarray(times, dtype=np.int64)
-    closes_arr = np.asarray(closes, dtype=np.float64)
-    n = len(times_arr)
-    if n == 0 or len(closes_arr) != n:
-        return []
-    first_close = float(closes_arr[0])
-    if not (first_close > 0) or not (init_margin > 0):
-        return []
-    values = closes_arr * (init_margin / first_close)
-    return list(zip(times_arr.tolist(), values.tolist()))
-
-
 def forward_fill_nan(arr: np.ndarray) -> np.ndarray:
     """직전 유효값으로 NaN 구간을 채운다. 선행 NaN은 그대로 남는다.
 
-    벡터화 경로가 심볼별 종가를 병합 이벤트 그리드에 흩뿌린 뒤 채워 넣는 데도 재사용한다
-    (그 심볼의 캔들이 없는 이벤트는 직전 알려진 종가를 써야 하므로).
+    ``build_multi_symbol_buy_and_hold_curve``가 심볼별 종가를 병합 이벤트 그리드에 흩뿌린 뒤
+    채워 넣는 데 쓴다 (그 심볼의 캔들이 없는 이벤트는 직전 알려진 종가를 써야 하므로).
     """
     idx = np.where(~np.isnan(arr), np.arange(len(arr)), 0)
     np.maximum.accumulate(idx, out=idx)
@@ -86,7 +61,7 @@ def build_multi_symbol_buy_and_hold_curve(
     상장 시점이 다른 심볼(늦게 시작하거나 구간에 구멍이 있는)도 다룬다: 그 심볼의 몫은
     첫 유효 종가가 나타나는 시점부터 곡선에 반영되고, 그 전에는 0으로 취급된다 — 총
     투입 자본이 심볼이 하나씩 합류할 때마다 계단식으로 늘어난다는 뜻이다. 심볼이 하나뿐이면
-    ``build_buy_and_hold_curve``와 같은 결과를 낸다.
+    옛 단일 심볼 곡선(``init_margin * close_i / close_0``)과 같은 결과를 낸다.
 
     :param times: equity_curve와 같은 길이/타임스탬프의 이벤트 시각.
     :param closes_by_symbol: 심볼별 종가 시퀀스, times와 같은 길이. 그 심볼의 캔들이 아직

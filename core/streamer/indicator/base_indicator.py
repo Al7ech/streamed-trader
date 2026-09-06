@@ -87,9 +87,10 @@ class NumericIndicator(BaseIndicator):
     #: backtester holds a value per candle per indicator over the whole history.
     #:
     #: Reads deeper than this are a programming error and raise ``IndexError`` rather than
-    #: silently returning ``None``: a silent ``None`` would make the loop path and a vectorized
-    #: path (whose array-backed shim mirrors this bound) disagree. Reads that are merely still
-    #: in warm-up keep returning ``None``.
+    #: silently returning ``None``: a silent ``None`` would let a read past the retained history
+    #: pass unnoticed (and would diverge from any array-backed fast path that mirrors this bound
+    #: if the vectorized backtest path is reintroduced). Reads that are merely still in warm-up
+    #: keep returning ``None``.
     #:
     #: The default is far deeper than anything shipped reads (the deepest is
     #: ``MomentumTimeExitStreamer``'s ``mom_lookback``). Pass ``history_size`` to the
@@ -111,14 +112,13 @@ class NumericIndicator(BaseIndicator):
         ``SupertrendIndicator``의 방향 값)도 그 deque와 history_size를 넘겨 그대로
         재사용한다 — ``history_size``를 ``self``에서 읽지 않고 인자로 받는 이유다.
 
-        인덱스는 **음수만** 받는다. 음수가 아니면 루프 경로는 ``values[0]`` = 가장 오래된
-        보관값을, 벡터화 경로의 ``ArrayIndicator``는 ``seq[cursor]`` = 아직 반영되지
-        않은 캔들의 값(= 룩어헤드)을 주므로 둘이 아예 다른 뜻이 된다.
+        인덱스는 **음수만** 받는다. 음수가 아니면 deque 조회는 ``values[0]`` = 가장 오래된
+        보관값을 조용히 돌려줘 "최신"을 뜻하는 ``-1``과 정반대가 된다 (벡터화 백테스트 경로가
+        재도입되면 그쪽 array 조회는 아직 반영되지 않은 캔들 = 룩어헤드를 주므로 더 나쁘다).
 
-        NaN은 ``None``으로 정규화한다. ``precompute_series``는 값이 없는 구간을 NaN으로
-        표현하고 ``ArrayIndicator``가 그걸 ``None``으로 바꾸는데, 루프 경로가 raw NaN을
-        내보내면 두 경로가 갈린다 — 게다가 ``x is None`` / ``x <= 0`` 류의 가드가 NaN을
-        전부 통과시켜 조용히 전략 로직을 오염시킨다.
+        NaN은 ``None``으로 정규화한다. ``precompute_series``를 정의한 지표는 값이 없는 구간을
+        NaN으로 표현하는데, 루프 경로가 raw NaN을 그대로 내보내면 ``x is None`` / ``x <= 0``
+        류의 가드가 NaN을 전부 통과시켜 조용히 전략 로직을 오염시킨다.
         """
         if idx >= 0:
             raise IndexError(

@@ -23,8 +23,8 @@ class SupertrendIndicator(NumericIndicator):
     출력 deque 외에 자기만의 작업용 deque(min_deque)를 따로 갖는 것과 같은 모양이다. 라인과
     방향은 하나의 래칫 재귀 계산에서 동시에 나오므로 update() 한 곳에서 둘 다 채운다.
 
-    래칫이 재귀적(경로 의존)이라 벡터화하지 않는다 — plain NumericIndicator로 두면
-    벡터화 경로에서도 루프로 정확히 업데이트된다.
+    래칫이 재귀적(경로 의존)이라 ``precompute_series``를 정의하지 않는다 — 루프 경로
+    (``update()``)로만 갱신되고, 그것으로 정확하다.
     """
 
     def __init__(self, window: int, multiplier: float):
