@@ -15,10 +15,10 @@
 **엔진은 완전히 동기다.** ``process_event``는 평범한 메서드고, 액션을 실행기에 넘기면 그걸로
 끝이다 — 결과를 기다리지 않는다. 세 모드 모두 유일한 드라이버 :meth:`run_async`를 지나가고
 (producer를 ``async for``로 순회한다), 백테스트 경로는 그 코루틴을 ``asyncio.run``으로
-감싼다 (:func:`~core.engine.backtest.run_backtest`는 여전히 동기 함수다). ``run_async``만이
+감싼다 (:func:`~core.backtest.run.run_backtest`는 여전히 동기 함수다). ``run_async``만이
 ``process_event`` 안에서 터진 예외를 ``on_error``로 넘긴다.
 
-라이브에서 주문 제출은 :class:`~core.trader.live_executor.LiveExecutor` 안에서 fire-and-forget이다.
+라이브에서 주문 제출은 :class:`~core.live.executor.LiveExecutor` 안에서 fire-and-forget이다.
 예전의 "주문 N의 결과를 확인한 뒤 N+1을 보낸다"는 보장은 **의도적으로 없앴다** — 라이브 ``status``
 는 거래소가 정답이라(유저 데이터 스트림이 이벤트 밖에서 갱신한다) 누락된 주문은 다음 캔들에 스스로
 복구된다. 그 대신 한 이벤트 안 액션들의 실행 순서도 라이브에서는 보장되지 않는다 (백테스트/드라이런
@@ -28,12 +28,12 @@
 import logging
 from typing import Awaitable, Callable, Dict, List, Optional
 
+from core.domain.action import Action
+from core.domain.candle import Candle
 from core.engine.candle_producer import CandleProducer
 from core.engine.executor import Executor
 from core.engine.recorder import Recorder
 from core.streamer import BaseStreamer
-from core.streamer.action import Action
-from core.streamer.candle import Candle
 from core.utils import generate_dict_string
 
 

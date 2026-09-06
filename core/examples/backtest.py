@@ -1,10 +1,10 @@
 import sys
 from datetime import datetime, timezone
 
-from core.engine.backtest import DEFAULT_INIT_MARGIN, run_backtest
-from core.engine.binance_backtest_candle_producer import BinanceBacktestCandleProducer
+from core.backtest.binance_candle_producer import BinanceBacktestCandleProducer
+from core.backtest.run import DEFAULT_INIT_MARGIN, run_backtest
 from core.logging_config import setup_logging
-from core.streamer.keltner_streamer import KeltnerStreamer
+from core.streamer.strategies.keltner_streamer import KeltnerStreamer
 
 if __name__ == "__main__":
     # 0. 로깅 설정. 이게 없으면 페처/백테스터의 경고가 lastResort 핸들러로 빠져
@@ -21,7 +21,7 @@ if __name__ == "__main__":
     producer = BinanceBacktestCandleProducer(
         start_time=start_date, end_time=end_date, symbols=[symbol], interval=interval)
 
-    # 2. 전략 생성 — 다른 전략을 돌리려면 여기만 바꾸면 된다 (streamer/ 참고)
+    # 2. 전략 생성 — 다른 전략을 돌리려면 여기만 바꾸면 된다 (streamer/strategies/ 참고)
     #    max_loss는 스탑 거리에서의 손실 한도이자 사실상 레버리지 손잡이다. 0.08처럼 크게
     #    잡으면 1m 캔들에서는 스탑 거리가 워낙 좁아 항상 6x 캡에 붙고, 왕복 수수료가
     #    자본의 ~0.5%씩 수백 번 나가면서 전략과 무관하게 계좌가 녹는다. 데모 기본값은

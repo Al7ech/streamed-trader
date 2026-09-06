@@ -1,7 +1,7 @@
 from typing import Optional
 
-from core.engine.status import Status
-from core.streamer.candle import Candle
+from core.domain.candle import Candle
+from core.domain.status import Status
 from core.streamer.indicator.base_indicator import BaseIndicator
 
 

@@ -41,7 +41,7 @@ Click **asset 폴더 선택** and pick the repo's `asset/` directory. The app li
 renders candles, indicators, trade markers, an equity curve and monthly stats.
 
 > **`core` is a real, `uv`-installed package.** `uv sync` editable-installs it, so modules import
-> their siblings with the full path (`from core.streamer.candle import Candle`) and resolve the
+> their siblings with the full path (`from core.domain.candle import Candle`) and resolve the
 > same way regardless of cwd. Run scripts from the repo root with `uv run python core/<script>.py`.
 > Default output paths (`asset/`) are relative to the cwd, so run from the repo root, not from
 > inside `core/`.
@@ -51,10 +51,10 @@ renders candles, indicators, trade markers, an equity curve and monthly stats.
 Subclass `BaseStreamer`, declare your indicators, and implement `decide_action`:
 
 ```python
-from core.engine.status import Status
-from core.streamer.action import Action
+from core.domain.action import Action
+from core.domain.candle import Candle
+from core.domain.status import Status
 from core.streamer.base_streamer import BaseStreamer
-from core.streamer.candle import Candle
 from core.streamer.indicator.moving_average import MovingAverage
 
 
@@ -109,7 +109,7 @@ trader has no future to precompute.
 
 An indicator that reads `status` **cannot** be precomputed this way: account state depends on the
 trades the strategy makes, which is a feedback loop. Keep those as plain `BaseIndicator` without
-`precompute_series` (`indicator/position_age.py` is the example). The two kinds mix freely in one
+`precompute_series` (`streamer/indicator/position_age.py` is the example). The two kinds mix freely in one
 strategy.
 
 One class attribute tunes an indicator, settable per subclass or per instance:
@@ -150,8 +150,8 @@ the resulting numbers as a smoke test, not as evidence.
 ## Backtesting
 
 ```python
-from core.engine.backtest import run_backtest
-from core.engine.binance_backtest_candle_producer import BinanceBacktestCandleProducer
+from core.backtest import run_backtest
+from core.backtest.binance_candle_producer import BinanceBacktestCandleProducer
 
 producer = BinanceBacktestCandleProducer(
     start_time=start, end_time=end, symbols=["ETHUSDT"], interval="1m")
@@ -171,7 +171,7 @@ adding `save_series=True` also writes month-bucketed `<run_id>.<YYYY-MM>.series.
 per-candle OHLC and indicator values, which the frontend loads lazily per viewport.
 
 ```bash
-uv run python core/live_check.py            # live path + dry-run == backtest
+uv run python core/checks/live_check.py            # live path + dry-run == backtest
 ```
 
 The engine also force-liquidates every position when mark-to-market equity falls to zero or below,
@@ -191,7 +191,7 @@ backtest of the same candles would.
 - **`MassiveStockFetcher`** — US equity minute bars from Massive (formerly Polygon.io), needs
   `MASSIVE_API_KEY`. Session-aware: `nyse_session` builds the NYSE trading-hours grid so a
   1200-candle window means the same wall-clock span on every symbol instead of silently spanning
-  overnight gaps. `uv run python core/fetch_stock_check.py AAPL` smoke-tests it.
+  overnight gaps. `uv run python core/checks/fetch_stock_check.py AAPL` smoke-tests it.
 
 All of them share `BaseCandleFetcher.get_candles_with_cache`, which caches per **month** under
 `asset/candle/<symbol>_<interval>/<YYYY-MM>.pkl`. Only missing months are fetched; completed
@@ -210,7 +210,7 @@ uv run streamed-trader
 > run.** In dry run no orders are sent, no user-data socket is opened, and margin starts at a
 > synthetic `1e6` with fills simulated locally. With `DRY_RUN=false` this sends real market orders
 > against real money at whatever leverage your strategy asks for. Nothing here is financial advice
-> and there is no warranty — read `core/trader/README.md` before you flip it.
+> and there is no warranty — read `core/live/README.md` before you flip it.
 
 Docker runs the trader continuously:
 
@@ -221,23 +221,41 @@ docker compose up -d --build
 ## Repository layout
 
 ```
-pyproject.toml                 package metadata + deps (uv-managed), builds the `core` package
+pyproject.toml            package metadata + deps (uv-managed), builds the `core` package
 core/
-  examples/                    backtest.py/trader.py entry points (edit for symbol/date/strategy)
-  live_check.py               live path + dry-run == backtest check (the de-facto test suite)
-  fetch_stock_check.py        US equity data smoke test
-  engine/                     the unified trading engine, candle producers, executors, recorders
-  backtest/                   Status/Trade/Report, metrics, result writer
-  streamer/                   BaseStreamer, Candle, Action + example strategies
-    indicator/                MA, ATR, Donchian, ADX, Supertrend, rolling std, volume stats, ...
-  candle_fetcher/             BaseCandleFetcher + month-chunk pickle cache
-  binance_candle_fetcher/     Binance REST / data.binance.vision / funding / OI + long-short metrics
-  stock_candle_fetcher/       Massive US equities + NYSE session calendar
-  trader/                     BinanceTrader (asyncio + websockets), BinanceExecutor, ReliableWebsocket
-  utils/                      timestamp and rounding helpers
-visualise/                    React viewer for asset/backtest/*.json
-asset/                        gitignored: candle cache + backtest output
+  domain/                 Candle, Action, Status, Trade, Report, order book + fill rules
+  streamer/               BaseStreamer — the strategy contract
+    indicator/            MA, ATR, Donchian, ADX, Supertrend, rolling std, volume stats, ...
+    strategies/           example strategies (illustrations, not tuned)
+  fetcher/                BaseCandleFetcher + month-chunk pickle cache
+    binance/              Binance REST / data.binance.vision / funding / OI + long-short metrics
+    stock/                Massive US equities + NYSE session calendar
+  engine/                 TradingEngine + the three ports (CandleProducer/Executor/Recorder)
+  result/                 run JSON + series shards, Sharpe/MDD/benchmark metrics
+  backtest/              run_backtest, SimulatedExecutor, BacktestRecorder, candle producers
+  live/                   BinanceTrader (asyncio + websockets), LiveExecutor/Recorder/Producer,
+                          BinanceOrderClient, ReliableWebsocket
+  checks/                 live_check.py (the de-facto test suite), fetch_stock_check.py
+  examples/               backtest.py/trader.py entry points (edit for symbol/date/strategy)
+  utils/                  timestamp and rounding helpers
+visualise/                React viewer for asset/backtest/*.json
+asset/                    gitignored: candle cache + backtest output
 ```
+
+Dependencies run one way, and nothing points back:
+
+```
+utils ← domain ← streamer
+              ← fetcher
+              ← engine ← result
+                      ← backtest ← live
+```
+
+`domain/` imports nothing from the repo but `utils/` — it knows nothing about the engine, the
+strategies or the exchange. `engine/` holds the order-of-operations and the three ABCs the modes
+plug into, and imports neither `backtest/` nor `live/`. The one edge that looks backwards is
+deliberate: `live/` imports `backtest/` for `SimulatedExecutor`, because a dry run runs the
+backtest's own fill code rather than a copy of it.
 
 ## Requirements
 

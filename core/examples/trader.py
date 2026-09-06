@@ -1,5 +1,5 @@
 """
-Example usage of the BinanceTrader and BinanceExecutor modules.
+Example usage of the BinanceTrader and BinanceOrderClient modules.
 
 This file demonstrates how to integrate the trader components with a streamer
 for live trading operations.
@@ -11,9 +11,9 @@ import os
 
 from dotenv import load_dotenv
 
+from core.live.trader import BinanceTrader
 from core.logging_config import setup_logging
-from core.streamer.keltner_streamer import KeltnerStreamer
-from core.trader.BinanceTrader import BinanceTrader
+from core.streamer.strategies.keltner_streamer import KeltnerStreamer
 
 logger = logging.getLogger(__name__)
 
