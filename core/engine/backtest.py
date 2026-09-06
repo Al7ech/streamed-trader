@@ -1,6 +1,6 @@
 """백테스트 진입점.
 
-:func:`run_backtest`는 :class:`~core.engine.candle_producer.BacktestCandleProducer`,
+:func:`run_backtest`는 :class:`~core.engine.backtest_candle_producer.BacktestCandleProducer`,
 :class:`~core.engine.engine.TradingEngine`, :class:`~core.engine.executor.SimulatedExecutor`,
 레코더를 조립해 ``Report``를 돌려준다.
 
@@ -17,7 +17,7 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from core.engine.candle_producer import BacktestCandleProducer
+from core.engine.backtest_candle_producer import BacktestCandleProducer
 from core.engine.engine import TradingEngine
 from core.engine.executor import SimulatedExecutor, resolve_fee_ratio, resolve_slippage_ratio
 from core.engine.indicator_columns import collect_indicator_columns

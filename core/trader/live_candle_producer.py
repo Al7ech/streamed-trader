@@ -45,7 +45,8 @@ class LiveCandleProducer(CandleProducer):
         self.symbols = [s.upper() for s in symbols]
         self._symbol_set = set(self.symbols)
         self.interval = interval
-        self.interval_ms = interval_to_minutes(interval) * 60_000
+        # 라이브의 간격 출처는 config다 — 첫 캔들 전에 경계 정규화·갭 감지에 이미 필요하다.
+        super().__init__(interval_to_minutes(interval) * 60_000)
         self._on_error = on_error
         #: 심볼별 마지막으로 내준 캔들의 시작 시각 — 중복/구멍 판정의 기준점. None이면 아직
         #: 기준이 없다 (프리피드 전, 또는 프리피드할 지표가 하나도 없는 심볼).

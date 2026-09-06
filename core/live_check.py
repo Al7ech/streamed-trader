@@ -354,7 +354,7 @@ class ReplayProducer(CandleProducer):
     """라이브처럼 심볼별 단일 키 이벤트를 비동기로 내주는 소스 (캔들은 메모리에서)."""
 
     def __init__(self, candles_by_symbol, interval_ms: int):
-        self.interval_ms = interval_ms
+        super().__init__(interval_ms)
         self._events = sorted(
             ((c.end_time, sym, c) for sym, cs in candles_by_symbol.items() for c in cs),
             key=lambda t: (t[0], t[1]))

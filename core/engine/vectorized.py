@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from core.engine.candle_producer import BacktestCandleProducer
+from core.engine.backtest_candle_producer import BacktestCandleProducer
 from core.engine.engine import TradingEngine
 from core.engine.executor import SimulatedExecutor
 from core.engine.metrics import build_multi_symbol_buy_and_hold_curve, forward_fill_nan
