@@ -16,7 +16,6 @@ class TradeStreamer(BaseStreamer):
             'a': MovingAverage(10)
         }})
 
-        self.symbol = symbol
         self.dir = 1  # 다음 진입 방향: 1이면 롱, -1이면 숏
 
     def decide_action(self, candles: Dict[str, Candle], status: Status) -> List[Action]:

@@ -35,7 +35,6 @@ class MeanReversionZScoreStreamer(BaseStreamer):
             "MA": MovingAverage(window),
             "STD": RollingStd(window),
         }})
-        self.symbol = symbol
         self.entry_z = entry_z
         self.timeout_candles = timeout_candles
         self.max_loss = max_loss

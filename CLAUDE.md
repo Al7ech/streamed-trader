@@ -674,9 +674,16 @@ one symbol draws down the same pool a profit on another symbol credits. `status.
 symbol)` lazily creates a flat `PositionState` for a symbol not yet touched, so callers never
 `KeyError` on a symbol they haven't traded. `total_margin()` sums `margin` plus every symbol's
 `unrealised_pnl`; `update_leverage()` sums notional (`avg_price * abs(position)`) across every
-symbol over that. `status.last_close: Dict[str, float]` is engine-maintained (every symbol's close
-in a merged event is frozen up front, before `decide_action` runs for that event) — it's what
-lets a cross-symbol action price a non-trigger symbol correctly.
+symbol over that. `status.last_close: Dict[str, float]` is engine-maintained — every symbol's close in an event is
+frozen into it up front (`process_event` step 1), and it **persists across events**, so a symbol
+keeps its last known close on events where it has no candle. That persistence is why it can't be
+replaced by reading the event's `candles` dict: it is the price source for
+`Executor.mark_to_market()` (marks every open position, including symbols absent from this event),
+for the `SimulatedExecutor` MARKET fill price of an action's *target* symbol (which, for a
+cross-symbol action, is not the symbol whose candle triggered the decision), and for deriving a
+`STOP_MARKET`'s trigger direction when the strategy leaves `Action.trigger_above=None`
+(`order_book.register_order`; live's `LiveExecutor` uses it the same way to pick STOP_MARKET vs
+TAKE_PROFIT_MARKET). No strategy reads it directly.
 `status.fee_ratio` is the account's fee rate — a `Status` field (default `DEFAULT_FEE_RATIO` in
 `core/domain/status.py`) the executor sets: `SimulatedExecutor` from its constructor arg,
 `LiveExecutor` from `futures_commission_rate`. Strategies read it when sizing (`price * (1/lev +

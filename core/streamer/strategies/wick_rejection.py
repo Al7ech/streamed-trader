@@ -33,7 +33,6 @@ class WickRejectionStreamer(BaseStreamer):
         super().__init__([symbol], {symbol: {
             "atr": ATRIndicator(60),
         }})
-        self.symbol = symbol
         self.wick_atr_mult = wick_atr_mult
         self.close_pos = close_pos
         self.hold_candles = hold_candles

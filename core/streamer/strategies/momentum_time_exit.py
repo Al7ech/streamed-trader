@@ -39,7 +39,6 @@ class MomentumTimeExitStreamer(BaseStreamer):
             "close_hist": MovingAverage(
                 1, history_size=max(MovingAverage.history_size, mom_lookback + 2)),
         }})
-        self.symbol = symbol
         self.mom_lookback = mom_lookback
         self.entry_threshold_pct = entry_threshold_pct
         self.hold_candles = hold_candles

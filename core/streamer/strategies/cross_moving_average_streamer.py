@@ -28,7 +28,6 @@ class CrossMovingAverageStreamer(BaseStreamer):
             "ma10": MovingAverage(10),
             "ma25": MovingAverage(25),
         }})
-        self.symbol = symbol
 
     def decide_action(self, candles: Dict[str, Candle], status: Status) -> List[Action]:
         symbol = self.symbols[0]

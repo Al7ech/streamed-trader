@@ -27,7 +27,6 @@ class SupertrendStreamer(BaseStreamer):
         super().__init__([symbol], {symbol: {
             "ST": SupertrendIndicator(atr_window, multiplier),
         }})
-        self.symbol = symbol
         self.max_loss = max_loss
 
         self.logger = logging.getLogger(__name__)

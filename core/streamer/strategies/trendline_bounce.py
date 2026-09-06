@@ -63,7 +63,6 @@ class TrendlineBounceStreamer(BaseStreamer):
         if lines in ("sup", "both"):
             indicators["SUP"] = PivotTrendlineIndicator(pivot_k, mode="low")
         super().__init__([symbol], {symbol: indicators})
-        self.symbol = symbol
         self.eps = eps
         self.min_touch = min_touch
         self.hold_candles = hold_candles
