@@ -10,8 +10,9 @@
   엔진 루프는 그걸 기다리지 않는다.
 - **``status``는 거래소가 정답이다.** ``ACCOUNT_UPDATE``가 margin/포지션을 덮고, 미체결 장부는
   ``ORDER_TRADE_UPDATE``가 동기화한다. 여기서 ``apply_fill``을 부르지 않는다.
-- **미체결 주문을 시뮬레이션하지 않는다.** ``match_resting``은 no-op이고, 강제청산도 거래소가
-  한다 (``force_liquidation``이 항상 False).
+- **미체결 주문을 시뮬레이션하지 않는다.** ``begin_event``는 낡은 시장가 결정만 폐기하고
+  미체결 매칭은 하지 않는다 (:class:`SimulatedExecutor`의 ``begin_event`` 안에서 캔들로
+  판정하는 그 로직이 여기엔 없다). 강제청산도 거래소가 한다 (``force_liquidation``이 항상 False).
 - **생성이 곧 수화(hydration)다.** 유일한 생성 경로인 :meth:`LiveExecutor.create`가 거래소에서
   지갑/포지션/미체결 주문을 읽어 **완성된** ``Status``를 만들어 들고 돌아온다. 그래서 "아직
   채워지지 않은 ``Status``"라는 중간 상태가 존재하지 않는다 — 예전에는 호출자가

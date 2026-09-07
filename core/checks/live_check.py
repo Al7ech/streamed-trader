@@ -531,9 +531,14 @@ async def check_live_executor():
           ex.status.total_open_orders() == 0
           and ex._orders.calls[-1].order_type is ActionType.CANCEL)
 
+    # 라이브는 미체결 주문을 캔들로 시뮬레이션하지 않는다 — begin_event가 트리거를 넘긴
+    # 캔들을 받아도 장부는 그대로고 Trade도 생기지 않는다 (거래소가 체결하고 유저 데이터로 온다).
     ex, trades, _, _ = await make_live_executor()
-    ex.match_resting(SYM, Candle(1, 1, 1, 1, 1, 0, MIN), MIN)
-    check("executor: 미체결 주문을 시뮬레이션하지 않는다", not trades)
+    await ex.on_user_data(order_msg(status="NEW", x="NEW", z=0.0, otype="STOP_MARKET",
+                                    sp=95.0, side="SELL", c="stop-sim"))
+    ex.begin_event(2, {SYM: Candle(1, 1, 1, 1, 1, 0, MIN)})
+    check("executor: 미체결 주문을 시뮬레이션하지 않는다",
+          not trades and ex.status.total_open_orders() == 1)
     check("executor: 강제청산은 거래소 몫", ex.force_liquidation() is False)
 
     ex, _, _, _ = await make_live_executor()

@@ -92,7 +92,8 @@ Order execution and account state, against the real exchange:
   parts. Commissions in a non-margin asset (BNB) are excluded from `fee` and flagged as
   `metadata.fee_asset_mismatch`.
 - Resting orders are not simulated and forced liquidation is not performed — the exchange does both
-  (`match_resting` is a no-op, `force_liquidation` always returns `False`).
+  (`begin_event` only drops stale market decisions and never matches resting orders, unlike
+  `SimulatedExecutor.begin_event`; `force_liquidation` always returns `False`).
 - `reconcile_resumed(saved)` compares a resumed run's remembered positions and open orders against
   the exchange's actual ones and warns on any difference. It only reports; the exchange wins.
 

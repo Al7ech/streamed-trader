@@ -282,8 +282,7 @@ implements one method, `__aiter__` — nothing else in the codebase has to know 
 `process_event(event_time, candles)` — the contract every mode goes through:
 
 ```
-0. executor.begin_event()          # sim: refresh last_close from this event's candles (all symbols, up front) + mark every open position to it; live: drop unmatched market decisions from the last candle
-2. executor.match_resting()        # fills happen here (sim only; live's exchange does it); sim then re-marks the filled symbol to the bar close
+0-2. executor.begin_event()        # sim: per symbol with a candle — refresh last_close + match resting orders (fills happen here) + tick expiry; then mark every open position (incl. symbols with no candle this event) to its last_close, which also re-marks a just-filled symbol from its fill price back to the bar close. live: drop unmatched market decisions from the last candle (no matching — the exchange fills resting orders)
 4. executor.force_liquidation()    # sim: status.total_margin() <= 0 -> cancel_all + flatten every symbol; live: always False
 5. update every symbol's indicators, then one streamer.decide_action(candles, status) for the whole event (engine flattens each symbol itself if bankrupt — decide_action is not called)
 6. recorder.record_event()         # the recorder reads status.total_margin() itself for the equity point
@@ -291,11 +290,18 @@ implements one method, `__aiter__` — nothing else in the codebase has to know 
 8. recorder.end_event()
 ```
 
-Matching is at step 2, ahead of `decide_action`, because on a real exchange a resting order fills
-before the bar closes — put it after and the strategy decides while believing it still holds a
-position its stop already closed. The equity point comes from `record_event` reading
-`status.total_margin()` after matching (step 2) and before MARKET submits (step 7), which is why a
-MARKET fill's state applies from the *next* event while a resting fill's applies from this one.
+Resting-order matching happens inside `begin_event`, ahead of `decide_action`, because on a real
+exchange a resting order fills before the bar closes — put it after and the strategy decides while
+believing it still holds a position its stop already closed. The engine no longer drives a
+per-symbol match loop; `SimulatedExecutor.begin_event` folds the whole thing (`match_symbol` ->
+`_fill` -> `tick_expiry`, then the mark-to-close pass) into one method, and its per-symbol
+iteration order is the `candles` dict's (alphabetical by symbol from the merge heap tiebreak), not
+`streamer.symbols` — fill price/quantity/realised PnL are independent of cross-symbol order, though
+in a multi-symbol event where two symbols both fill resting orders the `Trade.prev_status`/`leverage`
+snapshot of the first can show the other still marked to the previous event's close. The equity
+point comes from `record_event` reading `status.total_margin()` after `begin_event` and before
+MARKET submits (step 7), which is why a MARKET fill's state applies from the *next* event while a
+resting fill's applies from this one.
 
 **Fills flow through a sink, not a return value** (`executor.on_trade`). The simulated executor
 calls it synchronously right after `apply_fill`; the live executor calls it when
@@ -652,15 +658,16 @@ Assumptions that a candle cannot verify, all deliberate:
 - **Forced liquidation cancels the whole book** (`cancel_all`) along with flattening every symbol;
   otherwise a stop left resting would open a ghost position on a bankrupt account.
 
-**Where matching sits in the event** is step 2 of `TradingEngine.process_event` (see "The trading
-engine" above) — ahead of `decide_action`, because on a real exchange a resting order fills before
-the bar closes. A consequence worth keeping in mind for any future vectorized equity rebuild: a
-MARKET fill happens *after* the equity point is recorded so its state applies from the next event
-index, while a resting fill happens *before* it so its state applies from this one.
+**Where matching sits in the event** is inside `SimulatedExecutor.begin_event`, at the top of
+`TradingEngine.process_event` (see "The trading engine" above) — ahead of `decide_action`, because
+on a real exchange a resting order fills before the bar closes. A consequence worth keeping in mind
+for any future vectorized equity rebuild: a MARKET fill happens *after* the equity point is
+recorded so its state applies from the next event index, while a resting fill happens *before* it
+so its state applies from this one.
 
-Live never simulates any of this: `LiveExecutor.match_resting` is a no-op and the exchange owns the
-book, hydrated at startup from `futures_get_open_orders()` and kept in sync by
-`ORDER_TRADE_UPDATE`.
+Live never simulates any of this: `LiveExecutor.begin_event` only drops stale market decisions and
+never matches resting orders, and the exchange owns the book, hydrated at startup from
+`futures_get_open_orders()` and kept in sync by `ORDER_TRADE_UPDATE`.
 
 ### Position & PnL accounting (`core/domain/status.py`, `trade.py`, `report.py`)
 
@@ -679,16 +686,17 @@ symbol)` lazily creates a flat `PositionState` for a symbol not yet touched, so 
 symbol over that. `SimulatedExecutor.last_close: Dict[str, float]` — **only on the simulated
 executor**, not `Status` and not base `Executor`, because it is a price cache, not account state,
 and only the backtest/dry-run path needs it (live prices come from the exchange).
-`SimulatedExecutor.begin_event` refreshes it from every candle in the event, up front (before
-matching or decisions), and it **persists across events**, so a symbol keeps its last known close
-on events where it has no candle. That persistence is why it can't be replaced by reading the
-event's `candles` dict. Two consumers, both in `SimulatedExecutor`: `begin_event` marks every open
-position to it (that mark, re-applied to a filled symbol at the end of `match_resting`, is the
-event's equity-curve value the recorder reads at step 6), and it is the MARKET fill price of an
+`SimulatedExecutor.begin_event` refreshes each symbol's entry as it processes that symbol (setting
+`last_close[symbol]` right before matching its resting orders), and it **persists across events**,
+so a symbol keeps its last known close on events where it has no candle. That persistence is why it
+can't be replaced by reading the event's `candles` dict. Two consumers, both in
+`SimulatedExecutor`: `begin_event`'s trailing mark-to-close pass marks every open position to it
+(that pass, which re-marks a just-filled symbol from its fill price back to the bar close, produces
+the event's equity-curve value the recorder reads at step 6), and it is the MARKET fill price of an
 action's *target* symbol (which, for a cross-symbol action, is not the symbol whose candle
 triggered the decision). No strategy reads it, and STOP_MARKET trigger direction no longer comes
 from it — `Action.trigger_above` is required and carries it. Live has no equivalent: the base
-`Executor` interface is just `begin_event`/`match_resting`/`force_liquidation`/`submit`, and
+`Executor` interface is just `begin_event`/`force_liquidation`/`submit`, and
 `LiveExecutor` marks nothing — `record_event` reads `status.total_margin()` off the last
 `ACCOUNT_UPDATE`.
 `status.fee_ratio` is the account's fee rate — a `Status` field (default `DEFAULT_FEE_RATIO` in
@@ -791,9 +799,10 @@ straight to `executor.on_user_data(...)`.
     several of our symbols at once. `_order_agg` is keyed by `(symbol, order_id)`, not `order_id`
     alone, since nothing guarantees order IDs are unique across symbols for one account.
   - Resting orders are never simulated here and forced liquidation is never performed — the
-    exchange does both (`match_resting` is a no-op, `force_liquidation` always returns `False`).
-    `status.open_orders` is hydrated at startup from `futures_get_open_orders()` and kept in sync
-    by `ORDER_TRADE_UPDATE` (`NEW` adds, a terminal state removes).
+    exchange does both (`begin_event` only drops stale market decisions and never runs the
+    `match_symbol` path `SimulatedExecutor.begin_event` does; `force_liquidation` always returns
+    `False`). `status.open_orders` is hydrated at startup from `futures_get_open_orders()` and kept
+    in sync by `ORDER_TRADE_UPDATE` (`NEW` adds, a terminal state removes).
   - `reconcile_resumed(saved)` compares a resumed run's remembered positions **and** open orders
     against the exchange's actual ones and warns on any difference — a liquidation/ADL, a manual
     order, or a fill event missed while the process was down. It only reports: live `Status` is

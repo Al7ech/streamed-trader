@@ -47,46 +47,41 @@ class SimulatedExecutor(Executor):
         self._prefix = f"[{log_label}] " if log_label else ""
 
     def begin_event(self, event_time: int, candles: Dict[str, Candle]) -> None:
-        """이 이벤트 캔들로 최근 종가 캐시를 갱신하고, 열린 포지션 전부를 그 종가로 시가평가한다.
+        """이벤트 경계: 최근 종가 갱신 → 미체결 주문 매칭 → 열린 포지션 시가평가.
 
-        시가평가 결과(``unrealised_pnl``)가 곧 이 이벤트의 자본곡선 값이 된다 — 레코더는
-        단계 6에서 ``status.total_margin()``을 읽는다. 이 이벤트에 캔들이 없는 심볼은 직전
-        종가를 그대로 쓴다.
+        **첫 루프** — 이벤트에 캔들이 있는 심볼마다: 최근 종가 캐시를 갱신하고, 곧바로 그
+        심볼의 미체결 주문을 이 캔들로 매칭한다. ``match_symbol``이 제너레이터라 체결은 한
+        건씩 즉시 반영되고, 같은 봉의 뒤쪽 주문은 갱신된 포지션을 본다 (``reduce_only`` clamp가
+        올바르려면 필요하다). 만료 처리는 매칭 **뒤에** 온다 — ``expire_after_candles=N``인
+        주문이 N번째 캔들에서도 체결 기회를 갖도록.
 
-        ``st.positions.items()``를 순회하며 이미 ``pos_state``를 쥐고 있으므로
+        **둘째 루프** — 열린 포지션 **전부**(이번 이벤트에 캔들이 없는 심볼 포함)를 최근
+        종가로 (재)시가평가한다. 이것이 자본곡선 값이 된다 — 레코더는 단계 6에서
+        ``status.total_margin()``을 읽는다. 이 루프는 첫 루프의 체결이 트리거/지정가 기준으로
+        남긴 ``unrealised_pnl``을 봉 종가 기준으로 되돌리는 역할까지 겸한다 (``_fill``은
+        체결가로 시가평가하므로). ``st.positions.items()``로 이미 ``pos_state``를 쥐고 있어
         ``st.update_unrealised_pnl``의 심볼 재조회를 피하고 공식을 인라인한다 — 이벤트·심볼당
         불리므로 조회 한 번이 수백만 회 쌓인다.
+
+        미체결 매칭이 지표 갱신·``decide_action`` **앞**에 있는 이유: 실제 거래소에서는
+        미체결 주문이 봉이 닫히기 전에 체결되므로, 뒤에 두면 전략이 이미 손절된 포지션을 아직
+        들고 있다고 착각한 채 결정하게 된다. 라이브는 거래소가 장부를 소유하므로 이 매칭이
+        없다 (:meth:`~core.engine.executor.Executor.begin_event` 기본 no-op 위의 라이브 override).
         """
         st = self.status
         for symbol, candle in candles.items():
             self.last_close[symbol] = candle.close
+            for order, price, quantity in order_book.match_symbol(
+                    st, symbol, candle, self.slippage_ratio):
+                self._fill(symbol, quantity, price, event_time,
+                           order.order_type.value, order.created_at)
+            for order in order_book.tick_expiry(st, symbol):
+                self.logger.info("%s미체결 주문 만료: %s", self._prefix, order)
         for symbol, pos_state in st.positions.items():
             if pos_state.position != 0.0:
                 price = self.last_close.get(symbol)
                 if price is not None:
                     pos_state.unrealised_pnl = pos_state.position * (price - pos_state.avg_price)
-
-    def match_resting(self, symbol: str, candle: Candle, event_time: int) -> None:
-        """``match_symbol``이 제너레이터라 체결은 한 건씩 즉시 반영되고, 같은 봉의 뒤쪽 주문은
-        갱신된 포지션을 본다 (``reduce_only`` clamp가 올바르려면 필요하다).
-
-        만료 처리는 매칭 **뒤에** 온다 — ``expire_after_candles=N``인 주문이 N번째 캔들에서도
-        체결 기회를 갖도록.
-
-        마지막으로 잔여 포지션을 이벤트 종가로 다시 시가평가한다 — 체결은 트리거/지정가에서
-        일어나 ``unrealised_pnl``이 그 가격 기준으로 남으므로, 자본곡선 값이 봉 종가 기준이
-        되도록 되돌린다 (``begin_event``는 매칭 **전**이라 이걸 못 잡는다).
-        """
-        for order, price, quantity in order_book.match_symbol(
-                self.status, symbol, candle, self.slippage_ratio):
-            self._fill(symbol, quantity, price, event_time,
-                       order.order_type.value, order.created_at)
-        for order in order_book.tick_expiry(self.status, symbol):
-            self.logger.info("%s미체결 주문 만료: %s", self._prefix, order)
-
-        pos = self.status.positions.get(symbol)
-        if pos is not None and pos.position != 0.0:
-            self.status.update_unrealised_pnl(symbol, self.last_close.get(symbol, candle.close))
 
     def force_liquidation(self) -> bool:
         """시가평가 자본이 0 이하로 떨어지면 파산이다. 증거금이 공유 풀이므로 한 심볼이 자본을

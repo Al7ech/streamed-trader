@@ -56,12 +56,10 @@ class Executor(ABC):
         """이벤트 처리 시작 훅. 기본은 아무것도 하지 않는다.
 
         :class:`~core.backtest.simulated_executor.SimulatedExecutor`는 여기서 심볼별 최근
-        종가를 갱신하고 열린 포지션을 시가평가한다 (그 결과가 이벤트의 자본곡선 값이 된다).
-        라이브는 미체결 결정 폐기에만 쓴다 — 자본은 ``ACCOUNT_UPDATE``가 정답이다.
+        종가를 갱신하고, **미체결 주문을 이 이벤트 캔들로 체결시키고**, 열린 포지션을
+        시가평가한다 (그 결과가 이벤트의 자본곡선 값이 된다). 라이브는 미체결 결정 폐기에만
+        쓴다 — 미체결 매칭도 강제청산도 거래소 몫이고, 자본은 ``ACCOUNT_UPDATE``가 정답이다.
         """
-
-    def match_resting(self, symbol: str, candle: Candle, event_time: int) -> None:
-        """미체결 주문을 이 캔들로 체결시킨다. 기본은 아무것도 하지 않는다 (거래소가 채운다)."""
 
     def force_liquidation(self) -> bool:
         """파산이면 장부를 비우고 True. 기본은 항상 False (거래소가 청산한다).
