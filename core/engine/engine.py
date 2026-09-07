@@ -35,7 +35,6 @@ import asyncio
 import logging
 from typing import Awaitable, Callable, Dict, List, Optional
 
-from core.domain.action import Action
 from core.domain.candle import Candle
 from core.domain.report import Report
 from core.engine.candle_producer import CandleProducer
@@ -83,24 +82,28 @@ class TradingEngine:
         "이미 손절된 포지션을 아직 들고 있다"고 착각한 채 결정하게 된다. 그 매칭은
         ``begin_event`` 안에서 일어난다 (백테스트/드라이런은 :class:`SimulatedExecutor`가
         캔들로 판정, 라이브는 거래소 몫이라 no-op).
+
+        **엔진은 파산을 모르고, 파산해도 루프는 안 멈춘다.** 시가평가 자본이 0 이하로
+        떨어졌을 때의 강제청산은 ``begin_event`` 안(백테스트/드라이런 한정)에서 끝난다 —
+        파산은 실행기 내부 상태일 뿐 런을 끝내는 사건이 아니다. 시장은 계속 움직이고 지표도
+        계속 갱신되며 레코더도 그릴 자본곡선이 있다(0에 평평). ``decide_action``은 이후에도
+        매 이벤트 불리지만 flat·소진된 계좌를 받아 낸 액션을 실행기가 버린다. 루프는 프로듀서의
+        데이터가 끝날 때 끝난다.
         """
         st = self.executor.status
 
         # 0-2. 이벤트 경계 훅. 백테스트/드라이런은 실행기가 심볼별 최근 종가를 이 이벤트
         #      캔들로 갱신하고, **미체결 주문을 이 캔들로 체결시키고**, 열린 포지션을 그 종가로
-        #      시가평가한다 — 그 결과가 단계 6에서 레코더가 읽는 자본곡선 값이다. 다른 심볼을
-        #      겨냥한 MARKET 액션의 체결가도 이 종가 캐시에서 정해진다. 라이브는 미체결 결정
-        #      폐기에만 쓴다 (매칭·강제청산 모두 거래소 몫).
+        #      시가평가하고, 자본이 0 이하면 장부를 비우고 전 포지션을 청산한다 — 그 결과가
+        #      단계 6에서 레코더가 읽는 자본곡선 값이다. 다른 심볼을 겨냥한 MARKET 액션의
+        #      체결가도 이 종가 캐시에서 정해진다. 라이브는 미체결 결정 폐기에만 쓴다
+        #      (매칭·강제청산 모두 거래소 몫).
         self.executor.begin_event(event_time, candles)
 
-        # 4. 파산 판정. flat인 심볼도 이 분기를 타는데, 그때는 flatten 액션이 만들어지지 않아
-        #    "파산 후에는 스트리머를 부르지 않는다"가 유지된다. 지표 갱신과 기록은 파산 여부와
-        #    무관하게 계속된다 — 건너뛰는 것은 오직 스트리머의 결정 호출뿐이다.
-        bankrupt = self.executor.force_liquidation()
-
-        # 5. 이 이벤트의 **모든** 심볼 지표를 먼저 갱신한 뒤, decide_action을 이벤트당 한 번
+        # 4. 이 이벤트의 **모든** 심볼 지표를 먼저 갱신한 뒤, decide_action을 이벤트당 한 번
         #    부른다 — 결정 시점에 모든 심볼 지표가 이 캔들까지 반영돼 있어 크로스심볼 결정이
-        #    가능하다. status는 decide_action이 보는 것과 같은 거래 전 스냅샷이다.
+        #    가능하다. status는 decide_action이 보는 것과 같은 거래 전 스냅샷이다. 파산 후에도
+        #    부르지만, 그때 나온 액션은 단계 7에서 실행기가 무시한다.
         for symbol in self.streamer.symbols:
             candle = candles.get(symbol)
             if candle is None:
@@ -108,17 +111,7 @@ class TradingEngine:
             for indicator in self.streamer.indicators.get(symbol, {}).values():
                 indicator.update(candle, st)
 
-        actions: List[Action] = []
-        if bankrupt:
-            # 파산 후에는 스트리머를 부르지 않는다 — 캔들이 마감한 심볼만 flatten한다.
-            for symbol in self.streamer.symbols:
-                if candles.get(symbol) is None:
-                    continue
-                position = st.position_for(symbol).position
-                if position != 0.0:
-                    actions.append(Action(symbol, -position))
-        else:
-            actions = list(self.streamer.decide_action(candles, st))
+        actions = list(self.streamer.decide_action(candles, st))
 
         # 이벤트당 DEBUG 한 줄. isEnabledFor로 감싸는 게 핵심이다 — generate_dict_string은
         # 전 지표를 순회하며 get_latest()를 부르는데, 인자로 넘기면 DEBUG가 꺼져 있어도

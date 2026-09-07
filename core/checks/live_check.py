@@ -539,7 +539,6 @@ async def check_live_executor():
     ex.begin_event(2, {SYM: Candle(1, 1, 1, 1, 1, 0, MIN)})
     check("executor: 미체결 주문을 시뮬레이션하지 않는다",
           not trades and ex.status.total_open_orders() == 1)
-    check("executor: 강제청산은 거래소 몫", ex.force_liquidation() is False)
 
     ex, _, _, _ = await make_live_executor()
     ex.submit(Action(SYM, 1.0), event_time=1)

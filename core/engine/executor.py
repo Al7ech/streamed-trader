@@ -57,16 +57,13 @@ class Executor(ABC):
 
         :class:`~core.backtest.simulated_executor.SimulatedExecutor`는 여기서 심볼별 최근
         종가를 갱신하고, **미체결 주문을 이 이벤트 캔들로 체결시키고**, 열린 포지션을
-        시가평가한다 (그 결과가 이벤트의 자본곡선 값이 된다). 라이브는 미체결 결정 폐기에만
-        쓴다 — 미체결 매칭도 강제청산도 거래소 몫이고, 자본은 ``ACCOUNT_UPDATE``가 정답이다.
-        """
+        시가평가하고, 시가평가 자본이 0 이하면 장부를 비우고 전 포지션을 강제청산한다 (그
+        결과가 이벤트의 자본곡선 값이 된다). 라이브는 미체결 결정 폐기에만 쓴다 — 미체결
+        매칭도 강제청산도 거래소 몫이고, 자본은 ``ACCOUNT_UPDATE``가 정답이다.
 
-    def force_liquidation(self) -> bool:
-        """파산이면 장부를 비우고 True. 기본은 항상 False (거래소가 청산한다).
-
-        자본은 구현이 ``self.status.total_margin()``으로 직접 잰다 — 엔진이 넘겨주지 않는다.
+        파산은 캔들로만 판정되는 백테스트 고유 개념이라 이 포트에 등장하지 않는다 —
+        엔진은 파산을 모르고, 강제청산은 위 구현체가 자기 ``begin_event`` 안에서 끝낸다.
         """
-        return False
 
     @abstractmethod
     def submit(self, action: Action, event_time: int) -> None:

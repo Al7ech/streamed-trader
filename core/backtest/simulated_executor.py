@@ -45,9 +45,12 @@ class SimulatedExecutor(Executor):
         #: 미체결 주문 제출 순서. 같은 봉 안의 체결 순서를 결정적으로 만든다.
         self._order_seq = 0
         self._prefix = f"[{log_label}] " if log_label else ""
+        #: 파산해 강제청산이 걸렸는지. 한 번 잠기면 이후 이벤트의 액션은 :meth:`submit`에서
+        #: 전부 무시된다 — 죽은 계좌는 다시 매매하지 않는다. 엔진은 이 플래그를 모른다.
+        self._bankrupt = False
 
     def begin_event(self, event_time: int, candles: Dict[str, Candle]) -> None:
-        """이벤트 경계: 최근 종가 갱신 → 미체결 주문 매칭 → 열린 포지션 시가평가.
+        """이벤트 경계: 최근 종가 갱신 → 미체결 주문 매칭 → 열린 포지션 시가평가 → 파산 판정.
 
         **첫 루프** — 이벤트에 캔들이 있는 심볼마다: 최근 종가 캐시를 갱신하고, 곧바로 그
         심볼의 미체결 주문을 이 캔들로 매칭한다. ``match_symbol``이 제너레이터라 체결은 한
@@ -67,6 +70,11 @@ class SimulatedExecutor(Executor):
         미체결 주문이 봉이 닫히기 전에 체결되므로, 뒤에 두면 전략이 이미 손절된 포지션을 아직
         들고 있다고 착각한 채 결정하게 된다. 라이브는 거래소가 장부를 소유하므로 이 매칭이
         없다 (:meth:`~core.engine.executor.Executor.begin_event` 기본 no-op 위의 라이브 override).
+
+        **파산 판정**도 여기 있다 — 시가평가 자본이 0 이하면 :meth:`_liquidate`로 장부를
+        비우고 전 포지션을 청산한다. 파산은 이 실행기 내부 상태일 뿐 런을 끝내지 않는다:
+        엔진은 파산을 모르고 루프도 안 멈춘다. ``decide_action``은 이후에도 불리지만 낸
+        액션을 :meth:`submit`이 버린다. 라이브는 강제청산도 거래소 몫이라 이 판정이 없다.
         """
         st = self.status
         for symbol, candle in candles.items():
@@ -82,27 +90,41 @@ class SimulatedExecutor(Executor):
                 price = self.last_close.get(symbol)
                 if price is not None:
                     pos_state.unrealised_pnl = pos_state.position * (price - pos_state.avg_price)
+        if not self._bankrupt and st.total_margin() <= 0.0:
+            self._liquidate(event_time)
 
-    def force_liquidation(self) -> bool:
-        """시가평가 자본이 0 이하로 떨어지면 파산이다. 증거금이 공유 풀이므로 한 심볼이 자본을
-        다 태우면 나머지 심볼도 전부 청산된다 (flatten 액션은 엔진이 만든다).
-
-        장부를 여기서 비우지 않으면 파산 후에도 손절 주문이 남아, flat이 된 계좌에 나중에 유령
-        포지션을 여는 체결이 생긴다.
+    def _liquidate(self, event_time: int) -> None:
+        """시가평가 자본이 0 이하 — 파산이다. 증거금이 공유 풀이라 한 심볼이 자본을 다 태우면
+        나머지 심볼도 전부 청산된다: 장부를 비우고(``cancel_all``) 열린 포지션을 전부 최근
+        종가로 flatten한다. 장부를 비우지 않으면 flat이 된 계좌에 나중에 손절 주문이 유령
+        포지션을 연다. ``_bankrupt``가 잠겨 이후 이벤트의 액션은 :meth:`submit`에서 전부
+        무시된다 — 죽은 계좌는 다시 매매하지 않는다.
         """
-        if self.status.total_margin() > 0.0:
-            return False
+        self._bankrupt = True
         cancelled = order_book.cancel_all(self.status)
         if cancelled:
-            self.logger.warning("강제청산: 미체결 주문 %d건을 취소한다", len(cancelled))
-        return True
+            self.logger.warning("%s강제청산: 미체결 주문 %d건을 취소한다", self._prefix,
+                                len(cancelled))
+        for symbol, pos_state in list(self.status.positions.items()):
+            if pos_state.position == 0.0:
+                continue
+            price = self.last_close.get(symbol)
+            if price is not None:
+                self._fill(symbol, -pos_state.position, price, event_time,
+                           ActionType.MARKET.value, event_time)
 
     def submit(self, action: Action, event_time: int) -> None:
         """가상 실행기는 즉시 체결하거나 장부에 올린다 — 반환값이 없다.
 
+        파산한 계좌는 아무것도 하지 않는다: ``begin_event``의 강제청산이 ``_bankrupt``를
+        잠근 뒤로는 이벤트마다 ``decide_action``이 계속 불려도 그 액션을 여기서 버린다.
+
         장부 조작(취소/등록)이 수량 검사보다 **먼저**다: CANCEL은 quantity가 0이라 뒤에 두면
         조용히 사라진다.
         """
+        if self._bankrupt:
+            return None
+
         if action.order_type is ActionType.CANCEL:
             cancelled = order_book.cancel_orders(self.status, action.symbol, action.client_id)
             if cancelled:

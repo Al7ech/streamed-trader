@@ -282,11 +282,10 @@ implements one method, `__aiter__` — nothing else in the codebase has to know 
 `process_event(event_time, candles)` — the contract every mode goes through:
 
 ```
-0-2. executor.begin_event()        # sim: per symbol with a candle — refresh last_close + match resting orders (fills happen here) + tick expiry; then mark every open position (incl. symbols with no candle this event) to its last_close, which also re-marks a just-filled symbol from its fill price back to the bar close. live: drop unmatched market decisions from the last candle (no matching — the exchange fills resting orders)
-4. executor.force_liquidation()    # sim: status.total_margin() <= 0 -> cancel_all + flatten every symbol; live: always False
-5. update every symbol's indicators, then one streamer.decide_action(candles, status) for the whole event (engine flattens each symbol itself if bankrupt — decide_action is not called)
+0-2. executor.begin_event()        # sim: per symbol with a candle — refresh last_close + match resting orders (fills happen here) + tick expiry; then mark every open position (incl. symbols with no candle this event) to its last_close, which also re-marks a just-filled symbol from its fill price back to the bar close; then if status.total_margin() <= 0 -> cancel_all + flatten every open position at last_close and latch _bankrupt. live: drop unmatched market decisions from the last candle (no matching, no bankruptcy check — the exchange fills resting orders and liquidates)
+4. update every symbol's indicators, then one streamer.decide_action(candles, status) for the whole event (still called after bankruptcy — the executor just discards the resulting actions)
 6. recorder.record_event()         # the recorder reads status.total_margin() itself for the equity point
-7. per action: executor.submit()   # sim: CANCEL/register/fill in list order; live: fire the order, return
+7. per action: executor.submit()   # sim: CANCEL/register/fill in list order, or no-op once _bankrupt is latched; live: fire the order, return
 8. recorder.end_event()
 ```
 
@@ -294,7 +293,8 @@ Resting-order matching happens inside `begin_event`, ahead of `decide_action`, b
 exchange a resting order fills before the bar closes — put it after and the strategy decides while
 believing it still holds a position its stop already closed. The engine no longer drives a
 per-symbol match loop; `SimulatedExecutor.begin_event` folds the whole thing (`match_symbol` ->
-`_fill` -> `tick_expiry`, then the mark-to-close pass) into one method, and its per-symbol
+`_fill` -> `tick_expiry`, the mark-to-close pass, then the bankruptcy check) into one method, and
+its per-symbol
 iteration order is the `candles` dict's (alphabetical by symbol from the merge heap tiebreak), not
 `streamer.symbols` — fill price/quantity/realised PnL are independent of cross-symbol order, though
 in a multi-symbol event where two symbols both fill resting orders the `Trade.prev_status`/`leverage`
@@ -656,7 +656,16 @@ Assumptions that a candle cannot verify, all deliberate:
   one. Fills apply one at a time (`match_symbol` is a generator, and the caller applies each fill
   before the next is produced), so later orders in the same candle see the updated position.
 - **Forced liquidation cancels the whole book** (`cancel_all`) along with flattening every symbol;
-  otherwise a stop left resting would open a ghost position on a bankrupt account.
+  otherwise a stop left resting would open a ghost position on a bankrupt account. It runs at the
+  tail of `SimulatedExecutor.begin_event` (`status.total_margin() <= 0`), flattens every open
+  position at its `last_close`, and latches `_bankrupt` so every later `submit` is a no-op. That
+  latch is the whole mechanism: **the run is not stopped**. Bankruptcy is executor-internal state,
+  not a run-ending event — the market still moves, indicators still update, and the recorder still
+  has an equity curve to draw (flat at zero to the end of the producer's data), so every component
+  keeps doing its plain job and the engine never learns a run went bankrupt. `decide_action` is
+  still called each event; the strategy just sees a flat, spent account and its actions are
+  discarded. Live has no equivalent: the exchange liquidates, and `LiveExecutor.begin_event` runs
+  no such check.
 
 **Where matching sits in the event** is inside `SimulatedExecutor.begin_event`, at the top of
 `TradingEngine.process_event` (see "The trading engine" above) — ahead of `decide_action`, because
@@ -696,7 +705,7 @@ the event's equity-curve value the recorder reads at step 6), and it is the MARK
 action's *target* symbol (which, for a cross-symbol action, is not the symbol whose candle
 triggered the decision). No strategy reads it, and STOP_MARKET trigger direction no longer comes
 from it — `Action.trigger_above` is required and carries it. Live has no equivalent: the base
-`Executor` interface is just `begin_event`/`force_liquidation`/`submit`, and
+`Executor` interface is just `begin_event`/`submit`, and
 `LiveExecutor` marks nothing — `record_event` reads `status.total_margin()` off the last
 `ACCOUNT_UPDATE`.
 `status.fee_ratio` is the account's fee rate — a `Status` field (default `DEFAULT_FEE_RATIO` in
@@ -799,9 +808,9 @@ straight to `executor.on_user_data(...)`.
     several of our symbols at once. `_order_agg` is keyed by `(symbol, order_id)`, not `order_id`
     alone, since nothing guarantees order IDs are unique across symbols for one account.
   - Resting orders are never simulated here and forced liquidation is never performed — the
-    exchange does both (`begin_event` only drops stale market decisions and never runs the
-    `match_symbol` path `SimulatedExecutor.begin_event` does; `force_liquidation` always returns
-    `False`). `status.open_orders` is hydrated at startup from `futures_get_open_orders()` and kept
+    exchange does both (`begin_event` only drops stale market decisions; it never runs the
+    `match_symbol` path or the `total_margin() <= 0` bankruptcy check `SimulatedExecutor.begin_event`
+    does). `status.open_orders` is hydrated at startup from `futures_get_open_orders()` and kept
     in sync by `ORDER_TRADE_UPDATE` (`NEW` adds, a terminal state removes).
   - `reconcile_resumed(saved)` compares a resumed run's remembered positions **and** open orders
     against the exchange's actual ones and warns on any difference — a liquidation/ADL, a manual
