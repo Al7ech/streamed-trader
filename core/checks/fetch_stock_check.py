@@ -14,10 +14,10 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 from dotenv import load_dotenv
 
-from core.backtest import DEFAULT_INIT_MARGIN
-from core.backtest.in_memory_candle_producer import InMemoryCandleProducer
-from core.backtest.recorder import BacktestRecorder
-from core.backtest.simulated_executor import SimulatedExecutor
+from core.executor.simulated import DEFAULT_INIT_MARGIN
+from core.producer.in_memory import InMemoryCandleProducer
+from core.recorder.backtest import BacktestRecorder
+from core.executor.simulated import SimulatedExecutor
 from core.engine.engine import TradingEngine
 from core.fetcher.stock import nyse_session
 from core.fetcher.stock.massive_fetcher import MassiveStockFetcher

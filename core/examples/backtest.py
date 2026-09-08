@@ -1,10 +1,10 @@
 import sys
 from datetime import datetime, timezone
 
-from core.backtest import DEFAULT_INIT_MARGIN
-from core.backtest.historical_candle_producer import BinanceHistoricalCandleProducer
-from core.backtest.recorder import BacktestRecorder
-from core.backtest.simulated_executor import SimulatedExecutor
+from core.executor.simulated import DEFAULT_INIT_MARGIN
+from core.producer.historical import BinanceHistoricalCandleProducer
+from core.recorder.backtest import BacktestRecorder
+from core.executor.simulated import SimulatedExecutor
 from core.engine.engine import TradingEngine
 from core.logging_config import setup_logging
 from core.streamer.strategies.keltner_streamer import KeltnerStreamer

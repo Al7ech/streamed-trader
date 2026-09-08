@@ -2,9 +2,9 @@
 
 드라이런은 백테스트와 대조하기 위해 존재한다. 그래서 체결 규칙·회계·미체결 장부가 한 벌이어야
 하고, 여기가 그 한 벌이다 (:mod:`core.checks.live_check`가 "드라이런 == 백테스트"를 실제로
-검증한다). 체결 판정 규칙 자체는 :mod:`core.domain.order_book`에 있다.
+검증한다). 체결 판정 규칙 자체는 :mod:`core.order.order_book`에 있다.
 
-라이브 패키지(:mod:`core.live.trader`)가 드라이런 모드에서 이 클래스를 import한다 — 계층상
+라이브 패키지(:mod:`core.trader.trader`)가 드라이런 모드에서 이 클래스를 import한다 — 계층상
 거꾸로 보이지만, "드라이런은 백테스트 코드를 그대로 돌린다"는 불변식을 import 한 줄로 드러내는
 것이 의도다.
 """
@@ -12,12 +12,15 @@
 import copy
 from typing import Callable, Dict, Optional
 
-from core.domain import order_book
-from core.domain.action import Action, ActionType
-from core.domain.candle import Candle
-from core.domain.status import DEFAULT_FEE_RATIO, Status
-from core.domain.trade import Trade
-from core.engine.executor import Executor
+from core.order import order_book
+from core.order.action import Action, ActionType
+from core.candle.candle import Candle
+from core.account.status import DEFAULT_FEE_RATIO, Status
+from core.account.trade import Trade
+from core.executor.base import Executor
+
+#: 백테스트의 기본 초기 증거금. 수익률의 기준선이 되는 값이라 한 곳에 둔다.
+DEFAULT_INIT_MARGIN = 100_000.0
 
 
 class SimulatedExecutor(Executor):
@@ -69,7 +72,7 @@ class SimulatedExecutor(Executor):
         미체결 매칭이 지표 갱신·``decide_action`` **앞**에 있는 이유: 실제 거래소에서는
         미체결 주문이 봉이 닫히기 전에 체결되므로, 뒤에 두면 전략이 이미 손절된 포지션을 아직
         들고 있다고 착각한 채 결정하게 된다. 라이브는 거래소가 장부를 소유하므로 이 매칭이
-        없다 (:meth:`~core.engine.executor.Executor.begin_event` 기본 no-op 위의 라이브 override).
+        없다 (:meth:`~core.executor.base.Executor.begin_event` 기본 no-op 위의 라이브 override).
 
         **파산 판정**도 여기 있다 — 시가평가 자본이 0 이하면 :meth:`_liquidate`로 장부를
         비우고 전 포지션을 청산한다. 파산은 이 실행기 내부 상태일 뿐 런을 끝내지 않는다:

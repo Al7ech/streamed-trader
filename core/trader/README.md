@@ -1,4 +1,4 @@
-# Live package (`core/live/`)
+# Trader package (`core/trader/`)
 
 Live Binance USD-M Futures trading: it feeds closed candles from a websocket into the same
 `BaseStreamer` you backtested, and executes the resulting `Action`s.
@@ -18,7 +18,7 @@ This package supplies the live implementations of the three pluggable pieces aro
 | live | `LiveCandleProducer` | `LiveExecutor` | `LiveRecorder` |
 
 Dry run and backtest use **literally the same executor class** — this package imports
-`SimulatedExecutor` out of `core/backtest/`. Dry run exists to be compared against a backtest, so
+`SimulatedExecutor` out of `core/executor/simulated.py`. Dry run exists to be compared against a backtest, so
 the fill rules, accounting and resting-order book must be one copy, not two that happen to agree.
 `core/checks/live_check.py` asserts that a dry run and a backtest of the same candles produce
 identical trades.
@@ -164,7 +164,7 @@ full `core.*` path.
 import asyncio
 
 from core.streamer.strategies.keltner_streamer import KeltnerStreamer
-from core.live.trader import BinanceTrader
+from core.trader.trader import BinanceTrader
 
 streamer = KeltnerStreamer(["ETHUSDT", "BTCUSDT"], window=20 * 60, m_entry=2.0, m_exit=0.0,
                            max_loss=0.08)

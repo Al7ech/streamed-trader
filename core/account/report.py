@@ -1,7 +1,7 @@
 from typing import List, Optional, Tuple
 
-from core.domain.status import Status
-from core.domain.trade import Trade
+from core.account.status import Status
+from core.account.trade import Trade
 
 
 class Report:

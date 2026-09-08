@@ -2,8 +2,8 @@ from abc import ABC, abstractmethod
 from collections import deque
 from typing import Optional
 
-from core.domain.candle import Candle
-from core.domain.status import Status
+from core.candle.candle import Candle
+from core.account.status import Status
 
 
 class BaseIndicator(ABC):

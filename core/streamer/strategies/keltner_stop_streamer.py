@@ -1,9 +1,9 @@
 import logging
 from typing import List
 
-from core.domain.action import Action, ActionType
-from core.domain.candle import Candle
-from core.domain.status import Status
+from core.order.action import Action, ActionType
+from core.candle.candle import Candle
+from core.account.status import Status
 from core.streamer.strategies.keltner_streamer import KeltnerStreamer
 from core.utils import trunc_by_sign
 

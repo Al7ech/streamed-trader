@@ -3,9 +3,9 @@
 엔진은 이벤트 하나가 끝날 때마다 :meth:`Recorder.record_event`를, 체결이 날 때마다
 :meth:`Recorder.record_trade`를 부른다. 무엇을 어디에 남길지는 전부 구현체가 정한다:
 
-- :class:`~core.backtest.recorder.BacktestRecorder` — 메모리에 모았다가 ``Report``를 만들고,
+- :class:`~core.recorder.backtest.BacktestRecorder` — 메모리에 모았다가 ``Report``를 만들고,
   선택적으로 샤드를 쓴다.
-- :class:`~core.live.recorder.LiveRecorder` — 주기적으로 체크포인트를 남기고 재기동 시
+- :class:`~core.recorder.live.LiveRecorder` — 주기적으로 체크포인트를 남기고 재기동 시
   이어쓴다.
 
 지표 값은 인자로 받지 않고 **레코더가 직접 읽는다** (``streamer.indicators``). 필요 없는
@@ -16,9 +16,9 @@
 from abc import ABC, abstractmethod
 from typing import Dict, Optional
 
-from core.domain.candle import Candle
-from core.domain.report import Report
-from core.domain.trade import Trade
+from core.candle.candle import Candle
+from core.account.report import Report
+from core.account.trade import Trade
 
 
 class Recorder(ABC):
@@ -58,7 +58,7 @@ class Recorder(ABC):
 
         :meth:`~core.engine.engine.TradingEngine.run` / ``run_async``가 이것을 그대로
         돌려주므로, 백테스트처럼 결과를 메모리로 받아야 하는 쪽은
-        (:class:`~core.backtest.recorder.BacktestRecorder`) 이 프로퍼티를 오버라이드한다.
+        (:class:`~core.recorder.backtest.BacktestRecorder`) 이 프로퍼티를 오버라이드한다.
         라이브 레코더처럼 파일로만 남기는 구현은 ``None``인 채로 둔다.
         """
         return None

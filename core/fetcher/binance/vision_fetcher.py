@@ -11,7 +11,7 @@ from typing import List, Optional, Tuple
 import requests
 from tqdm import tqdm
 
-from core.domain import Candle
+from core.candle.candle import Candle
 from core.fetcher.binance.rest_fetcher import BinanceCandleFetcher
 from core.utils import ensure_utc, ms_timestamp_to_datetime
 

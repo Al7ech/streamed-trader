@@ -2,7 +2,7 @@
 
 ``start/end/symbols/interval``만 받아 **내부에서 fetcher로 심볼별 캔들을 불러오고** 하나의
 이벤트 타임라인으로 병합해 내준다. 병합/이터레이션 로직은
-:class:`~core.backtest.in_memory_candle_producer.InMemoryCandleProducer`를 그대로 상속한다 —
+:class:`~core.producer.in_memory.InMemoryCandleProducer`를 그대로 상속한다 —
 이 클래스가 더하는 건 "캔들이 어디서 오는가"뿐이다.
 
 ``LiveCandleProducer``가 웹소켓을 자기 안에 들고 있는 것과 대칭이다: 백테스트 캔들 소스도
@@ -17,8 +17,8 @@ producer 안으로 들어온다.
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from core.backtest.in_memory_candle_producer import InMemoryCandleProducer
-from core.domain.candle import Candle
+from core.producer.in_memory import InMemoryCandleProducer
+from core.candle.candle import Candle
 from core.fetcher.binance.rest_fetcher import BinanceCandleFetcher
 from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
 from core.utils import interval_to_minutes

@@ -1,9 +1,9 @@
 import logging
 from typing import Dict, List
 
-from core.domain.action import Action
-from core.domain.candle import Candle
-from core.domain.status import Status
+from core.order.action import Action
+from core.candle.candle import Candle
+from core.account.status import Status
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.indicator.atr import ATRIndicator
 from core.streamer.indicator.pivot_trendline import PivotTrendlineIndicator

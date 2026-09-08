@@ -17,8 +17,9 @@
 마무리(``recorder.close()``)는 엔진이 한다. 지표 워밍업(:meth:`TradingEngine.warmup_from`)도
 엔진이 갖지만 루프 밖의 별개 단계다 — 캔들 소스가 본 공급자와 다르고, 라이브는 소켓을 열기
 전에 끝내야 하기 때문이다. 예전에는 이 배선이 진입점마다 손으로
-반복됐다. 실행기와 레코더의 **구현체**는 여전히 :mod:`core.backtest`/:mod:`core.live`에
-있고 엔진은 그 어느 쪽도 import하지 않는다 — 만들어 넘기는 것은 호출자다.
+반복됐다. 실행기와 레코더의 **구현체**는 각 포트 패키지(:mod:`core.executor`,
+:mod:`core.recorder`)에 있고 엔진은 각 포트의 ``base`` ABC만 import한다 — 만들어 넘기는 것은
+호출자다.
 
 **엔진은 완전히 동기다.** ``process_event``는 평범한 메서드고, 액션을 실행기에 넘기면 그걸로
 끝이다 — 결과를 기다리지 않는다. 세 모드 모두 유일한 드라이버 :meth:`run_async`를 지나가고
@@ -26,7 +27,7 @@
 으로 감싼 :meth:`run`이 따로 있다 (백테스트가 쓴다). ``run_async``만이 ``process_event`` 안에서
 터진 예외를 ``on_error``로 넘긴다.
 
-라이브에서 주문 제출은 :class:`~core.live.executor.LiveExecutor` 안에서 fire-and-forget이다.
+라이브에서 주문 제출은 :class:`~core.executor.live.LiveExecutor` 안에서 fire-and-forget이다.
 예전의 "주문 N의 결과를 확인한 뒤 N+1을 보낸다"는 보장은 **의도적으로 없앴다** — 라이브 ``status``
 는 거래소가 정답이라(유저 데이터 스트림이 이벤트 밖에서 갱신한다) 누락된 주문은 다음 캔들에 스스로
 복구된다. 그 대신 한 이벤트 안 액션들의 실행 순서도 라이브에서는 보장되지 않는다 (백테스트/드라이런
@@ -37,10 +38,10 @@ import asyncio
 import logging
 from typing import Awaitable, Callable, Dict, Optional
 
-from core.domain.report import Report
-from core.engine.candle_producer import CandleProducer, Event
-from core.engine.executor import Executor
-from core.engine.recorder import NullRecorder, Recorder
+from core.account.report import Report
+from core.producer.base import CandleProducer, Event
+from core.executor.base import Executor
+from core.recorder.base import NullRecorder, Recorder
 from core.streamer import BaseStreamer
 from core.utils import generate_dict_string
 
@@ -50,7 +51,7 @@ class TradingEngine:
 
     :param producer: 캔들 공급자. 지표 워밍업용 과거 캔들은 여기서 나오지 않는다 —
         그건 별도의 공급자를 :meth:`warmup_from`에 넘긴다.
-    :param recorder: None이면 :class:`~core.engine.recorder.NullRecorder` — 기록이 꺼진
+    :param recorder: None이면 :class:`~core.recorder.base.NullRecorder` — 기록이 꺼진
         라이브 실행처럼 엔진은 돌려야 하지만 적재할 필요가 없을 때다.
     :param on_error: 주면 한 이벤트의 처리 실패가 루프를 끝내지 않고 여기로 넘어간다.
         None이면 그대로 올라간다 (:meth:`run_async` 참고).
@@ -157,7 +158,7 @@ class TradingEngine:
         워밍업 소스가 본 공급자와 **다른 객체**라는 것이 이 메서드의 전제다: 라이브는 REST로
         과거 구간을 받아오는 ``BinanceHistoricalCandleProducer``를 넘기고 본 공급자는
         웹소켓이다. 그래서 마지막으로 먹인 지점을
-        :meth:`~core.engine.candle_producer.CandleProducer.resume_after`로 이어 준다 —
+        :meth:`~core.producer.base.CandleProducer.resume_after`로 이어 준다 —
         그게 없으면 워밍업이 먹은 캔들이 실시간으로 한 번 더 들어오거나(주문 이중 발행) 그
         사이 구멍이 조용히 지나간다.
 

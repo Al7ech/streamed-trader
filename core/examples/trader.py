@@ -11,7 +11,7 @@ import os
 
 from dotenv import load_dotenv
 
-from core.live.trader import BinanceTrader
+from core.trader.trader import BinanceTrader
 from core.logging_config import setup_logging
 from core.streamer.strategies.keltner_streamer import KeltnerStreamer
 

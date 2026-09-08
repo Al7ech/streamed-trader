@@ -23,12 +23,12 @@ import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from core.domain import Candle
-from core.domain import order_book
-from core.domain.report import Report
-from core.domain.status import PositionState, Status
-from core.domain.trade import Trade
-from core.engine.recorder import Recorder
+from core.candle.candle import Candle
+from core.order import order_book
+from core.account.report import Report
+from core.account.status import PositionState, Status
+from core.account.trade import Trade
+from core.recorder.base import Recorder
 from core.result.indicator_columns import collect_indicator_columns
 from core.result.metrics import build_multi_symbol_buy_and_hold_curve
 from core.result.writer import SCHEMA_VERSION, ShardWriter, read_shard, write_run_json

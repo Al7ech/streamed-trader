@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
-from core.domain.status import Status
+from core.account.status import Status
 
 
 @dataclass

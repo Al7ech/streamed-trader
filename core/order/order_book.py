@@ -20,9 +20,9 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Tuple
 
-from core.domain.action import Action, ActionType
-from core.domain.candle import Candle
-from core.domain.status import Status
+from core.order.action import Action, ActionType
+from core.candle.candle import Candle
+from core.account.status import Status
 
 
 logger = logging.getLogger(__name__)

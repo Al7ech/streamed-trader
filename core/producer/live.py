@@ -3,7 +3,7 @@
 바이낸스 선물 kline 웹소켓에서 마감 캔들을 받아 :class:`~core.engine.engine.TradingEngine`이
 소비할 이벤트로 내준다. 실시간 캔들 소스에 관한 모든 것 — 소켓 연결/수신, 심볼별 연속성
 판정, 구멍 백필 — 이 여기 모여 있다. 지표 워밍업용 과거 캔들은 여기 없다: 그건 별개의
-공급자(:class:`~core.backtest.historical_candle_producer.BinanceHistoricalCandleProducer`)가
+공급자(:class:`~core.producer.historical.BinanceHistoricalCandleProducer`)가
 내주고, 어디까지 먹였는지만 :meth:`LiveCandleProducer.resume_after`로 넘어온다.
 
 라이브는 심볼을 병합하지 않는다. 각 심볼의 캔들이 도착하는 즉시 **키 하나짜리 이벤트**로
@@ -24,10 +24,10 @@ from typing import AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 from binance.enums import ContractType
 
-from core.domain.candle import Candle
-from core.engine.candle_producer import CandleProducer, Event
+from core.candle.candle import Candle
+from core.producer.base import CandleProducer, Event
 from core.fetcher.binance.rest_fetcher import BinanceCandleFetcher
-from core.live.reliable_websocket import ReliableWebsocket
+from core.producer.reliable_websocket import ReliableWebsocket
 from core.utils import interval_to_minutes, ms_timestamp_to_datetime
 
 #: 한 번에 백필할 수 있는 캔들 수의 상한. 이걸 넘으면 재기동으로 복구하는 편이 안전하다 —

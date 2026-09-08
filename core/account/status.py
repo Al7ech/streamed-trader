@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # 런타임 임포트는 순환을 만든다 (order_book이 Status를 쓴다)
-    from core.domain.order_book import OpenOrder
+    from core.order.order_book import OpenOrder
 
 #: 계좌 수수료율의 기본값. 실제로는 거래소가 VIP/커미션 티어로 정하는 계좌 속성이라
 #: ``Status``에 얹혀 있고, 실행기가 자기 생성 경로에서 이 값을 채운다 —

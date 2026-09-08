@@ -1,6 +1,6 @@
 """실제 거래소에 주문을 내고 계좌 상태를 거래소 값으로 유지하는 실행기.
 
-:class:`~core.backtest.simulated_executor.SimulatedExecutor`와 대비되는 지점이 이 모듈의 요점이다:
+:class:`~core.executor.simulated.SimulatedExecutor`와 대비되는 지점이 이 모듈의 요점이다:
 
 - **체결이 비동기로 도착한다.** ``submit``은 주문을 fire-and-forget으로 보내고 곧바로 돌아온다
   (반환값 없음). 실제 체결은 나중에 유저 데이터 스트림(``ORDER_TRADE_UPDATE``)으로 오고, 그때
@@ -22,7 +22,7 @@
   거래소 응답의 해석은 :func:`build_status`/:func:`order_from_exchange`라는 순수 함수에 있어
   클라이언트 없이도 검증할 수 있다.
 
-유저 데이터 소켓의 **수명주기**는 :class:`~core.live.trader.BinanceTrader`가 들고
+유저 데이터 소켓의 **수명주기**는 :class:`~core.trader.trader.BinanceTrader`가 들고
 있고, 받은 메시지만 :meth:`LiveExecutor.on_user_data`로 넘어온다.
 """
 
@@ -35,14 +35,14 @@ from typing import Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from binance import AsyncClient
 
-from core.domain import order_book
-from core.domain.action import Action, ActionType
-from core.domain.candle import Candle
-from core.domain.order_book import OpenOrder
-from core.domain.status import DEFAULT_FEE_RATIO, Status
-from core.domain.trade import Trade
-from core.engine.executor import Executor
-from core.live.binance_order_client import BinanceOrderClient, OrderResult
+from core.order import order_book
+from core.order.action import Action, ActionType
+from core.candle.candle import Candle
+from core.order.order_book import OpenOrder
+from core.account.status import DEFAULT_FEE_RATIO, Status
+from core.account.trade import Trade
+from core.executor.base import Executor
+from core.executor.binance_order_client import BinanceOrderClient, OrderResult
 
 #: 선물 정산(마진) 자산 후보. 심볼에서 접미사로 떼어내 잔고 항목을 찾는다.
 #: 긴 것부터 검사해야 USDT/USDC 같은 4자리가 USD류 접두와 헷갈리지 않는다.

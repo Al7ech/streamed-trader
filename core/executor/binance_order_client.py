@@ -1,8 +1,8 @@
 """
 BinanceOrderClient: Multi-threaded futures order execution module for the StreamedTrader project.
 
-This is the **low-level REST order client** that :class:`~core.live.executor.LiveExecutor`
-delegates to. It deliberately does *not* implement the :class:`~core.engine.executor.Executor`
+This is the **low-level REST order client** that :class:`~core.executor.live.LiveExecutor`
+delegates to. It deliberately does *not* implement the :class:`~core.executor.base.Executor`
 port — it knows nothing about ``Status``, events or the trading engine, only how to put an
 order on the exchange and retry it. (It was named ``BinanceExecutor`` until 2026-09, which read
 as if it belonged to the ``Executor``/``LiveExecutor`` family; it never did.)
@@ -25,7 +25,7 @@ from typing import Optional, Dict, Any, Union
 from binance import Client
 from binance.exceptions import BinanceAPIException, BinanceOrderException
 
-from core.domain.action import Action, ActionType
+from core.order.action import Action, ActionType
 
 
 class OrderType(Enum):

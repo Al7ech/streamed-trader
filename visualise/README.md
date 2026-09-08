@@ -25,7 +25,7 @@ cd ../core && python backtest.py "my run"
 
 ## What it reads
 
-Everything under `asset/backtest/`, written by `core/backtest/result_writer.py`:
+Everything under `asset/backtest/`, written by `core/result/writer.py` (backtest) and `core/recorder/live.py` (live):
 
 - `<run_id>.json` — metadata, summary metrics, downsampled equity curve, and the full trade list.
 - `<run_id>.<YYYY-MM>.series.json` — one month-bucketed columnar shard per month, holding

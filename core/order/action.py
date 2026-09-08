@@ -11,7 +11,7 @@ _CLIENT_ID_RE = re.compile(r"^[.A-Z:/a-z0-9_-]{1,36}$")
 class ActionType(Enum):
     """Action이 요청하는 주문의 종류.
 
-    ``core.live.binance_order_client.OrderType``과 일부러 분리된 타입이다 — ``core/streamer``와
+    ``core.executor.binance_order_client.OrderType``과 일부러 분리된 타입이다 — ``core/streamer``와
     ``core/backtest``는 python-binance에 의존하지 않아야 하므로, 실행기 쪽에서 이 값을
     거래소 주문 타입으로 매핑한다.
     """

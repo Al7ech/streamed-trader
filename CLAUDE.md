@@ -86,15 +86,16 @@ npm run build
 `[tool.hatch.build.targets.wheel] packages = ["core"]`) makes it installable with `uv sync` (which
 does an editable install of the `core` package into `.venv`). Every module imports its siblings
 with the full absolute path rooted at `core`, e.g. `from core.streamer.strategies.keltner_streamer import
-KeltnerStreamer`, `from core.domain.status import Status` — this resolves via the installed
+KeltnerStreamer`, `from core.account.status import Status` — this resolves via the installed
 package regardless of current working directory, so scripts can be run as `uv run python
 core/<script>.py` from anywhere in the repo (no more cwd-inside-`core/` requirement). The
 distribution name in `pyproject.toml` is `streamed-trader`, but the importable top-level
 package is still `core`.
 
-The two CLI entry points live in `core/examples/` (`backtest.py`, `trader.py`) specifically to
-avoid name collisions with the `core/engine/` and `core/backtest/` packages. Relative imports
-(`from .foo import Bar`) are not used anywhere — everything is the full `core.`-rooted path.
+The two CLI entry points live in `core/examples/` (`backtest.py`, `trader.py`) so that
+`examples/backtest.py` and `examples/trader.py` never shadow the `core/engine/` engine or the
+`core/trader/` package. Relative imports (`from .foo import Bar`) are not used anywhere —
+everything is the full `core.`-rooted path.
 
 Default paths like `BaseCandleFetcher(save_path="../asset/")` and
 `BacktestRecorder(result_path="../asset/")` are relative to the *current working directory*, not the
@@ -103,48 +104,65 @@ launched with cwd = `core/`.
 
 ### Package layout — the dependency direction is the point
 
+Packages are organised **by object/concept**: each of the three engine ports (candle supply,
+execution, recording) is a package holding its ABC (`base.py`) *and* both implementations
+(backtest + live) side by side, because backtest / dry run / live are one domain that differs only
+in which part is plugged in.
+
 ```
 core/
-  domain/     Candle, Action, Status, Trade, Report, order_book (fill rules)
+  candle/     Candle                                     (candle.py)
+  order/      Action/ActionType (action.py) + order_book.py (resting book + fill rules)
+  account/    Status/PositionState (status.py), Trade (trade.py), Report (report.py)
   streamer/   BaseStreamer + indicator/ + strategies/ (the example strategies)
   fetcher/    BaseCandleFetcher + pickle cache; binance/ and stock/ under it
-  engine/     TradingEngine + the three ports: CandleProducer, Executor, Recorder
+  engine/     TradingEngine only (engine.py) — the order-of-operations, nothing else
+  producer/   base.py = CandleProducer ABC + Event; in_memory.py, historical.py, live.py,
+              reliable_websocket.py
+  executor/   base.py = Executor ABC; simulated.py (+ DEFAULT_INIT_MARGIN), live.py,
+              binance_order_client.py
+  recorder/   base.py = Recorder ABC + NullRecorder; backtest.py, live.py
   result/     writer.py (run JSON + shards), metrics.py, indicator_columns.py
-  backtest/   SimulatedExecutor, BacktestRecorder, in-memory + historical candle producers
-  live/       BinanceTrader, LiveCandleProducer/Executor/Recorder, BinanceOrderClient
+  trader/     BinanceTrader (trader.py) — live/dry-run assembly + lifecycle; README.md here
   checks/     live_check.py, fetch_stock_check.py
   examples/   backtest.py, trader.py
   utils/      timestamp/rounding helpers, logging_config.py alongside
 ```
 
 ```
-utils ← domain ← streamer
-              ← fetcher
-              ← engine ← result
-                      ← backtest ← live
+utils ← candle ← order ← account
+              ← producer/base, executor/base, recorder/base   (the port ABCs)
+              ← streamer ← result
+      engine ← {producer,executor,recorder}/base, account, streamer
+      {producer,executor,recorder} impls ← their own base, account, order, candle, fetcher, result
+      trader ← engine, producer, executor, recorder, account, fetcher, streamer
 ```
 
-Three rules hold this together, and a change that breaks one is a design change, not a tidy-up:
+Rules that hold this together — a change that breaks one is a design change, not a tidy-up:
 
-- **`domain/` imports nothing from the repo but `utils/`.** It is the vocabulary all three modes
-  share — an account, a position, a fill, a candle, a resting order. It does not know that an
-  engine, a strategy or an exchange exists. This is why `fetcher/` can produce `Candle`s without
-  importing the strategy framework, which it used to have to do when `Candle` lived under
-  `core/streamer/`.
-- **`engine/` holds the contract, not the implementations.** `TradingEngine` plus the three ABCs.
-  It imports neither `backtest/` nor `live/`. `TradingEngine` wires the parts together and runs
-  them, but it never *constructs* them — the caller does that (`core/examples/backtest.py`,
-  `live/trader.py`), which is exactly what lets the engine stay ignorant of both mode packages.
-  Moving that construction into `engine/` would make `engine ↔ backtest` circular, so it is a
-  design change, not a tidy-up.
-- **`live/` importing `backtest/` is deliberate.** Dry run uses `SimulatedExecutor` — the
-  backtest's own class, not a copy of it — so the import is the invariant made visible. It is the
-  only edge that runs "backwards" and it is acyclic.
+- **`candle/`, `order/`, `account/` import nothing from the repo but `utils/`** (and each other, in
+  that order). They are the vocabulary all three modes share — a candle, an order, a resting book,
+  an account, a position, a fill. They do not know an engine, a strategy or an exchange exists.
+  `order/order_book.py` uses `core.account.status.Status` at runtime and `account/status.py`
+  type-hints `OpenOrder` under `TYPE_CHECKING` only — both always reference the **submodule path**,
+  never the package attribute, or the partially-initialised-package cycle resurfaces.
+- **`engine/` holds only `TradingEngine`.** The three port ABCs live in
+  `producer/base.py` / `executor/base.py` / `recorder/base.py` next to their implementations;
+  `engine/engine.py` imports those `base` modules and no implementation. `TradingEngine` wires the
+  parts and runs them but never *constructs* them — the caller does (`core/examples/backtest.py`,
+  `core/trader/trader.py`) — which is what keeps `engine → port` one-directional.
+- **`trader/` importing both `executor.simulated` and `executor.live` is the point of the split.**
+  Dry run uses `SimulatedExecutor` — the backtest's own class, not a copy — so the two live in one
+  `executor/` package and the old "`live/` imports `backtest/` backwards" edge is gone.
+- **Port `__init__.py` files stay thin** (re-export the ABC only). `live.py` / `binance_order_client.py`
+  pull in python-binance and asyncio; eager-importing them from `producer/__init__.py` or
+  `executor/__init__.py` would drag that into the pure backtest path. Callers import the concrete
+  class from its submodule (`from core.executor.simulated import SimulatedExecutor`).
 
-`BaseIndicator` deliberately stays in `core/streamer/indicator/` rather than moving to `domain/`:
-nothing outside `core/streamer/` imports it (the engine, recorders and `indicator_columns` reach
-indicators only through `streamer.indicators`, duck-typed), and a stateful rolling-window ABC
-carrying a frontend hint (`scale_group`) would blur what `domain/` means.
+`BaseIndicator` deliberately stays in `core/streamer/indicator/`: nothing outside `core/streamer/`
+imports it (the engine, recorders and `indicator_columns` reach indicators only through
+`streamer.indicators`, duck-typed), and a stateful rolling-window ABC carrying a frontend hint
+(`scale_group`) does not belong with the shared value types.
 
 ### Data flow: fetch → cache → backtest → visualise
 
@@ -178,11 +196,11 @@ carrying a frontend hint (`scale_group`) would blur what `domain/` means.
    its `(module path, name)` string, so a relocation makes `pickle.load` raise
    `ModuleNotFoundError` — loudly, since neither `pickle_storage` nor `get_candles_with_cache`
    catches it, so it is a crash rather than a silent multi-GB re-download. The fix is a throwaway
-   migration, not a permanent shim: alias the old path (`sys.modules["core.streamer.candle"] =
-   core.domain.candle`), then load-and-re-save each `.pkl`. `save_to_pickle` is tmp + `os.replace`,
-   so it is atomic per file and the script is safe to interrupt and re-run. That is how the
-   2026-09 `core.streamer.candle` → `core.domain.candle` move was handled, and no compatibility
-   code was left behind.
+   migration, not a permanent shim: alias the old path (`sys.modules["core.domain.candle"] =
+   core.candle.candle`), then load-and-re-save each `.pkl`. `save_to_pickle` is tmp + `os.replace`,
+   so it is atomic per file and the script is safe to interrupt and re-run. That is how both the
+   `core.streamer.candle` → `core.domain.candle` and the later `core.domain.candle` →
+   `core.candle.candle` moves were handled, and no compatibility code was left behind.
 
    Adding a *field* is different: older chunks simply lack it in `__dict__` and `Candle`'s
    class-attribute defaults cover it, so no migration is needed. Only a class **move or rename**
@@ -197,7 +215,7 @@ carrying a frontend hint (`scale_group`) would blur what `domain/` means.
    engine" below):
 
    ```python
-   # DEFAULT_INIT_MARGIN is core.backtest's; the executor builds and owns the Status.
+   # DEFAULT_INIT_MARGIN lives in core.executor.simulated; the executor builds and owns the Status.
    executor = SimulatedExecutor(DEFAULT_INIT_MARGIN, fee_ratio)
    recorder = BacktestRecorder(streamer, executor.status, interval_ms=producer.interval_ms,
                                metadata=metadata, save_series=True)
@@ -205,7 +223,7 @@ carrying a frontend hint (`scale_group`) would blur what `domain/` means.
    ```
 
    `fee_ratio` is a `Status` field the executor sets — `SimulatedExecutor` from its constructor
-   arg (default `DEFAULT_FEE_RATIO` in `core/domain/status.py`), `LiveExecutor.create` from the
+   arg (default `DEFAULT_FEE_RATIO` in `core/account/status.py`), `LiveExecutor.create` from the
    exchange's own taker commission rate (`futures_commission_rate`). Strategies read
    `status.fee_ratio` when sizing, so the fee the account is charged and the fee the strategy
    sized against are one value by construction — the old `resolve_fee_ratio`/`resolve_slippage_ratio`
@@ -213,12 +231,12 @@ carrying a frontend hint (`scale_group`) would blur what `domain/` means.
    simulation modelling knob, not account state; no strategy sizes with it).
 
    It is multi-symbol. The candle source is one of:
-   - `InMemoryCandleProducer(candles_by_symbol)` (`backtest/in_memory_candle_producer.py`) —
+   - `InMemoryCandleProducer(candles_by_symbol)` (`producer/in_memory.py`) —
      `Dict[str, List[Candle]]`, one ragged list per symbol (symbols don't need to start/end at the
      same time), merged by its own `merge_by_end_time` (same module — same `end_time` is one
      event) into one chronological stream of **events**. Used by the check scripts and
      non-Binance sources.
-   - `BinanceHistoricalCandleProducer` (`backtest/historical_candle_producer.py`), which
+   - `BinanceHistoricalCandleProducer` (`producer/historical.py`), which
      subclasses `InMemoryCandleProducer` and fetches the `[start, end)` range itself (default
      fetcher `BinanceVisionFetcher`, injectable; `use_cache=False` bypasses the month-chunk pkl
      cache) before merging. This is what `core/examples/backtest.py` uses — and, with a REST
@@ -247,12 +265,13 @@ Backtest, dry run and live are **one domain**. The order-of-operations exists ex
 
 | | CandleProducer | Executor | Recorder |
 |---|---|---|---|
-| backtest | `backtest.BinanceHistoricalCandleProducer` / `backtest.InMemoryCandleProducer` | `backtest.SimulatedExecutor` | `backtest.BacktestRecorder` |
-| dry run | `live.LiveCandleProducer` | **`backtest.SimulatedExecutor`** | `live.LiveRecorder` |
-| live | `live.LiveCandleProducer` | `live.LiveExecutor` | `live.LiveRecorder` |
+| backtest | `producer.historical.BinanceHistoricalCandleProducer` / `producer.in_memory.InMemoryCandleProducer` | `executor.simulated.SimulatedExecutor` | `recorder.backtest.BacktestRecorder` |
+| dry run | `producer.live.LiveCandleProducer` | **`executor.simulated.SimulatedExecutor`** | `recorder.live.LiveRecorder` |
+| live | `producer.live.LiveCandleProducer` | `executor.live.LiveExecutor` | `recorder.live.LiveRecorder` |
 
-`core/engine/` holds only `TradingEngine` and the three ABCs the columns above name; every
-implementation lives in `core/backtest/` or `core/live/`, and the engine imports neither.
+`core/engine/` holds only `TradingEngine`; each port's ABC and both implementations live together
+in `core/producer/`, `core/executor/`, `core/recorder/` (`base.py` = the ABC), and the engine
+imports only the `base` modules.
 
 **Assembling and running is the engine's job too.** The caller builds the four parts and hands them
 over — `TradingEngine(streamer, producer, executor, recorder, on_error=...)` — and the engine does
@@ -260,11 +279,11 @@ the wiring (`executor.on_trade = recorder.record_trade`, `NullRecorder` when no 
 the event loop, and the finish (`recorder.close()`), returning
 `recorder.report`. (Indicator warm-up is the engine's too, but as a separate call — see below.) That wiring used to be hand-repeated at each of the three entry points; the
 `on_trade` line alone existed in three places. Only *constructing* the parts stays with the caller,
-because those implementations live in the mode packages — which is what keeps the engine from
-importing `backtest/` or `live/`.
+because those implementations live in the port packages — which is what keeps the engine from
+importing anything but the port `base` ABCs.
 
 Dry run and backtest share the executor **class**, not merely equivalent code — which is why
-`core/live/trader.py` imports `SimulatedExecutor` out of `core/backtest/`. Dry run exists to be
+`core/trader/trader.py` imports `SimulatedExecutor` from `core/executor/simulated.py`. Dry run exists to be
 compared against a backtest, so the fill rules, accounting and resting-order book have to be one
 copy — before this, `_fill` and `_submit_book_action` were hand-copied into the live trader and
 kept in sync by attention alone.
@@ -409,7 +428,7 @@ matters most for the live recorder below — it rewrites the same files continuo
 an interrupted backtest leaves no corrupt output. The part file is `<dest>.part`, deliberately not
 ending in `.json`, because the frontend's directory scanner collects every `*.json` it finds.
 
-### Live run output (`core/live/recorder.py`)
+### Live run output (`core/recorder/live.py`)
 
 `LiveRecorder` writes live and dry-run sessions to `asset/live/` in **exactly** the format above,
 so the visualiser loads both from one directory list (`filterRunFiles` accepts `backtest/` and
@@ -653,7 +672,7 @@ those check scripts default to WARNING.
   runs** (multiple price panes, per-symbol trade markers, `summary.by_symbol`) — that's unbuilt
   follow-up work; only the core engine and output schema support multiple symbols today.
 
-### Resting orders (`core/domain/order_book.py`)
+### Resting orders (`core/order/order_book.py`)
 
 `Action` can request an order that is **not** filled on the decision candle: a `LIMIT` at a price,
 or a `STOP_MARKET` at a trigger. Those live in `Status.open_orders: Dict[str, List[OpenOrder]]`
@@ -718,7 +737,7 @@ Live never simulates any of this: `LiveExecutor.begin_event` only drops stale ma
 never matches resting orders, and the exchange owns the book, hydrated at startup from
 `futures_get_open_orders()` and kept in sync by `ORDER_TRADE_UPDATE`.
 
-### Position & PnL accounting (`core/domain/status.py`, `trade.py`, `report.py`)
+### Position & PnL accounting (`core/account/status.py`, `trade.py`, `report.py`)
 
 `Status` is the single shared representation of account state, **created and owned by the
 executor** (`executor.status` — nothing outside an executor constructs one: `SimulatedExecutor`
@@ -749,7 +768,7 @@ from it — `Action.trigger_above` is required and carries it. Live has no equiv
 `LiveExecutor` marks nothing — `record_event` reads `status.total_margin()` off the last
 `ACCOUNT_UPDATE`.
 `status.fee_ratio` is the account's fee rate — a `Status` field (default `DEFAULT_FEE_RATIO` in
-`core/domain/status.py`) the executor sets: `SimulatedExecutor` from its constructor arg,
+`core/account/status.py`) the executor sets: `SimulatedExecutor` from its constructor arg,
 `LiveExecutor` from `futures_commission_rate`. Strategies read it when sizing (`price * (1/lev +
 status.fee_ratio)`), so the fee the account is charged and the fee the position was sized against
 are the same number — this is why the `resolve_fee_ratio` streamer-reconciliation helper no longer
@@ -772,7 +791,7 @@ produced it) and `submitted_at` — for a market fill that equals `timestamp`, b
 submitted bars before it fills and one timestamp cannot hold both. `Report` bundles all `Trade`s with `max_leverage`, the final
 `Status` and the equity curve.
 
-### Live trading (`core/live/`)
+### Live trading (`core/trader/` + each port's `live.py`)
 
 Live trading is **multi-symbol**: `BinanceTrader.symbols` is derived directly from
 `streamer.symbols` (there is no separate `symbol`/`symbols` constructor argument, so the trader
@@ -785,7 +804,7 @@ opens the sockets and shuts everything down; the trading logic itself is in `cor
 one asyncio seam left in it is the user-data socket's lifecycle — the messages themselves go
 straight to `executor.on_user_data(...)`.
 
-- **`live/candle_producer.py` — where candles come from.** One futures kline websocket, a
+- **`producer/live.py` — where candles come from.** One futures kline websocket, a
   `futures_multiplex_socket` carrying every symbol's `continuousKline` stream (built as
   `<symbol>_<contract_type>@continuousKline_<interval>` per symbol), via `ReliableWebsocket` (a
   thin wrapper around python-binance's `ReconnectingWebsocket` that recovers from a dropped
@@ -829,7 +848,7 @@ straight to `executor.on_user_data(...)`.
     would really have filled during that bar still fills) but never reach `streamer.decide_action`.
     An outdated bar must not produce a market order that fills at the current price. The cost —
     an entry signal on a bar missed during a disconnect is skipped entirely — is deliberate.
-- **`live/executor.py` — orders and account state.** `submit()` fires the order and returns `None`;
+- **`executor/live.py` — orders and account state.** `submit()` fires the order and returns `None`;
   a detached task (`_await_order_result`) awaits the submission result and routes a failure to
   `on_error`. The fill arrives later on the user-data stream, so the pre-trade `Status`
   snapshot is deep-copied *before* the order is sent and keyed by `(symbol, client order id)` —
@@ -911,7 +930,7 @@ what gets executed, wrap `trader.executor`. `add_error_callback` remains.
 ## Conventions
 
 - Code comments and docstrings are in Korean; documentation files (`README.md`, `CLAUDE.md`,
-  `core/live/README.md`) are in English. Match whatever the file you are editing already uses.
+  `core/trader/README.md`) are in English. Match whatever the file you are editing already uses.
 - `asset/` is gitignored and holds the candle cache, backtest output (`asset/backtest/`) and live
   run output (`asset/live/`). Never commit it. `docker-compose.yml` bind-mounts it so live runs
   survive container recreation.

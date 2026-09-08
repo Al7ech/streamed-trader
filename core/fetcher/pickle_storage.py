@@ -5,7 +5,7 @@ import pickle
 from datetime import datetime
 from typing import List
 
-from core.domain import Candle
+from core.candle.candle import Candle
 
 _logger = logging.getLogger(__name__)
 
@@ -19,7 +19,8 @@ class PickleStorage:
     그때는 옛 경로를 새 클래스에 이어붙이는 일회용 스크립트로 캐시를 다시 저장하면 된다 —
     ``sys.modules["<옛 모듈>"] = <새 모듈>`` 로 별칭을 걸고 파일마다 load → save 하면 끝이고,
     ``save_to_pickle``이 tmp + ``os.replace``라 중간에 끊겨도 손상된 파일은 남지 않는다.
-    (2026-09에 ``core.streamer.candle`` → ``core.domain.candle`` 이전을 그렇게 처리했다.)
+    (``core.streamer.candle`` → ``core.domain.candle`` → ``core.candle.candle`` 두 번의 이전을
+    모두 그렇게 처리했고, 호환 코드는 남기지 않았다.)
 
     필드 **추가**는 이야기가 다르다. 옛 pickle의 ``__dict__``에는 그 필드가 없으므로
     ``Candle``이 클래스 속성 기본값으로 폴백시킨다 — 캐시를 다시 만들 필요가 없다.

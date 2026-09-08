@@ -26,18 +26,18 @@ from concurrent.futures import Future
 from datetime import datetime, timezone
 from typing import Dict, List
 
-from core.backtest.in_memory_candle_producer import InMemoryCandleProducer
-from core.backtest.recorder import BacktestRecorder
-from core.backtest.simulated_executor import SimulatedExecutor
-from core.domain.action import Action, ActionType
-from core.domain.candle import Candle
-from core.domain.status import Status
-from core.engine.candle_producer import CandleProducer, Event
+from core.producer.in_memory import InMemoryCandleProducer
+from core.recorder.backtest import BacktestRecorder
+from core.executor.simulated import SimulatedExecutor
+from core.order.action import Action, ActionType
+from core.candle.candle import Candle
+from core.account.status import Status
+from core.producer.base import CandleProducer, Event
 from core.engine.engine import TradingEngine
 from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
-from core.live import candle_producer as lcp
-from core.live.binance_order_client import OrderResult
-from core.live.executor import LiveExecutor, resolve_margin_asset
+from core.producer import live as lcp
+from core.executor.binance_order_client import OrderResult
+from core.executor.live import LiveExecutor, resolve_margin_asset
 from core.logging_config import setup_logging
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.strategies.keltner_stop_streamer import KeltnerStopStreamer

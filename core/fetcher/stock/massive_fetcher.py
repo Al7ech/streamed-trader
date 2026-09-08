@@ -11,7 +11,7 @@ from typing import List, Optional
 
 import requests
 
-from core.domain import Candle
+from core.candle.candle import Candle
 from core.fetcher import BaseCandleFetcher
 from core.fetcher.stock import nyse_session
 from core.utils import ensure_utc, interval_to_minutes, ms_timestamp_to_datetime

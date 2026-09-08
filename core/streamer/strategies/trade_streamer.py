@@ -1,7 +1,8 @@
 from typing import Dict, List
 
-from core.domain import Action, Candle
-from core.domain.status import Status
+from core.candle.candle import Candle
+from core.order.action import Action
+from core.account.status import Status
 from core.streamer import BaseStreamer
 from core.streamer.indicator import MovingAverage
 from core.utils import trunc_by_sign

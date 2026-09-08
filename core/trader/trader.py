@@ -10,7 +10,7 @@
 ===========  =========================  ==================  ================
 
 매매 순서 규약은 :class:`~core.engine.engine.TradingEngine`에, 캔들 소스는
-:class:`~core.live.candle_producer.LiveCandleProducer`에, 주문 실행과 계좌 상태는
+:class:`~core.producer.live.LiveCandleProducer`에, 주문 실행과 계좌 상태는
 실행기에 있다. **드라이런이 백테스트와 문자 그대로 같은 실행기 클래스를 쓴다** —
 드라이런은 백테스트와 대조하기 위해 존재하므로, 체결 규칙이 갈라지면 기능 자체가 무의미해진다.
 """
@@ -23,16 +23,16 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from binance import AsyncClient, BinanceSocketManager
 
-from core.backtest.historical_candle_producer import BinanceHistoricalCandleProducer
-from core.backtest.simulated_executor import SimulatedExecutor
-from core.domain.status import DEFAULT_FEE_RATIO, Status
+from core.producer.historical import BinanceHistoricalCandleProducer
+from core.executor.simulated import SimulatedExecutor
+from core.account.status import DEFAULT_FEE_RATIO, Status
 from core.engine.engine import TradingEngine
-from core.engine.executor import Executor
+from core.executor.base import Executor
 from core.fetcher.binance.rest_fetcher import BinanceCandleFetcher
-from core.live.candle_producer import LiveCandleProducer
-from core.live.executor import LiveExecutor, resolve_margin_asset
-from core.live.recorder import DEFAULT_SHARD_FLUSH_EVERY, LiveRecorder, default_run_id
-from core.live.reliable_websocket import ReliableWebsocket
+from core.producer.live import LiveCandleProducer
+from core.executor.live import LiveExecutor, resolve_margin_asset
+from core.recorder.live import DEFAULT_SHARD_FLUSH_EVERY, LiveRecorder, default_run_id
+from core.producer.reliable_websocket import ReliableWebsocket
 from core.streamer.base_streamer import BaseStreamer
 from core.utils import interval_to_minutes
 

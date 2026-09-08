@@ -1,9 +1,9 @@
 import logging
 from typing import Dict, List, Optional
 
-from core.domain.action import Action
-from core.domain.candle import Candle
-from core.domain.status import Status
+from core.order.action import Action
+from core.candle.candle import Candle
+from core.account.status import Status
 from core.streamer.indicator.volume_stats import VolumeMovingAverage, VolumeRollingStd
 from core.streamer.strategies.momentum_time_exit import MomentumTimeExitStreamer
 

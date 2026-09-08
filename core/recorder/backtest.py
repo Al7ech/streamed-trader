@@ -2,10 +2,10 @@
 
 엔진이 흘려보내는 이벤트/체결을 받아 ``Report``를 만들고, ``metadata``를 받았으면
 ``<result_path>/backtest/`` 에 런 JSON과 (선택적으로) 월별 시계열 샤드를 쓴다. 계약은
-:class:`core.engine.recorder.Recorder`에 있다.
+:class:`core.recorder.base.Recorder`에 있다.
 
 **무엇을 어디에 남길지는 레코더가 전부 갖는다.** 엔진은 실행만 알고, 백테스트 전용 산출물
-포맷은 알지 못한다 — 라이브가 :class:`~core.live.recorder.LiveRecorder`로 같은 일을 하는 것과
+포맷은 알지 못한다 — 라이브가 :class:`~core.recorder.live.LiveRecorder`로 같은 일을 하는 것과
 같은 구조다.
 """
 
@@ -13,11 +13,11 @@ import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from core.domain.candle import Candle
-from core.domain.report import Report
-from core.domain.status import Status
-from core.domain.trade import Trade
-from core.engine.recorder import Recorder
+from core.candle.candle import Candle
+from core.account.report import Report
+from core.account.status import Status
+from core.account.trade import Trade
+from core.recorder.base import Recorder
 from core.result.indicator_columns import collect_indicator_columns
 from core.result.metrics import build_multi_symbol_buy_and_hold_curve
 from core.result.writer import ShardWriter, write_run_json

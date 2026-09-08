@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple
 
-from core.domain import Candle
+from core.candle.candle import Candle
 from core.fetcher.pickle_storage import PickleStorage
 from core.utils import ensure_utc, interval_to_minutes, ms_timestamp_to_datetime
 

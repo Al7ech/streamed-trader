@@ -41,7 +41,7 @@ Click **asset 폴더 선택** and pick the repo's `asset/` directory. The app li
 renders candles, indicators, trade markers, an equity curve and monthly stats.
 
 > **`core` is a real, `uv`-installed package.** `uv sync` editable-installs it, so modules import
-> their siblings with the full path (`from core.domain.candle import Candle`) and resolve the
+> their siblings with the full path (`from core.candle.candle import Candle`) and resolve the
 > same way regardless of cwd. Run scripts from the repo root with `uv run python core/<script>.py`.
 > Default output paths (`asset/`) are relative to the cwd, so run from the repo root, not from
 > inside `core/`.
@@ -53,9 +53,9 @@ Subclass `BaseStreamer`, declare your indicators, and implement `decide_action`:
 ```python
 from typing import Dict, List
 
-from core.domain.action import Action
-from core.domain.candle import Candle
-from core.domain.status import Status
+from core.order.action import Action
+from core.candle.candle import Candle
+from core.account.status import Status
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.indicator.moving_average import MovingAverage
 
@@ -165,10 +165,10 @@ the resulting numbers as a smoke test, not as evidence.
 A backtest is the four engine parts assembled and handed to `TradingEngine`:
 
 ```python
-from core.backtest import DEFAULT_INIT_MARGIN
-from core.backtest.historical_candle_producer import BinanceHistoricalCandleProducer
-from core.backtest.recorder import BacktestRecorder
-from core.backtest.simulated_executor import SimulatedExecutor
+from core.executor.simulated import DEFAULT_INIT_MARGIN
+from core.producer.historical import BinanceHistoricalCandleProducer
+from core.recorder.backtest import BacktestRecorder
+from core.executor.simulated import SimulatedExecutor
 from core.engine.engine import TradingEngine
 
 producer = BinanceHistoricalCandleProducer(
@@ -236,7 +236,7 @@ uv run streamed-trader
 > run.** In dry run no orders are sent, no user-data socket is opened, and margin starts at a
 > synthetic `1e6` with fills simulated locally. With `DRY_RUN=false` this sends real market orders
 > against real money at whatever leverage your strategy asks for. Nothing here is financial advice
-> and there is no warranty — read `core/live/README.md` before you flip it.
+> and there is no warranty — read `core/trader/README.md` before you flip it.
 
 Docker runs the trader continuously:
 

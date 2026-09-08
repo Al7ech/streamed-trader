@@ -6,7 +6,7 @@ from typing import List, Tuple
 from binance.client import Client
 from tqdm import tqdm
 
-from core.domain import Candle
+from core.candle.candle import Candle
 from core.fetcher import BaseCandleFetcher
 from core.utils import interval_to_minutes, ensure_utc, ms_timestamp_to_datetime
 

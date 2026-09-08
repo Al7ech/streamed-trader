@@ -4,11 +4,11 @@
 그래서 백테스트/드라이런/라이브가 같은 :class:`~core.engine.engine.TradingEngine`을 쓰면서
 Executor만 갈아끼우는 것으로 갈린다. 구현체는 각자의 패키지에 있다:
 
-- :class:`~core.backtest.simulated_executor.SimulatedExecutor` — 백테스트와 드라이런. 캔들로
+- :class:`~core.executor.simulated.SimulatedExecutor` — 백테스트와 드라이런. 캔들로
   체결을 판정하고 ``Status``를 직접 갱신한다. **두 경로가 문자 그대로 같은 클래스를 쓰는 것**이
   요점이다 — 드라이런은 백테스트와 대조하기 위해 존재하므로, 체결 규칙이 갈라지면 기능 자체가
   무의미해진다. 그래서 라이브 패키지가 백테스트 패키지를 import한다.
-- :class:`~core.live.executor.LiveExecutor` — 실제 거래소. 주문을 fire-and-forget으로
+- :class:`~core.executor.live.LiveExecutor` — 실제 거래소. 주문을 fire-and-forget으로
   보내고, 체결은 나중에 유저 데이터 스트림으로 도착한다. 한 이벤트 안 액션들의 실행 순서는
   보장되지 않는다 (스레드풀) — ``SimulatedExecutor``는 동기라 리스트 순서를 지킨다.
 
@@ -21,10 +21,10 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Optional
 
-from core.domain.action import Action
-from core.domain.candle import Candle
-from core.domain.status import Status
-from core.domain.trade import Trade
+from core.order.action import Action
+from core.candle.candle import Candle
+from core.account.status import Status
+from core.account.trade import Trade
 
 
 class Executor(ABC):
@@ -36,13 +36,13 @@ class Executor(ABC):
     자리채우기 ``Status(margin=0.0)``을 만들어 넘기면 수화되기 전의 그 빈 껍데기를 누가
     읽어도 예외 없이 통과한다 — 런 JSON의 ``init_margin``이 조용히 0이 되는 식으로.
     그래서 이 생성자는 각 구현체의 생성 경로
-    (:class:`~core.backtest.simulated_executor.SimulatedExecutor` 의 ``__init__``,
-    :meth:`~core.live.executor.LiveExecutor.create`)만 부른다.
+    (:class:`~core.executor.simulated.SimulatedExecutor` 의 ``__init__``,
+    :meth:`~core.executor.live.LiveExecutor.create`)만 부른다.
 
     엔진과 레코더는 ``executor.status``를 통해서만 계좌를 읽는다.
 
     :param status: 이 실행기가 소유하는 계좌 상태. 위 설명대로 구현체가 만들어 넘긴다.
-    :param on_trade: 체결 싱크. 보통 :meth:`~core.engine.recorder.Recorder.record_trade`.
+    :param on_trade: 체결 싱크. 보통 :meth:`~core.recorder.base.Recorder.record_trade`.
     """
 
     def __init__(self, status: Status, on_trade: Optional[Callable[[Trade], None]] = None):
@@ -55,7 +55,7 @@ class Executor(ABC):
     def begin_event(self, event_time: int, candles: Dict[str, Candle]) -> None:
         """이벤트 처리 시작 훅. 기본은 아무것도 하지 않는다.
 
-        :class:`~core.backtest.simulated_executor.SimulatedExecutor`는 여기서 심볼별 최근
+        :class:`~core.executor.simulated.SimulatedExecutor`는 여기서 심볼별 최근
         종가를 갱신하고, **미체결 주문을 이 이벤트 캔들로 체결시키고**, 열린 포지션을
         시가평가하고, 시가평가 자본이 0 이하면 장부를 비우고 전 포지션을 강제청산한다 (그
         결과가 이벤트의 자본곡선 값이 된다). 라이브는 미체결 결정 폐기에만 쓴다 — 미체결
@@ -71,6 +71,6 @@ class Executor(ABC):
 
         백테스트/드라이런(:class:`SimulatedExecutor`)은 동기적으로 즉시 체결하거나 장부에
         올리므로 한 이벤트 안 액션들이 리스트 순서대로 반영된다. 라이브
-        (:class:`~core.live.executor.LiveExecutor`)는 주문을 스레드풀로 보내고 곧바로
+        (:class:`~core.executor.live.LiveExecutor`)는 주문을 스레드풀로 보내고 곧바로
         돌아오므로 **한 이벤트 안 액션들의 실행 순서는 보장되지 않는다.**
         """

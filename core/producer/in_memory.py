@@ -7,7 +7,7 @@
 캔들을 스스로 가져오지 않는다. 이미 만들어진 ``candles_by_symbol``을 받는다 — 드라이런 대조
 검사(:mod:`core.checks.live_check`)나 비-바이낸스 소스(주식 등)처럼 캔들을 직접 넘기는 쪽이 쓴다.
 바이낸스에서 구간을 fetch해 백테스트하려면
-:class:`~core.backtest.historical_candle_producer.BinanceHistoricalCandleProducer`.
+:class:`~core.producer.historical.BinanceHistoricalCandleProducer`.
 """
 
 import heapq
@@ -16,8 +16,8 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple
 
 from tqdm import tqdm
 
-from core.domain.candle import Candle
-from core.engine.candle_producer import CandleProducer, Event
+from core.candle.candle import Candle
+from core.producer.base import CandleProducer, Event
 
 
 class InMemoryCandleProducer(CandleProducer):

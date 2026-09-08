@@ -6,7 +6,7 @@ from typing import List
 import pandas as pd
 from tqdm import tqdm
 
-from core.domain import Candle
+from core.candle.candle import Candle
 
 _logger = logging.getLogger(__name__)
 
