@@ -1,39 +1,25 @@
 """라이브 캔들 공급자.
 
 바이낸스 선물 kline 웹소켓에서 마감 캔들을 받아 :class:`~core.engine.engine.TradingEngine`이
-소비할 이벤트로 내준다. 실시간 캔들 소스에 관한 모든 것 — 소켓 연결/수신, 심볼별 연속성
-판정, 구멍 백필 — 이 여기 모여 있다. 지표 워밍업용 과거 캔들은 여기 없다: 그건 별개의
-공급자(:class:`~core.producer.historical.BinanceHistoricalCandleProducer`)가
-내주고, 어디까지 먹였는지만 :meth:`LiveCandleProducer.resume_after`로 넘어온다.
+소비할 이벤트로 내준다. 소켓 연결/수신과 웹소켓 봉투 파싱, 마감 시각 정규화만 한다.
+
+**연속성 판정은 하지 않는다.** 중복 캔들 감지, 구멍 백필, 워밍업↔라이브 이어붙이기는 모두
+엔진 몫이다 (:meth:`~core.engine.engine.TradingEngine` 참고) — 엔진이 심볼별 연속성 앵커를
+들고, 스트림이 앞으로 건너뛰면 그 구간용 공급자를 즉석에서 만들어 지표만 채운다.
 
 라이브는 심볼을 병합하지 않는다. 각 심볼의 캔들이 도착하는 즉시 **키 하나짜리 이벤트**로
 내주므로, 엔진의 ``streamer.symbols`` 순회에서 나머지 심볼은 캔들이 없어 자연히 걸러진다.
-
-**백필이 스트림 순서로 표현된다**: 구멍을 발견하면 빠진 캔들을 먼저 yield하고 그다음에 방금
-받은 캔들을 yield한다. 예전에는 처리 경로를 재귀적으로 재진입해야 했던 것("라이브 캔들과
-백필 캔들이 같은 경로를 타야 한다")이, 소스가 순서를 책임지는 것으로 바뀌었다.
-
-다만 백필 캔들은 ``Event.decide=False``로 나간다 — **이미 지나간 봉이 새 주문을 내면 안 된다.**
-지표는 갱신해야 하고(안 그러면 롤링 윈도우가 영구히 갈라진다) 그 사이 거래소에서 벌어진
-미체결 체결도 반영해야 하지만, 몇 분 전 봉을 보고 지금 가격에 시장가를 내는 것은 다른 얘기다.
 """
 
-import asyncio
 import logging
-from typing import AsyncIterator, Awaitable, Callable, Dict, List, Optional
+from typing import AsyncIterator, Awaitable, Callable, List, Optional
 
 from binance.enums import ContractType
 
 from core.candle.candle import Candle
 from core.producer.base import CandleProducer, Event
-from core.fetcher.binance.rest_fetcher import BinanceCandleFetcher
 from core.producer.reliable_websocket import ReliableWebsocket
-from core.utils import interval_to_minutes, ms_timestamp_to_datetime
-
-#: 한 번에 백필할 수 있는 캔들 수의 상한. 이걸 넘으면 재기동으로 복구하는 편이 안전하다 —
-#: 프로세스가 오래 죽어 있었다는 뜻이고, 재기동은 지표를 프리피드로 다시 세우고 포지션은
-#: 거래소에서 다시 읽는다.
-MAX_BACKFILL_CANDLES = 60
+from core.utils import interval_to_minutes
 
 
 class LiveCandleProducer(CandleProducer):
@@ -50,16 +36,11 @@ class LiveCandleProducer(CandleProducer):
         self.symbols = [s.upper() for s in symbols]
         self._symbol_set = set(self.symbols)
         self.interval = interval
-        # 라이브의 간격 출처는 config다 — 첫 캔들 전에 경계 정규화·갭 감지에 이미 필요하다.
+        # 라이브의 간격 출처는 config다 — 첫 캔들 전에 경계 정규화에 이미 필요하다.
         super().__init__(interval_to_minutes(interval) * 60_000)
         self._on_error = on_error
-        #: 심볼별 마지막으로 내준 캔들의 시작 시각 — 중복/구멍 판정의 기준점. None이면 아직
-        #: 기준이 없다 (:meth:`resume_after`로 워밍업 지점을 받기 전).
-        self._last_candle_start: Dict[str, Optional[int]] = {s: None for s in self.symbols}
         self.socket: Optional[ReliableWebsocket] = None
         self._running = False
-        #: 치명적 사유로 스트림을 끊었다면 그 이유. 소비자가 트레이더를 멈추는 근거가 된다.
-        self.fatal_reason: Optional[str] = None
 
     # ------------------------------------------------------------- 수명주기
 
@@ -110,17 +91,13 @@ class LiveCandleProducer(CandleProducer):
                     yield event
                     if not self._running:
                         return
-            except _FatalStream:
-                break
-            except _SkipCandle:
-                continue  # 중복 수신 — 이미 경고를 남겼다
             except Exception as e:
-                # 파싱/백필 중의 예상 못 한 오류. 한 메시지를 버리고 계속한다.
+                # 파싱 중의 예상 못 한 오류. 한 메시지를 버리고 계속한다.
                 self.logger.exception("Error processing kline message: %s", e)
                 await self._on_error(e)
 
     async def _events_from(self, data: dict) -> AsyncIterator[Event]:
-        """메시지 하나에서 나올 이벤트들 (백필 캔들이 있으면 그것들이 먼저)."""
+        """메시지 하나에서 나올 이벤트 (마감 캔들이면 하나, 아니면 없음)."""
         if await self._handle_stream_error_frame(data):
             return
 
@@ -147,124 +124,7 @@ class LiveCandleProducer(CandleProducer):
             start_time=start_time,
             end_time=start_time + self.interval_ms,
         )
-
-        # 백필 캔들은 decide=False — 지표와 실행기의 이벤트 경계 훅까지만 가고
-        # streamer.decide_action에는 닿지 않는다 (지나간 봉이 새 주문을 내면 안 된다).
-        for missed in await self._missing_before(symbol, candle):
-            self._last_candle_start[symbol] = missed.start_time
-            yield Event(missed.end_time, {symbol: missed}, decide=False)
-
-        self._last_candle_start[symbol] = candle.start_time
         yield Event(candle.end_time, {symbol: candle})
-
-    async def _missing_before(self, symbol: str, candle: Candle) -> List[Candle]:
-        """이 캔들 앞에 빠진 캔들들. 이 캔들 자체를 버려야 하면 :class:`_FatalStream`이나
-        :class:`_SkipCandle`을 올린다.
-
-        python-binance는 끊김을 스스로 재연결하고(``ReconnectingWebsocket._run_reconnect``)
-        그 사이 메시지를 버린다. 게다가 그 사실은 예외가 아니라 ``{"e": "error"}`` 메시지로만
-        알려지므로, 그냥 두면 두 가지가 조용히 일어난다: 마감 캔들이 통째로 빠져 지표가
-        백테스트와 영구히 갈라지거나(청산 조건이 걸린 캔들을 놓치면 포지션이 그대로 남는다),
-        재연결 직후 같은 마감 캔들이 다시 와서 ``decide_action``이 두 번 불리고 **주문이 두 번**
-        나간다.
-        """
-        last = self._last_candle_start[symbol]
-        if last is None:
-            return []
-
-        if candle.start_time <= last:
-            self.logger.warning(
-                f"이미 처리한 캔들을 버린다 (symbol={symbol}): "
-                f"start={ms_timestamp_to_datetime(candle.start_time)} <= "
-                f"마지막 처리 {ms_timestamp_to_datetime(last)}")
-            raise _SkipCandle
-
-        elapsed = candle.start_time - last
-        if elapsed % self.interval_ms != 0:
-            self._fatal(
-                f"캔들 경계가 인터벌과 맞지 않는다 (symbol={symbol}): "
-                f"{elapsed}ms 는 {self.interval_ms}ms 의 배수가 아니다 "
-                f"({ms_timestamp_to_datetime(last)} -> "
-                f"{ms_timestamp_to_datetime(candle.start_time)})")
-            raise _FatalStream
-
-        missing = elapsed // self.interval_ms - 1
-        if missing == 0:
-            return []
-
-        if missing > MAX_BACKFILL_CANDLES:
-            self._fatal(
-                f"캔들 {missing}개가 비었다 (symbol={symbol}) — 백필 상한 "
-                f"{MAX_BACKFILL_CANDLES}개를 넘어 재기동으로 복구한다")
-            raise _FatalStream
-
-        gap_start = last + self.interval_ms
-        self.logger.warning(
-            f"캔들 {missing}개가 비었다 (symbol={symbol}) — 백필해서 재생한다: "
-            f"{ms_timestamp_to_datetime(gap_start)} ~ "
-            f"{ms_timestamp_to_datetime(candle.start_time)}")
-        try:
-            return await self._fetch_range(symbol, gap_start, candle.start_time)
-        except Exception as e:
-            # 지표는 이미 갈라졌다. 이 상태로 계속 매매하면 전략이 백테스트와 다른 것을 본다.
-            self._fatal(f"빠진 캔들을 백필하지 못했다 (symbol={symbol}): {e}")
-            raise _FatalStream
-
-    async def _fetch_range(self, symbol: str, start_ms: int, end_ms: int) -> List[Candle]:
-        """``[start_ms, end_ms)`` 구간의 마감 캔들을 REST로 가져온다.
-
-        ``get_candles``의 구간 규약이 반열린 구간이라 정확히 빠진 캔들만 돌아온다 —
-        지표 워밍업 공급자가 쓰는 규약과 같다. 개수와 정렬을 검증해서, 어긋난 캔들이
-        조용히 지표에 먹히는 일이 없게 한다.
-        """
-        # 동기 HTTP + tqdm이라 스레드로 뺀다 — 이벤트 루프를 막으면 그동안 유저 데이터
-        # 스트림을 읽지 못한다.
-        candles = await asyncio.to_thread(
-            BinanceCandleFetcher().get_candles,
-            symbol=symbol, interval=self.interval,
-            start_date=ms_timestamp_to_datetime(start_ms),
-            end_date=ms_timestamp_to_datetime(end_ms))
-
-        expected = (end_ms - start_ms) // self.interval_ms
-        if len(candles) != expected:
-            raise ValueError(f"백필 캔들 개수가 맞지 않는다: {len(candles)} != {expected}")
-        for i, c in enumerate(candles):
-            want = start_ms + i * self.interval_ms
-            if c.start_time != want:
-                raise ValueError(
-                    f"백필 캔들 {i}의 시작 시각이 어긋난다: "
-                    f"{ms_timestamp_to_datetime(c.start_time)} != "
-                    f"{ms_timestamp_to_datetime(want)}")
-        return candles
-
-    # ------------------------------------------------------------- 이어붙이기
-
-    def resume_after(self, last_starts: Dict[str, int]) -> None:
-        """지표 워밍업이 어디까지 먹였는지 받아 심볼별 연속성 기준점으로 삼는다.
-
-        워밍업 소스와 이 소스는 서로 다른 객체라(전자는 REST로 과거 구간, 여기는 웹소켓),
-        엔진이 워밍업을 마치며 이 값을 넘겨 준다
-        (:meth:`~core.engine.engine.TradingEngine.warmup_from`). 이 한 줄이 양방향을 막는다:
-
-        - **중복** — 워밍업이 이미 먹인 봉이 소켓 첫 메시지로 들어오면(재연결 직후 재전송 등)
-          :meth:`_missing_before`가 ``_SkipCandle``로 버린다. 안 버리면 지표가 같은 봉을 두 번
-          먹고 ``decide_action``이 두 번 불려 **주문이 두 번** 나간다.
-        - **구멍** — 워밍업(수십 초가 걸릴 수 있다)이 끝나고 소켓이 붙는 사이에 봉이 마감했다면
-          첫 실시간 캔들에서 그만큼이 백필된다. 기준점이 없으면 그 구멍은 조용히 지나가고
-          모든 롤링 윈도우 지표가 백테스트와 영구히 갈라진다.
-
-        :param last_starts: 심볼 → 마지막으로 먹인 캔들의 ``start_time``. ``end_time``이 아니다
-            (연속성 판정이 ``start_time + interval_ms`` 기준이다).
-        """
-        for symbol, start_time in last_starts.items():
-            if symbol not in self._symbol_set:
-                self.logger.warning(
-                    f"거래하지 않는 심볼의 워밍업 지점은 무시한다: {symbol}")
-                continue
-            self._last_candle_start[symbol] = start_time
-            self.logger.info(
-                f"[{symbol}] 연속성 기준점: "
-                f"{ms_timestamp_to_datetime(start_time)} 이후부터 실시간 캔들을 받는다")
 
     # ------------------------------------------------------------- 내부
 
@@ -285,11 +145,3 @@ class LiveCandleProducer(CandleProducer):
         self.fatal_reason = reason
         self._running = False
         self.logger.fatal(f"Stopping trader. {reason}")
-
-
-class _FatalStream(Exception):
-    """스트림을 끊어야 하는 상황. :meth:`LiveCandleProducer.__aiter__`가 잡아 반복을 끝낸다."""
-
-
-class _SkipCandle(Exception):
-    """이 캔들만 버리고 계속한다 (중복 수신)."""

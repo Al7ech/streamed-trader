@@ -171,8 +171,12 @@ class BinanceTrader:
                     self.recorder.resumed_status if self.recorder else None)
 
             # 부품을 넘기면 배선(체결 싱크, 레코더 기본값)과 실행은 엔진이 갖는다.
+            # backfill_source: 라이브 스트림에 구멍이 나면 엔진이 이걸로 그 구간 공급자를
+            # 만들어 지표를 메운다 — 워밍업 프리피드와 같은 팩토리다. 드라이런도 넘긴다
+            # (백필된 봉에서 드라이런 스탑이 체결돼야 백테스트와 대조된다).
             self.engine = TradingEngine(self.streamer, self.producer, self.executor,
-                                        self.recorder, on_error=self._handle_error)
+                                        self.recorder, on_error=self._handle_error,
+                                        backfill_source=self._historical_producer)
 
             # 4. 지표 워밍업. 소켓을 열기 **전에** 한다 — 수십 초가 걸릴 수 있는데 그동안
             #    유저 데이터 스트림을 읽지 않으면 python-binance의 큐가 넘쳐 죽는다.
@@ -301,12 +305,23 @@ class BinanceTrader:
         try:
             # 생성자가 그 자리에서 동기 HTTP를 친다 — 이벤트 루프를 막지 않게 스레드로 뺀다.
             warmup_producer = await asyncio.to_thread(
-                BinanceHistoricalCandleProducer, start_time, end_time, self.symbols,
-                self.interval, fetcher=BinanceCandleFetcher(), use_cache=False, progress=False)
+                self._historical_producer, self.symbols, start_time, end_time)
             await self.engine.warmup_from(warmup_producer)
         except Exception as e:
             self.logger.error(f"Failed to pre-feed indicators: {e}")
             raise
+
+    def _historical_producer(self, symbols: List[str], start: datetime,
+                             end: datetime) -> BinanceHistoricalCandleProducer:
+        """``[start, end)`` 구간 공급자. 워밍업 프리피드와 엔진의 구멍 백필이 함께 쓴다.
+
+        REST fetcher + ``use_cache=False``: Vision 벌크 덤프는 하루쯤 지연되고, 월청크 pkl
+        캐시는 요청 구간이 아니라 달 경계로 fetch한다 (월말 기동이 그 달 전체를 받게 된다).
+        생성자가 동기 HTTP를 치므로 호출자가 :func:`asyncio.to_thread`로 감싼다.
+        """
+        return BinanceHistoricalCandleProducer(
+            start, end, symbols, self.interval,
+            fetcher=BinanceCandleFetcher(), use_cache=False, progress=False)
 
     # ----------------------------------------------------------------- 결과 기록
 

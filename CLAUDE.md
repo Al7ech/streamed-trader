@@ -22,9 +22,10 @@ There is no automated test suite (no `pytest`/`unittest` files in `core/`, only 
 `react-scripts test` in `visualise/`). The de-facto correctness check is:
 
 - `core/checks/live_check.py` — covers the live path (it needs a socket and an exchange, so it fakes
-  both) and asserts the candle producer's continuity/backfill rules, the indicator warm-up
-  handoff (`warmup_from` -> `resume_after`, including the gap between the warm-up range and the
-  first live candle), the live executor's
+  both) and asserts the engine's continuity/backfill rules over a faked live producer (duplicate
+  skip, gap backfill via `backfill_source`, cap/boundary/fetch fatals), the indicator warm-up
+  handoff (`warmup_from` seeds the engine's `_last_start` anchor, including the gap between the
+  warm-up range and the first live candle), the live executor's
   account/fill handling, and that **a dry run produces exactly the trades a backtest of the same
   candles does** (over Keltner, a stateful mean-reversion strategy, and toy limit/stop-ladder
   fixtures). The vectorized backtest path and its `backtest_fast_check.py` parity harness were
@@ -314,19 +315,21 @@ stream updates it out of band), so a dropped order self-heals on the next candle
 that **intra-event action execution order is not guaranteed in live** (the thread pool runs them);
 backtest/dry run keep list order because `SimulatedExecutor` is synchronous. Every `CandleProducer`
 implements `__aiter__` and nothing else is required of it — nothing else in the codebase has to
-know sync from async. (`resume_after` is the one other method on the ABC, a no-op by default; see
-"Indicator warm-up" below.)
+know sync from async. (`request_stop()` and a `fatal_reason` field are on the ABC too — the engine
+sets them to end a run on an unrecoverable gap; see "Indicator warm-up" below.)
 
-`process_event(event)` — the contract every mode goes through. An `Event` is
-`(time, candles, decide)`; `decide=False` means **this bar already went by** (the live producer's
-gap backfill is the only source of it) and steps 4b/7 are skipped, so an outdated candle can never
-reach `streamer.decide_action` and can never produce a new order:
+`process_event(event, *, decide=True)` — the contract every mode goes through. An `Event` is just
+`(time, candles)` and does **not** know whether it is a fresh bar or an already-past one — the
+engine judges that itself from a per-symbol continuity anchor (`_last_start`) and passes `decide`.
+`decide=False` means **this bar already went by** (a gap candle the engine backfilled — see
+"Indicator warm-up") and steps 4b/7 are skipped, so an outdated candle can never reach
+`streamer.decide_action` and can never produce a new order:
 
 ```
 0-2. executor.begin_event()        # sim: per symbol with a candle — refresh last_close + match resting orders (fills happen here) + tick expiry; then mark every open position (incl. symbols with no candle this event) to its last_close, which also re-marks a just-filled symbol from its fill price back to the bar close; then if status.total_margin() <= 0 -> cancel_all + flatten every open position at last_close and latch _bankrupt. live: drop unmatched market decisions from the last candle (no matching, no bankruptcy check — the exchange fills resting orders and liquidates)
-4. update every symbol's indicators, then (if event.decide) one streamer.decide_action(candles, status) for the whole event (still called after bankruptcy — the executor just discards the resulting actions)
+4. update every symbol's indicators, then (if decide) one streamer.decide_action(candles, status) for the whole event (still called after bankruptcy — the executor just discards the resulting actions)
 6. recorder.record_event()         # the recorder reads status.total_margin() itself for the equity point
-7. per action: executor.submit()   # sim: CANCEL/register/fill in list order, or no-op once _bankrupt is latched; live: fire the order, return. no actions at all when event.decide is False
+7. per action: executor.submit()   # sim: CANCEL/register/fill in list order, or no-op once _bankrupt is latched; live: fire the order, return. no actions at all when decide is False
 8. recorder.end_event()
 ```
 
@@ -351,16 +354,23 @@ indicators only** — no `begin_event`, no `decide_action`, no orders, no record
 gets no `status` (that stretch of history has no corresponding account state, so status-aware
 indicators must treat `None` as warm-up). It then raises `ValueError` if any symbol received fewer
 candles than its own window (`streamer.warmup_windows()`), because silently under-warmed indicators
-are worse than a failed startup, and finishes by handing the last fed `start_time` per symbol to
-the *main* producer's `resume_after()`.
+are worse than a failed startup, and records the last fed `start_time` per symbol into the engine's
+own `_last_start` continuity anchor.
 
-That handoff is the whole reason the warm-up source can be a plain producer. The two sources are
-different objects — live warms from `BinanceHistoricalCandleProducer` over REST and then trades off
-a websocket — so someone has to splice them, and one value does it in both directions: a candle the
-warm-up already ate must not arrive again (double-fed indicators, and `decide_action` re-running
-means **a second order**), and a bar that closed while the sockets were still connecting must be
-backfilled (otherwise every rolling-window indicator diverges from the backtest permanently).
-`resume_after` is a no-op on the ABC; only `LiveCandleProducer` implements it.
+**The engine owns continuity end to end.** `run_async` checks each incoming candle's `start_time`
+against `_last_start[symbol]`: `<= anchor` is an already-processed candle (reconnect resend) and the
+event is dropped whole; a jump forward is a gap. On a gap the engine builds a throw-away producer
+for the missing `[gap_start, next_start)` range via the `backfill_source` factory the caller
+supplied (`BinanceHistoricalCandleProducer` over REST — the same shape as the warm-up source),
+consumes it through `process_event(..., decide=False)` (indicators + `begin_event` + recording, no
+`decide_action`), then processes the triggering candle with `decide=True`. This one anchor closes
+both failure modes the old `resume_after` handoff existed for: a warm-up candle re-arriving would
+double-feed indicators and re-run `decide_action` (**a second order**); a bar that closed while the
+sockets were connecting would leave every rolling-window indicator permanently diverged from the
+backtest. A misaligned boundary, a gap over `max_backfill_candles` (default 60), or a failed/short
+backfill fetch is fatal — the engine sets `producer.fatal_reason`, calls `producer.request_stop()`,
+and ends the run so a restart rebuilds the indicators. A backtest passes no `backfill_source`, so a
+jump in a ragged `InMemoryCandleProducer` series (staggered listing dates) is just data, not a gap.
 
 Only live calls `warmup_from`, and it calls it *before opening any socket* (a long backfill would
 overflow python-binance's user-data queue), which is why it is not inside `run_async`. A backtest
@@ -842,36 +852,35 @@ straight to `executor.on_user_data(...)`.
   Live order submissions are fired to the thread pool and not awaited, so an order result may land
   after later candles; that race, plus the kline-vs-user-data-listener race, is tolerated because
   `status` is exchange truth and the pre-trade `pre_position`/`pre_margin` are read before the order is sent.
-  - **Gaps and duplicates are detected per symbol** (each tracks its own `_last_candle_start`,
-    advanced *before* the candle is yielded so a consumer exception cannot cause a re-run). A gap
-    is filled by **yielding the missing candles first** — so "backfilled candles take the same path
-    as live ones" is a property of stream order rather than something the processing path has to
-    re-enter. A gap raises no exception on its own (`ReliableWebsocket` only recovers from a
-    throwing `recv()`, so a silently dropped kline would otherwise leave the log quiet while the
-    hole propagates into every rolling-window indicator and the recorded series); the check
-    compares `start_time + interval_ms`, not `end_time`, because a websocket kline's `T` is
-    `start + interval - 1` (the fetcher's `end_time` is exclusive; the stream's is not) — the
-    producer normalizes `end_time` to the interval boundary for exactly this reason.
-  - A misaligned boundary, a gap larger than `MAX_BACKFILL_CANDLES`, or a failed backfill **ends
-    the stream**; the trader then stops and a restart recovers (warm-up rebuilds the indicators,
-    the exchange owns the position).
+  - **The producer does no continuity check.** It parses the multiplex envelope, ignores unknown
+    symbols and unclosed klines, normalizes `end_time` to the interval boundary (a websocket
+    kline's `T` is `start + interval - 1` while the fetcher's `end_time` is exclusive), and yields
+    one `Event(end_time, {symbol: candle})` per closed candle. Nothing else. Duplicate/gap
+    detection is the engine's — it compares `start_time + interval_ms` against its own per-symbol
+    `_last_start` anchor (see "Indicator warm-up" under "The trading engine"), backfills a gap
+    through the `backfill_source` factory, and ends the stream (`producer.fatal_reason` +
+    `producer.request_stop()`) on a misaligned boundary, a gap over `max_backfill_candles`, or a
+    failed/short backfill fetch. A restart then recovers (warm-up rebuilds the indicators, the
+    exchange owns the position).
   - **Indicator history is not fetched here.** `BinanceTrader._prefeed_indicators` builds a
-    `BinanceHistoricalCandleProducer` over `[end - max(window)*interval, end)` (REST fetcher,
-    `use_cache=False`, constructed inside `asyncio.to_thread` because its constructor does
-    synchronous HTTP) and hands it to `TradingEngine.warmup_from`; this producer only learns the
-    result through `resume_after(last_starts)`, which seeds `_last_candle_start` — see "Indicator
-    warm-up" under "The trading engine". `end` is floored to the **interval** boundary, not the
-    minute, or a `1h` run started at 13:37 would ask for a range Binance's hour-aligned candles
-    can't fill; every symbol shares that one `end` and one `max(window)`-long range, so sequential
-    fetches can't stagger the symbols' windows relative to each other (a symbol with a shorter
-    window is simply over-warmed, which is harmless for rolling indicators). The old
-    sleep-to-the-next-minute guard is gone: if a boundary passes mid-fetch, the resulting gap is
-    just a gap, and `resume_after` + the backfill path above closes it.
-  - **Backfilled candles do not trade.** They are yielded as `Event(..., decide=False)`, so they
-    update indicators and go through `executor.begin_event` (in dry run, a stop that the exchange
-    would really have filled during that bar still fills) but never reach `streamer.decide_action`.
-    An outdated bar must not produce a market order that fills at the current price. The cost —
-    an entry signal on a bar missed during a disconnect is skipped entirely — is deliberate.
+    `BinanceHistoricalCandleProducer` over `[end - max(window)*interval, end)` via the
+    `_historical_producer` helper (REST fetcher, `use_cache=False`, constructed inside
+    `asyncio.to_thread` because its constructor does synchronous HTTP) and hands it to
+    `TradingEngine.warmup_from`, which records the last fed `start_time` per symbol into the
+    engine's `_last_start`. That **same** `_historical_producer` helper is passed to the engine as
+    `backfill_source`, so a live gap is filled by the identical machinery. `end` is floored to the
+    **interval** boundary, not the minute, or a `1h` run started at 13:37 would ask for a range
+    Binance's hour-aligned candles can't fill; every symbol shares that one `end` and one
+    `max(window)`-long range, so sequential fetches can't stagger the symbols' windows relative to
+    each other (a symbol with a shorter window is simply over-warmed, which is harmless for rolling
+    indicators). The old sleep-to-the-next-minute guard is gone: if a boundary passes mid-fetch,
+    the resulting gap is just a gap, and the engine's `_last_start` + backfill path closes it.
+  - **Backfilled candles do not trade.** The engine feeds them through
+    `process_event(..., decide=False)`, so they update indicators and go through
+    `executor.begin_event` (in dry run, a stop that the exchange would really have filled during
+    that bar still fills) but never reach `streamer.decide_action`. An outdated bar must not
+    produce a market order that fills at the current price. The cost — an entry signal on a bar
+    missed during a disconnect is skipped entirely — is deliberate.
 - **`executor/live.py` — orders and account state.** `submit()` fires the order and returns `None`;
   a detached task (`_await_order_result`) awaits the submission result and routes a failure to
   `on_error`. The fill arrives later on the user-data stream, so the pre-trade
