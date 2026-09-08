@@ -180,8 +180,8 @@ report = TradingEngine(streamer, producer, executor, recorder).run()
 ```
 
 The executor writes `fee_ratio` into the `Status` it builds, so the fee accounting
-(`Status.apply_fill`) and the strategy's own position sizing (`status.fee_ratio`) always read one
-value. `slippage_ratio` is a `SimulatedExecutor` argument only — it is a simulation modelling knob,
+(`apply_fill`, a module-level function in `core/executor/simulated.py`) and the strategy's own
+position sizing (`status.fee_ratio`) always read one value. `slippage_ratio` is a `SimulatedExecutor` argument only — it is a simulation modelling knob,
 not account state, and no strategy sizes with it.
 
 The candle source is either `BinanceHistoricalCandleProducer` (fetches the `[start, end)` range

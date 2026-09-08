@@ -10,7 +10,7 @@
 """
 
 import copy
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 from core.order import order_book
 from core.order.action import Action, ActionType
@@ -21,6 +21,79 @@ from core.executor.base import Executor
 
 #: 백테스트의 기본 초기 증거금. 수익률의 기준선이 되는 값이라 한 곳에 둔다.
 DEFAULT_INIT_MARGIN = 100_000.0
+
+
+def apply_fill(status: Status, symbol: str, quantity: float,
+               price: float) -> Tuple[float, float]:
+    """체결 하나를 ``status``에 반영한다. 반환값은 ``(wnl, fee)``.
+
+    포지션 가중평균 원가·실현손익 안분·수수료 부과를 하는 체결 회계의 한 벌. 백테스트와
+    드라이런이 **같은** 회계를 쓰도록 (:meth:`SimulatedExecutor._fill`이 유일한 호출자)
+    여기 한 곳에만 둔다. 라이브는 이 함수를 부르지 않는다 — 거래소의 ``ACCOUNT_UPDATE``가
+    ``status``를 직접 덮으므로, 이 회계가 가상 실행기 모듈에 사는 것이 곧 그 사실이다.
+    ``Status``는 상태·파생값(``total_margin``/``leverage``/``update_unrealised_pnl``)만
+    들고, 모드별 동작인 이 회계는 들지 않는다.
+
+    ``wnl``은 **수수료 차감 전** 실현손익이고 ``fee``는 별도로 반환한다. margin에는 둘 다
+    반영된다(실현손익 가산 후 수수료 차감). margin은 전 심볼이 공유하는 증거금 풀이라
+    어느 심볼의 체결이든 같은 ``status.margin``을 갱신한다 — 심볼별로 분리되는 것은
+    position/avg_price/unrealised_pnl 뿐이다. 수수료율은 ``status.fee_ratio``를 쓴다.
+
+    청산 손익을 ``unrealised_pnl`` 안분으로 구하므로, 호출 전에 그 값이 **체결가 기준**으로
+    마킹돼 있어야 실현손익이 맞는다 (:meth:`SimulatedExecutor._fill` 참고).
+
+    :param status: 체결을 반영할 계좌 상태.
+    :param symbol: 체결이 일어난 심볼.
+    :param quantity: 현재 포지션에 더할 부호 있는 수량 (양수=매수, 음수=매도)
+    :param price: 체결가
+    """
+    p = status.position_for(symbol)
+    qty = quantity
+    wnl = 0.0
+    fee = price * abs(qty) * status.fee_ratio
+
+    # 신규 진입 (롱/숏 방향 동일하게 처리)
+    if p.position == 0.0:
+        p.avg_price = price
+        p.position = qty
+
+    # 같은 방향 추가 진입 (롱/숏)
+    elif (p.position > 0 and qty > 0) or (p.position < 0 and qty < 0):
+        total_cost = abs(p.avg_price * p.position) + abs(price * qty)
+        total_pos = p.position + qty
+        p.avg_price = total_cost / abs(total_pos)
+        p.position = total_pos
+        # margin, unrealised_pnl는 변동 없음
+
+    # 반대 방향 청산(부분/전부)
+    else:
+        if abs(qty) > abs(p.position):
+            # 방향 전환: 기존 포지션 청산 후 신규 진입
+            open_qty = qty + p.position
+
+            wnl = p.unrealised_pnl
+            # PNL/margin 계산 (전부 청산)
+            p.avg_price = price
+            status.margin += p.unrealised_pnl
+            p.unrealised_pnl = 0.0
+            p.position = open_qty
+        else:
+            # 부분 청산 (수량이 정확히 같으면 비율이 1이라 전량 청산이 된다)
+            closed_qty = qty
+            realised_pnl = p.unrealised_pnl * (-closed_qty / p.position)
+
+            wnl = realised_pnl
+            # avg_price는 변동 없음
+            status.margin += realised_pnl
+            p.unrealised_pnl -= realised_pnl
+            p.position += closed_qty
+
+    if p.position == 0.0:
+        p.avg_price = 0.0
+
+    status.margin -= fee
+
+    return wnl, fee
 
 
 class SimulatedExecutor(Executor):
@@ -164,14 +237,14 @@ class SimulatedExecutor(Executor):
         거래 전 스냅샷은 ``apply_fill`` **전에** 떠야 한다 — ``Trade.status``의 계약이고,
         승패 분류(``result_writer._win_lose_counts``)가 그 시점의 포지션 부호를 본다.
 
-        ``apply_fill``의 청산 손익은 ``unrealised_pnl``을 안분해서 구하므로, 그 값이 **체결가
-        기준**이어야 실현손익이 맞는다. 시장가는 체결가가 곧 이벤트 종가라 직전 시가평가가 이미
-        그 값이지만, 지정가/조건부는 봉 중간 가격에 체결되므로 여기서 다시 매긴다 (시장가에는
-        같은 값을 다시 계산하는 무해한 no-op이다).
+        모듈 함수 ``apply_fill``의 청산 손익은 ``unrealised_pnl``을 안분해서 구하므로, 그 값이
+        **체결가 기준**이어야 실현손익이 맞는다. 시장가는 체결가가 곧 이벤트 종가라 직전
+        시가평가가 이미 그 값이지만, 지정가/조건부는 봉 중간 가격에 체결되므로 여기서 다시
+        매긴다 (시장가에는 같은 값을 다시 계산하는 무해한 no-op이다).
         """
         self.status.update_unrealised_pnl(symbol, price)
         prev_status = copy.deepcopy(self.status)
-        wnl, fee = self.status.apply_fill(symbol, quantity, price)
+        wnl, fee = apply_fill(self.status, symbol, quantity, price)
         leverage = self.status.leverage()
         trade = Trade(
             timestamp=event_time,

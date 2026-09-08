@@ -119,7 +119,7 @@ core/
   engine/     TradingEngine only (engine.py) — the order-of-operations, nothing else
   producer/   base.py = CandleProducer ABC + Event; in_memory.py, historical.py, live.py,
               reliable_websocket.py
-  executor/   base.py = Executor ABC; simulated.py (+ DEFAULT_INIT_MARGIN), live.py,
+  executor/   base.py = Executor ABC; simulated.py (+ DEFAULT_INIT_MARGIN, apply_fill), live.py,
               binance_order_client.py
   recorder/   base.py = Recorder ABC + NullRecorder; backtest.py, live.py
   result/     writer.py (run JSON + shards), metrics.py, indicator_columns.py
@@ -143,6 +143,9 @@ Rules that hold this together — a change that breaks one is a design change, n
 - **`candle/`, `order/`, `account/` import nothing from the repo but `utils/`** (and each other, in
   that order). They are the vocabulary all three modes share — a candle, an order, a resting book,
   an account, a position, a fill. They do not know an engine, a strategy or an exchange exists.
+  `Status` is state plus read-only derived helpers (`total_margin`, `leverage`,
+  `update_unrealised_pnl`); the fill-accounting model (`apply_fill`) is a mode-specific behaviour
+  and lives with its only caller in `executor/simulated.py`, not on `Status`.
   `order/order_book.py` uses `core.account.status.Status` at runtime and `account/status.py`
   type-hints `OpenOrder` under `TYPE_CHECKING` only — both always reference the **submodule path**,
   never the package attribute, or the partially-initialised-package cycle resurfaces.
@@ -489,7 +492,7 @@ existing ragged-series contract with no changes needed there.
   adds, a terminal state removes), and `_reconcile_resumed_orders` warns when the resumed book and
   the exchange's actual book disagree — the exchange keeps working a stop while this process is
   down, which makes that reconciliation matter more than the position one.
-- **Fills.** Dry-run records the local `Status.apply_fill` result at `SimulatedExecutor.last_close[action.
+- **Fills.** Dry-run records the local `apply_fill` result at `SimulatedExecutor.last_close[action.
   symbol]` (the action's *target* symbol's last known close, not necessarily the triggering
   candle's own close — see the cross-symbol note below), so a dry run and a backtest of the same
   candles produce identical trades. Live records **real exchange fills** from
@@ -783,17 +786,21 @@ Either may pass `None`, and `Status.__init__` is the one place that turns `None`
 charged and the fee the position was sized against are the same number — this is why the
 `resolve_fee_ratio` streamer-reconciliation helper no longer exists. It is never serialized or
 restored (`metadata.last_status` omits it): every startup sources it fresh.
-`Status.apply_fill(symbol, quantity, price)` holds the one copy of the averaging/PNL
-math (charging `self.fee_ratio` on the notional) — and it derives realised PnL by **pro-rating
+`apply_fill(status, symbol, quantity, price)` — a module-level function in
+`core/executor/simulated.py`, **not** a `Status` method — holds the one copy of the averaging/PNL
+math (charging `status.fee_ratio` on the notional) — and it derives realised PnL by **pro-rating
 `unrealised_pnl`**, which is only correct when
 that field is marked at the fill price. For a market fill that is automatic (the fill price *is*
 the close the engine just marked at); for a resting fill at a trigger or limit price it is not, so
 `SimulatedExecutor._fill` — the **one** fill path for backtest and dry run alike — calls
-`update_unrealised_pnl(symbol, price)` immediately before `apply_fill`. On the market path that
-recomputes the same value and changes nothing; on the resting path, omitting it silently books the
-wrong realised PnL. `apply_fill` itself models opening, pyramiding (same-direction add), partial
+`status.update_unrealised_pnl(symbol, price)` immediately before `apply_fill`. On the market path
+that recomputes the same value and changes nothing; on the resting path, omitting it silently books
+the wrong realised PnL. `apply_fill` itself models opening, pyramiding (same-direction add), partial
 close, full close, and direction-flip on that symbol's `PositionState`, crediting/debiting the
-shared `margin`. Live never calls it — the exchange's `ACCOUNT_UPDATE` is the truth there.
+shared `margin`. It lives in the simulated-executor module because that is its only caller: live
+never does fill accounting — the exchange's `ACCOUNT_UPDATE` is the truth there — so `Status` keeps
+only state plus read-only derived helpers (`total_margin`, `leverage`, `update_unrealised_pnl`),
+not this mode-specific behaviour.
 A `Trade` is an immutable record of one fill (with its
 `symbol`) plus a deep-copied pre-trade `Status`; its `wnl` is realised PnL **before** the fee,
 which is carried separately in `fee`. It also carries `order_type` (the `ActionType` value that

@@ -150,7 +150,7 @@ reconnect count.
 | `status.fee_ratio` | the trader's `fee_ratio` (default `DEFAULT_FEE_RATIO`) | the account's taker rate from `futures_commission_rate()` |
 | User-data socket | not opened | opened; `ACCOUNT_UPDATE` / `ORDER_TRADE_UPDATE` keep `Status` in sync |
 | Orders | none sent; resting orders live in `Status.open_orders` and are matched against each candle | submitted through `BinanceOrderClient`; the exchange owns the book |
-| Position / avg price | updated through `Status.apply_fill` | updated from exchange fills |
+| Position / avg price | updated through `apply_fill` (in `executor/simulated.py`) | updated from exchange fills |
 | Recorded trades | local fill at `executor.last_close[action.symbol]` | real exchange fill (`ap` / `z` / `rp` / `n`) |
 | Forced liquidation | simulated when equity ≤ 0 | the exchange's |
 | Recorded run id | `dry_<Streamer>_<SYM1-SYM2-...>_<INTERVAL>` | `live_<Streamer>_<SYM1-SYM2-...>_<INTERVAL>` |
