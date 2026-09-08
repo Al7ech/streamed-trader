@@ -171,7 +171,7 @@ class SimulatedExecutor(Executor):
         self.status.update_unrealised_pnl(symbol, price)
         prev_status = copy.deepcopy(self.status)
         wnl, fee = self.status.apply_fill(symbol, quantity, price)
-        leverage = self.status.update_leverage()
+        leverage = self.status.leverage()
         trade = Trade(
             timestamp=event_time,
             symbol=symbol,

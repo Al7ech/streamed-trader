@@ -356,7 +356,6 @@ class BinanceTrader:
             pos.unrealised_pnl = saved_pos.unrealised_pnl
             pos.position = saved_pos.position
         self.status.margin = saved.margin
-        self.status.leverage = saved.leverage
         # 미체결 주문도 되살린다. 드라이런의 장부는 이 프로세스 안에만 있어서, 복원하지
         # 않으면 재기동할 때마다 걸어둔 손절이 조용히 사라진다.
         self.status.open_orders = copy.deepcopy(saved.open_orders)

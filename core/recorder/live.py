@@ -284,7 +284,6 @@ class LiveRecorder(Recorder):
             self.resumed_status = Status(
                 margin=float(saved_status.get("margin", 0.0)),
                 positions=positions,
-                leverage=float(saved_status.get("leverage", 0.0)),
                 # 드라이런은 이 장부가 유일한 사본이다. 복원하지 않으면 재기동할 때마다
                 # 걸어둔 손절이 사라진다. 라이브에서는 거래소 장부와 대조하는 데 쓴다
                 # (BinanceTrader._reconcile_resumed_orders).
@@ -380,7 +379,7 @@ class LiveRecorder(Recorder):
         # 재기동할 때마다 걸어둔 손절이 조용히 사라진다 (라이브는 거래소가 들고 있다).
         meta["last_status"] = {
             "margin": self._status.margin,
-            "leverage": self._status.leverage,
+            "leverage": self._status.leverage(),
             "positions": {
                 sym: {"avg_price": p.avg_price, "position": p.position,
                      "unrealised_pnl": p.unrealised_pnl}

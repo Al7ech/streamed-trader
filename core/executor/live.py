@@ -175,9 +175,6 @@ def build_status(account_info: Dict, raw_open_orders: List[Dict], symbols: List[
         pos.avg_price = float(info.get("entryPrice", 0.0)) if info else 0.0
         pos.unrealised_pnl = float(info.get("unrealizedProfit", 0.0)) if info else 0.0
         pos.position = float(info.get("positionAmt", 0.0)) if info else 0.0
-    # 레버리지는 전 심볼을 다 채운 뒤 한 번만 계산한다 — 심볼별로 부르면 아직 값을 채우지
-    # 않은 다른 심볼 때문에 중간값이 잘못 계산된다.
-    status.update_leverage()
 
     # 미체결 주문도 거래소에서 끌어온다. 프로세스가 죽어 있어도 걸어둔 손절은 거래소에서
     # 계속 살아 있으므로, 이걸 안 하면 전략이 "손절이 없다"고 보고 하나 더 걸어 이중으로
@@ -568,7 +565,6 @@ class LiveExecutor(Executor):
                     position_updated = True
                 if position_updated:
                     updated.append("position")
-                    self.status.update_leverage()
 
             # 실제로 뭔가 반영됐을 때만 INFO. 이 핸들러는 우리 자산/심볼 항목이 없으면 status를
             # 건드리지 않는 게 설계인데, 그런 이벤트에서도 찍으면 아무것도 바뀌지 않은 줄이
@@ -739,7 +735,7 @@ class LiveExecutor(Executor):
             wnl=agg.wnl,
             fee=agg.fee,
             status=pre_status,
-            leverage=self.status.update_leverage(),
+            leverage=self.status.leverage(),
             order_type=pending.order_type if pending is not None else ActionType.MARKET.value,
             submitted_at=pending.timestamp if pending is not None else timestamp,
         ))

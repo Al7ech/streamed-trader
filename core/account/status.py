@@ -23,12 +23,10 @@ class Status:
     def __init__(self,
                  margin: float = 0.0,
                  positions: Optional[Dict[str, PositionState]] = None,
-                 leverage: float = 0.0,
                  open_orders: Optional[Dict[str, List["OpenOrder"]]] = None,
                  fee_ratio: float = DEFAULT_FEE_RATIO):
         self.margin = margin
         self.positions: Dict[str, PositionState] = positions if positions is not None else {}
-        self.leverage = leverage
         #: 명목가치에 곱할 수수료율. 계좌 속성이라 여기 둔다 — 실행기가 채우고
         #: (백테스트: 생성자 인자, 라이브: 거래소 커미션 티어), 전략은 사이징 시 이 값을 읽는다.
         self.fee_ratio = fee_ratio
@@ -41,10 +39,6 @@ class Status:
 
     def position_for(self, symbol: str) -> PositionState:
         """해당 심볼의 PositionState. 처음 보는 심볼이면 flat 상태로 만들어 등록한다.
-
-        ``setdefault``가 아니라 get-후-삽입인 것은 성능 때문이다: ``setdefault(sym,
-        PositionState())``는 키가 이미 있어도 매 호출마다 ``PositionState()``를 새로
-        만들어 버린다 — 이 메서드는 이벤트·심볼당 여러 번 불려 그 낭비가 수천만 회 쌓인다.
         """
         p = self.positions.get(symbol)
         if p is None:
@@ -75,8 +69,13 @@ class Status:
         p.unrealised_pnl = p.position * (price - p.avg_price)
         return p.unrealised_pnl
 
-    def update_leverage(self) -> float:
+    def leverage(self) -> float:
         """실효 레버리지 = 전 심볼 명목가치(평단 기준) 합 / 시가평가 자본.
+
+        ``total_margin()``과 같은 부류의 **매 호출 계산되는 파생값**이다 — 저장하지 않는다.
+        저장 필드로 두면 apply_fill/시가평가가 positions·margin을 바꾼 뒤 누가 갱신을 부르기
+        전까지 낡은 값이 남는데, positions·margin만으로 언제든 다시 구할 수 있으므로 캐시할
+        이유가 없다. 체결 순간에 얼려야 하는 시점 값은 ``Trade.leverage``가 따로 들고 있다.
 
         분모는 margin이 아니라 total_margin()이다. margin만 쓰면 미실현손익이 빠져서, 수수료로
         margin이 음수가 된 순간 비율이 음수가 되고 그게 max(0.0, ...)에 눌려 **파산이 레버리지
@@ -88,11 +87,9 @@ class Status:
         """
         equity = self.total_margin()
         if equity <= 0.0:
-            self.leverage = 0.0
-        else:
-            notional = sum(p.avg_price * abs(p.position) for p in self.positions.values())
-            self.leverage = notional / equity
-        return self.leverage
+            return 0.0
+        notional = sum(p.avg_price * abs(p.position) for p in self.positions.values())
+        return notional / equity
 
     def apply_fill(self, symbol: str, quantity: float,
                    price: float) -> Tuple[float, float]:
@@ -165,5 +162,5 @@ class Status:
                               for sym, p in self.positions.items())
         resting = self.total_open_orders()
         orders = f", open_orders: {resting}" if resting else ""
-        return (f"[margin: {self.margin}, leverage: {self.leverage}, "
+        return (f"[margin: {self.margin}, leverage: {self.leverage()}, "
                 f"positions: {{{positions}}}{orders}]")
