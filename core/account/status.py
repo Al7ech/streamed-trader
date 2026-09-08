@@ -4,10 +4,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 if TYPE_CHECKING:  # 런타임 임포트는 순환을 만든다 (order_book이 Status를 쓴다)
     from core.order.order_book import OpenOrder
 
-#: 계좌 수수료율의 기본값. 실제로는 거래소가 VIP/커미션 티어로 정하는 계좌 속성이라
-#: ``Status``에 얹혀 있고, 실행기가 자기 생성 경로에서 이 값을 채운다 —
+#: 계좌 수수료율의 **유일한 기본값 정의**. 실제로는 거래소가 VIP/커미션 티어로 정하는 계좌
+#: 속성이라 ``Status``에 얹혀 있고, 실행기는 값(또는 ``None``)을 넘겨주기만 한다 —
 #: ``SimulatedExecutor``는 생성자 인자로, ``LiveExecutor``는 ``futures_commission_rate``로.
-#: 전략은 사이징할 때 ``status.fee_ratio``를 읽는다.
+#: 넘어온 값이 ``None``이면 아래 ``Status.__init__``이 이 상수를 박는다 (기본값이 실제로
+#: 적용되는 곳은 거기 한 줄뿐이다). 전략은 사이징할 때 ``status.fee_ratio``를 읽는다.
 DEFAULT_FEE_RATIO = 0.0004
 
 
@@ -24,12 +25,13 @@ class Status:
                  margin: float = 0.0,
                  positions: Optional[Dict[str, PositionState]] = None,
                  open_orders: Optional[Dict[str, List["OpenOrder"]]] = None,
-                 fee_ratio: float = DEFAULT_FEE_RATIO):
+                 fee_ratio: Optional[float] = None):
         self.margin = margin
         self.positions: Dict[str, PositionState] = positions if positions is not None else {}
-        #: 명목가치에 곱할 수수료율. 계좌 속성이라 여기 둔다 — 실행기가 채우고
+        #: 명목가치에 곱할 수수료율. 계좌 속성이라 여기 둔다 — 실행기가 값(또는 None)을 넘기고
         #: (백테스트: 생성자 인자, 라이브: 거래소 커미션 티어), 전략은 사이징 시 이 값을 읽는다.
-        self.fee_ratio = fee_ratio
+        #: None이면 여기서 ``DEFAULT_FEE_RATIO``를 박는다 — 기본값이 적용되는 유일한 지점.
+        self.fee_ratio = DEFAULT_FEE_RATIO if fee_ratio is None else fee_ratio
         #: 심볼별 미체결(resting) 주문. 거래소에서 미체결 주문은 실제로 계좌 상태의 일부이고,
         #: Status는 백테스터와 라이브 트레이더가 공유하는 단일 계좌 상태 표현이므로 여기 둔다.
         #: 덕분에 decide_action(candles, status) 시그니처를 바꾸지 않고도 전략이 자기

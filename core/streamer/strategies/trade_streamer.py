@@ -28,13 +28,13 @@ class TradeStreamer(BaseStreamer):
         position = status.position_for(symbol).position
         if position == 0:
             # 포지션이 없으면 dir 방향으로 전액 진입하고 다음 번을 위해 방향을 뒤집는다.
-            # 수수료(0.0004)만큼 여유를 두어 반올림으로 마진을 초과 주문하지 않도록 한다.
+            # 수수료율(status.fee_ratio)만큼 여유를 두어 반올림으로 마진을 초과 주문하지 않도록 한다.
             if self.dir == 1:
-                qty = trunc_by_sign(status.total_margin() / candle.close * (1 + 0.0004), 3)
+                qty = trunc_by_sign(status.total_margin() / candle.close * (1 + status.fee_ratio), 3)
                 self.dir = -1
                 return [Action(symbol, qty)]
             else:
-                qty = trunc_by_sign(-status.total_margin() / candle.close * (1 + 0.0004), 3)
+                qty = trunc_by_sign(-status.total_margin() / candle.close * (1 + status.fee_ratio), 3)
                 self.dir = 1
                 return [Action(symbol, qty)]
         else:

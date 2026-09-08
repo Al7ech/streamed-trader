@@ -15,7 +15,7 @@ from typing import Callable, Dict, Optional
 from core.order import order_book
 from core.order.action import Action, ActionType
 from core.candle.candle import Candle
-from core.account.status import DEFAULT_FEE_RATIO, Status
+from core.account.status import Status
 from core.account.trade import Trade
 from core.executor.base import Executor
 
@@ -29,14 +29,15 @@ class SimulatedExecutor(Executor):
     :param init_margin: 초기 증거금. 계좌 ``Status``는 여기서 만들어지고 이 실행기가 소유한다 —
         호출자는 ``executor.status``로 읽는다 (레코더에 넘길 때도 그 참조를 쓴다).
     :param fee_ratio: 명목가치에 곱할 수수료율. 이 값이 ``Status.fee_ratio``에 실려 회계
-        (``apply_fill``)와 전략 사이징(``status.fee_ratio``)이 같은 값을 본다.
+        (``apply_fill``)와 전략 사이징(``status.fee_ratio``)이 같은 값을 본다. ``None``이면
+        ``Status``가 ``DEFAULT_FEE_RATIO``를 박는다.
     :param slippage_ratio: 조건부 시장가(STOP_MARKET) 체결에 불리하게 얹을 비율. 순전히
         백테스트 모델링 값이라 ``Status``에 얹지 않고 여기서만 들고 있다 — 전략은 읽지 않는다.
     :param log_label: 체결 로그에 붙일 접두사. 드라이런은 ``"dry-run"``을 넘겨 실제 돈이 걸린
         체결과 구분되게 한다 (백테스트는 접두사가 없다).
     """
 
-    def __init__(self, init_margin: float, fee_ratio: float = DEFAULT_FEE_RATIO,
+    def __init__(self, init_margin: float, fee_ratio: Optional[float] = None,
                  slippage_ratio: float = 0.0,
                  on_trade: Optional[Callable[[Trade], None]] = None, log_label: str = ""):
         super().__init__(Status(margin=init_margin, fee_ratio=fee_ratio), on_trade)

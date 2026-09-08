@@ -25,7 +25,7 @@ from binance import AsyncClient, BinanceSocketManager
 
 from core.producer.historical import BinanceHistoricalCandleProducer
 from core.executor.simulated import SimulatedExecutor
-from core.account.status import DEFAULT_FEE_RATIO, Status
+from core.account.status import Status
 from core.engine.engine import TradingEngine
 from core.executor.base import Executor
 from core.fetcher.binance.rest_fetcher import BinanceCandleFetcher
@@ -62,8 +62,8 @@ class BinanceTrader:
             가져오므로 별도 인자가 없다 — 트레이더가 스트리머와 무엇을 거래하는지에 대해
             어긋날 수 없다.
         :param fee_ratio: 드라이런 회계/사이징에 적용할 수수료율 (``Status.fee_ratio``로 실린다).
-            None이면 ``DEFAULT_FEE_RATIO``. 라이브에서는 ``LiveExecutor.create``가 거래소
-            커미션 티어에서 직접 채우므로 이 값은 쓰이지 않는다.
+            None이면 그대로 넘겨 ``Status``가 기본값을 박는다. 라이브에서는
+            ``LiveExecutor.create``가 거래소 커미션 티어에서 직접 채우므로 이 값은 쓰이지 않는다.
         :param slippage_ratio: 드라이런에서 조건부 시장가 체결에 얹을 슬리피지. 백테스트와
             대조할 때 그쪽 설정과 맞춘다.
         :param record: True면 실행 결과를 ``<result_path>/live/`` 에 **백테스트와 같은
@@ -88,7 +88,9 @@ class BinanceTrader:
         # 정산 자산은 **두 모드 모두** 검증한다 — Status.margin이 전 심볼 공유 풀이라는 전제가
         # 드라이런에서도 똑같이 성립해야 하고, 설정 오류는 일찍 잡을수록 좋다.
         self._margin_asset = resolve_margin_asset(self.symbols)
-        self.fee_ratio = fee_ratio if fee_ratio is not None else DEFAULT_FEE_RATIO
+        #: 드라이런 executor에 그대로 넘길 원본 (None이면 Status가 기본값을 박는다). 해소된
+        #: 값은 executor 생성 후 ``self.status.fee_ratio``가 유일한 출처다.
+        self._fee_ratio: Optional[float] = fee_ratio
         self.slippage_ratio = slippage_ratio
 
         #: 액션을 체결로 바꾸는 실행기. 드라이런과 라이브의 차이는 **거의 전부** 여기 있다.
@@ -151,7 +153,7 @@ class BinanceTrader:
             if self.dry_run:
                 # 백테스트와 같은 클래스다. 체결 규칙·회계·미체결 장부가 한 벌이라 드라이런
                 # 결과를 같은 구간의 백테스트와 그대로 대조할 수 있다.
-                self.executor = SimulatedExecutor(DRY_RUN_MARGIN, self.fee_ratio,
+                self.executor = SimulatedExecutor(DRY_RUN_MARGIN, self._fee_ratio,
                                                   self.slippage_ratio, log_label="dry-run")
             else:
                 self.executor = await LiveExecutor.create(

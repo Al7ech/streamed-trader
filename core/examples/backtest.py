@@ -9,10 +9,6 @@ from core.engine.engine import TradingEngine
 from core.logging_config import setup_logging
 from core.streamer.strategies.keltner_streamer import KeltnerStreamer
 
-#: 명목가치에 곱할 수수료율. 실행기가 만드는 Status.fee_ratio에 실려 회계와 전략 사이징이
-#: 같은 값을 본다. 라이브는 이 대신 거래소 커미션 티어를 쓴다.
-FEE_RATIO = 0.0004
-
 if __name__ == "__main__":
     # 0. 로깅 설정. 이게 없으면 페처/백테스터의 경고가 lastResort 핸들러로 빠져
     #    레벨명 없는 맨 줄로 tqdm 진행바 사이에 섞인다 (월 청크 데이터 구멍 경고 등).
@@ -45,15 +41,16 @@ if __name__ == "__main__":
         "start": start_date.isoformat(),
         "end": end_date.isoformat(),
         "params": params,
-        "fee_ratio": FEE_RATIO,
     }
     # 실험 목적 한 줄 라벨: uv run python core/examples/backtest.py "ATR 채널폭 2.0 검증"
     if len(sys.argv) > 1:
         metadata["label"] = sys.argv[1]
 
-    # 수수료율은 실행기가 만드는 Status.fee_ratio에 실려 회계와 전략 사이징이 같은 값을 본다.
     # 계좌 상태는 실행기가 만들어 소유한다 — 레코더에는 그 참조(executor.status)를 넘긴다.
-    executor = SimulatedExecutor(init_margin, FEE_RATIO)
+    # fee_ratio를 안 넘기면 Status가 DEFAULT_FEE_RATIO를 박는다. 회계와 전략 사이징이 같은
+    # 값을 보고, 런 JSON metadata의 fee_ratio도 그 하나에서 읽는다. 라이브는 거래소 티어를 쓴다.
+    executor = SimulatedExecutor(init_margin)
+    metadata["fee_ratio"] = executor.status.fee_ratio
     # metadata를 주면 런 JSON을, save_series까지 주면 시계열 샤드도 asset/backtest/ 에 쓴다.
     recorder = BacktestRecorder(streamer, executor.status, interval_ms=producer.interval_ms,
                                 metadata=metadata, save_series=True)

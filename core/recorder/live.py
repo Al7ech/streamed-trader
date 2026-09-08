@@ -281,6 +281,8 @@ class LiveRecorder(Recorder):
                                    unrealised_pnl=float(p.get("unrealised_pnl", 0.0)))
                 for sym, p in (saved_status.get("positions") or {}).items()
             }
+            # fee_ratio는 담지 않는다 — 기동 시점에 새로 정해진다 (라이브: 거래소 커미션 조회,
+            # 시뮬/드라이런: SimulatedExecutor 생성자 인자). last_status에 실어 봐야 쓰이지 않는다.
             self.resumed_status = Status(
                 margin=float(saved_status.get("margin", 0.0)),
                 positions=positions,
@@ -325,6 +327,8 @@ class LiveRecorder(Recorder):
                 price=float(d["price"]),
                 wnl=float(d["wnl"]),
                 fee=float(d["fee"]),
+                # fee_ratio 미지정 — Status가 기본값을 박는다. 집계는 position 부호와
+                # total_margin()만 보므로 실제 요율은 필요 없다.
                 status=Status(margin=float(d.get("margin", 0.0)),
                               positions={symbol: PositionState(position=float(d.get("position", 0.0)))}),
                 leverage=float(d.get("leverage", 0.0)),

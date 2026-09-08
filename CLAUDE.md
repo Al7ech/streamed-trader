@@ -216,19 +216,25 @@ imports it (the engine, recorders and `indicator_columns` reach indicators only 
 
    ```python
    # DEFAULT_INIT_MARGIN lives in core.executor.simulated; the executor builds and owns the Status.
-   executor = SimulatedExecutor(DEFAULT_INIT_MARGIN, fee_ratio)
+   # fee_ratio omitted → Status stamps DEFAULT_FEE_RATIO; pass a float to override.
+   executor = SimulatedExecutor(DEFAULT_INIT_MARGIN)
    recorder = BacktestRecorder(streamer, executor.status, interval_ms=producer.interval_ms,
                                metadata=metadata, save_series=True)
    report   = TradingEngine(streamer, producer, executor, recorder).run()
    ```
 
-   `fee_ratio` is a `Status` field the executor sets — `SimulatedExecutor` from its constructor
-   arg (default `DEFAULT_FEE_RATIO` in `core/account/status.py`), `LiveExecutor.create` from the
-   exchange's own taker commission rate (`futures_commission_rate`). Strategies read
-   `status.fee_ratio` when sizing, so the fee the account is charged and the fee the strategy
-   sized against are one value by construction — the old `resolve_fee_ratio`/`resolve_slippage_ratio`
-   reconciliation is gone. `slippage_ratio` stays a `SimulatedExecutor` argument only (a
-   simulation modelling knob, not account state; no strategy sizes with it).
+   `fee_ratio` lives in exactly one place at runtime — `executor.status.fee_ratio` — and the sole
+   default literal is `DEFAULT_FEE_RATIO` in `core/account/status.py`. `SimulatedExecutor.__init__`
+   and `build_status` take `Optional[float]` and forward it (or `None`) straight into `Status`,
+   which is where `None` becomes `DEFAULT_FEE_RATIO` — the one line that applies the default.
+   `LiveExecutor.create` fills it from the exchange's own taker commission rate
+   (`futures_commission_rate`); that fetch failing is **fatal** (no fallback — sizing on a wrong
+   rate is worse than a failed startup). Strategies read `status.fee_ratio` when sizing, so the
+   fee the account is charged and the fee the strategy sized against are one value by
+   construction — the old `resolve_fee_ratio`/`resolve_slippage_ratio` reconciliation is gone.
+   `core/examples/backtest.py` writes `metadata["fee_ratio"] = executor.status.fee_ratio` (read
+   back off the Status, never a separate literal). `slippage_ratio` stays a `SimulatedExecutor`
+   argument only (a simulation modelling knob, not account state; no strategy sizes with it).
 
    It is multi-symbol. The candle source is one of:
    - `InMemoryCandleProducer(candles_by_symbol)` (`producer/in_memory.py`) —
@@ -521,7 +527,8 @@ existing ragged-series contract with no changes needed there.
   price) so it is step-shaped between account events, whereas a backtest re-marks every open
   position to the bar close every candle; live sizing uses `status.fee_ratio` from the account's real taker commission tier
   (`futures_commission_rate`) while a backtest uses whatever `fee_ratio` the caller passed
-  `SimulatedExecutor`, so position sizes can differ if the two rates differ; and BNB-denominated
+  `SimulatedExecutor` (or `DEFAULT_FEE_RATIO` when omitted), so position sizes can differ if the
+  two rates differ; and BNB-denominated
   commissions (`N` != margin asset) are excluded from `fee` and flagged as
   `metadata.fee_asset_mismatch`.
 
@@ -741,9 +748,9 @@ never matches resting orders, and the exchange owns the book, hydrated at startu
 
 `Status` is the single shared representation of account state, **created and owned by the
 executor** (`executor.status` — nothing outside an executor constructs one: `SimulatedExecutor`
-takes an `init_margin` scalar and a `fee_ratio` and builds it, `LiveExecutor.create()` reads the
-exchange — wallet balance, positions, open orders, **and the taker commission rate** — and builds
-it, so a `Status` that has not yet been filled in cannot be observed) and modelling one
+takes an `init_margin` scalar and an optional `fee_ratio` and builds it, `LiveExecutor.create()`
+reads the exchange — wallet balance, positions, open orders, **and the taker commission rate** —
+and builds it, so a `Status` that has not yet been filled in cannot be observed) and modelling one
 **shared cross-margin pool** (`margin`, a bare scalar)
 across per-symbol positions (`positions: Dict[str, PositionState]`, each holding `avg_price`,
 `position`, `unrealised_pnl`) — matching how Binance USD-M cross margin actually works: a loss on
@@ -767,12 +774,15 @@ from it — `Action.trigger_above` is required and carries it. Live has no equiv
 `Executor` interface is just `begin_event`/`submit`, and
 `LiveExecutor` marks nothing — `record_event` reads `status.total_margin()` off the last
 `ACCOUNT_UPDATE`.
-`status.fee_ratio` is the account's fee rate — a `Status` field (default `DEFAULT_FEE_RATIO` in
-`core/account/status.py`) the executor sets: `SimulatedExecutor` from its constructor arg,
-`LiveExecutor` from `futures_commission_rate`. Strategies read it when sizing (`price * (1/lev +
-status.fee_ratio)`), so the fee the account is charged and the fee the position was sized against
-are the same number — this is why the `resolve_fee_ratio` streamer-reconciliation helper no longer
-exists.
+`status.fee_ratio` is the account's fee rate and the single runtime home for the value — a
+`Status` field the executor supplies: `SimulatedExecutor` forwards its optional constructor arg,
+`LiveExecutor` forwards `futures_commission_rate` (fetch failure is fatal — no default fallback).
+Either may pass `None`, and `Status.__init__` is the one place that turns `None` into
+`DEFAULT_FEE_RATIO` (`core/account/status.py`, the only default literal). Strategies read
+`status.fee_ratio` when sizing (`price * (1/lev + status.fee_ratio)`), so the fee the account is
+charged and the fee the position was sized against are the same number — this is why the
+`resolve_fee_ratio` streamer-reconciliation helper no longer exists. It is never serialized or
+restored (`metadata.last_status` omits it): every startup sources it fresh.
 `Status.apply_fill(symbol, quantity, price)` holds the one copy of the averaging/PNL
 math (charging `self.fee_ratio` on the notional) — and it derives realised PnL by **pro-rating
 `unrealised_pnl`**, which is only correct when
@@ -864,7 +874,11 @@ straight to `executor.on_user_data(...)`.
     `Status(margin=0.0)` that a later `load_account()` overwrote, and reading it in between (the
     live recorder takes `init_margin` from it) silently produced a run with `init_margin` 0.
     Balance comes from `walletBalance`, not `marginBalance` — the latter already includes
-    unrealised PnL, which `total_margin()` adds again. A `futures_account()` failure is fatal; a
+    unrealised PnL, which `total_margin()` adds again. `create()` also fetches the taker
+    commission rate (`_fetch_taker_commission` → `futures_commission_rate`, `symbols[0]`'s value,
+    warning if symbols disagree) for `status.fee_ratio`. A `futures_account()` **or**
+    `_fetch_taker_commission` failure is fatal (`create` cleans up any resource it owns and
+    re-raises — sizing on a wrong fee rate is worse than a failed startup); a
     `futures_get_open_orders()` failure is not (the book looks empty and `ORDER_TRADE_UPDATE`
     refills it). After startup the state is kept in sync by `ACCOUNT_UPDATE`/`ORDER_TRADE_UPDATE`.
   - **Clients are self-created unless injected**, and `close()` only tears down what it created.

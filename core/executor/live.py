@@ -39,7 +39,7 @@ from core.order import order_book
 from core.order.action import Action, ActionType
 from core.candle.candle import Candle
 from core.order.order_book import OpenOrder
-from core.account.status import DEFAULT_FEE_RATIO, Status
+from core.account.status import Status
 from core.account.trade import Trade
 from core.executor.base import Executor
 from core.executor.binance_order_client import BinanceOrderClient, OrderResult
@@ -144,7 +144,7 @@ def order_from_exchange(o: Dict) -> Optional[OpenOrder]:
 
 
 def build_status(account_info: Dict, raw_open_orders: List[Dict], symbols: List[str],
-                 margin_asset: str, fee_ratio: float = DEFAULT_FEE_RATIO) -> Status:
+                 margin_asset: str, fee_ratio: Optional[float] = None) -> Status:
     """거래소 응답을 계좌 상태로 옮긴다 — **I/O 없는 순수 함수**.
 
     :meth:`LiveExecutor.create`가 받아온 ``futures_account()`` / ``futures_get_open_orders()``
@@ -336,17 +336,14 @@ class LiveExecutor(Executor):
 
         커미션율은 심볼별이지만 ``Status.fee_ratio``는 하나뿐이라 ``symbols[0]``의 값을 쓰고,
         심볼끼리 다르면 경고한다 (``resolve_margin_asset``과 같은 "하나로 합의, 어긋나면 경고"
-        관용구). 조회 실패는 **치명적이지 않다** — 기본값으로 떨어져도 사이징은 돈다.
+        관용구). 조회 실패는 **치명적이다** — 잘못된 수수료율로 사이징하느니 기동을 멈춘다.
+        예외는 그대로 전파되고, :meth:`create`가 소유 자원을 정리한 뒤 재던진다
+        (``futures_account()`` 실패와 같은 취급).
         """
-        try:
-            rates = {}
-            for symbol in symbols:
-                resp = await client.futures_commission_rate(symbol=symbol)
-                rates[symbol] = float(resp["takerCommissionRate"])
-        except Exception as e:
-            _logger.warning("커미션율을 불러오지 못했다 (기본값 %s 사용): %s",
-                            DEFAULT_FEE_RATIO, e)
-            return DEFAULT_FEE_RATIO
+        rates = {}
+        for symbol in symbols:
+            resp = await client.futures_commission_rate(symbol=symbol)
+            rates[symbol] = float(resp["takerCommissionRate"])
         chosen = rates[symbols[0]]
         if len(set(rates.values())) > 1:
             _logger.warning("심볼별 taker 커미션율이 다르다: %s — %s의 %s를 쓴다",
