@@ -338,8 +338,9 @@ per-symbol match loop; `SimulatedExecutor.begin_event` folds the whole thing (`m
 its per-symbol
 iteration order is the `candles` dict's (alphabetical by symbol from the merge heap tiebreak), not
 `streamer.symbols` — fill price/quantity/realised PnL are independent of cross-symbol order, though
-in a multi-symbol event where two symbols both fill resting orders the `Trade.prev_status`/`leverage`
-snapshot of the first can show the other still marked to the previous event's close. The equity
+in a multi-symbol event where two symbols both fill resting orders the first fill's `Trade.pre_margin`
+(and `leverage`) can be computed while the other symbol is still marked to the previous event's close.
+The equity
 point comes from `record_event` reading `status.total_margin()` after `begin_event` and before
 MARKET submits (step 7), which is why a MARKET fill's state applies from the *next* event while a
 resting fill's applies from this one.
@@ -498,15 +499,16 @@ existing ragged-series contract with no changes needed there.
   candles produce identical trades. Live records **real exchange fills** from
   `ORDER_TRADE_UPDATE`, aggregated per `(symbol, order_id)` into one `Trade` (`price` = `ap`,
   `quantity` = signed `z`, `wnl` = Σ`rp`, `fee` = Σ`n`) and emitted on a terminal order state —
-  `CANCELED`/`EXPIRED` with `z > 0` included, since those are real fills. The pre-trade `Status`
-  snapshot is deep-copied *before* the order is sent, because sending yields the event loop and a
-  fill / `ACCOUNT_UPDATE` can overwrite `status` before the `Trade` is built; the order result is
+  `CANCELED`/`EXPIRED` with `z > 0` included, since those are real fills. The pre-trade
+  `pre_position`/`pre_margin` scalars are read *before* the order is sent, because sending yields
+  the event loop and a fill / `ACCOUNT_UPDATE` can overwrite `status` before the `Trade` is built;
+  the order result is
   awaited in a detached task (`LiveExecutor._await_order_result`), not inline. For a **market** fill
   `Trade.timestamp` is the decision candle's `end_time`, not the fill's `T`, so trades bucket with
   the candle that caused them on aggregated views; for a **resting** fill it is the real fill time
   (`T`), because the decision was bars earlier and bucketing it there would be actively wrong —
   `submitted_at` carries the decision time instead. `_pending_decision` (used to pair a dispatched
-  order with its pre-trade snapshot) is keyed by `(symbol, client order id)`: every order now gets
+  order with its pre-trade `pre_position`/`pre_margin`) is keyed by `(symbol, client order id)`: every order now gets
   a `newClientOrderId` (auto-generated for market orders, the strategy's `client_id` for resting
   ones) which the exchange echoes back as `c`, so pairing is exact rather than a per-symbol guess —
   which also lifts the old "one in-flight decision per symbol" limit. Only market entries are
@@ -802,11 +804,16 @@ never does fill accounting — the exchange's `ACCOUNT_UPDATE` is the truth ther
 only state plus read-only derived helpers (`total_margin`, `leverage`, `update_unrealised_pnl`),
 not this mode-specific behaviour.
 A `Trade` is an immutable record of one fill (with its
-`symbol`) plus a deep-copied pre-trade `Status`; its `wnl` is realised PnL **before** the fee,
-which is carried separately in `fee`. It also carries `order_type` (the `ActionType` value that
-produced it) and `submitted_at` — for a market fill that equals `timestamp`, but a resting order is
-submitted bars before it fills and one timestamp cannot hold both. `Report` bundles all `Trade`s with `max_leverage`, the final
-`Status` and the equity curve.
+`symbol`) plus `pre_position`/`pre_margin` — two scalars read off the pre-trade `Status`: the
+signed position for this symbol and the account-wide `total_margin()` at decision time. They used
+to be a whole deep-copied `Status`, but the only readers are `result_writer._win_lose_counts`
+(needs the pre-trade position sign) and `trades[].margin` in the run JSON (the frontend's per-trade
+%), so the snapshot is trimmed to exactly those two — and a run resumed from its own JSON now
+rebuilds the same `Trade` shape instead of a two-field stand-in `Status`. `wnl` is realised PnL
+**before** the fee, which is carried separately in `fee`. It also carries `order_type` (the
+`ActionType` value that produced it) and `submitted_at` — for a market fill that equals `timestamp`,
+but a resting order is submitted bars before it fills and one timestamp cannot hold both. `Report`
+bundles all `Trade`s with `max_leverage`, the final `Status` and the equity curve.
 
 ### Live trading (`core/trader/` + each port's `live.py`)
 
@@ -834,7 +841,7 @@ straight to `executor.on_user_data(...)`.
   message, *decision* processing across symbols is naturally serialized and needs no extra locking.
   Live order submissions are fired to the thread pool and not awaited, so an order result may land
   after later candles; that race, plus the kline-vs-user-data-listener race, is tolerated because
-  `status` is exchange truth and the pre-trade snapshot is deep-copied before the order is sent.
+  `status` is exchange truth and the pre-trade `pre_position`/`pre_margin` are read before the order is sent.
   - **Gaps and duplicates are detected per symbol** (each tracks its own `_last_candle_start`,
     advanced *before* the candle is yielded so a consumer exception cannot cause a re-run). A gap
     is filled by **yielding the missing candles first** — so "backfilled candles take the same path
@@ -867,8 +874,9 @@ straight to `executor.on_user_data(...)`.
     an entry signal on a bar missed during a disconnect is skipped entirely — is deliberate.
 - **`executor/live.py` — orders and account state.** `submit()` fires the order and returns `None`;
   a detached task (`_await_order_result`) awaits the submission result and routes a failure to
-  `on_error`. The fill arrives later on the user-data stream, so the pre-trade `Status`
-  snapshot is deep-copied *before* the order is sent and keyed by `(symbol, client order id)` —
+  `on_error`. The fill arrives later on the user-data stream, so the pre-trade
+  `pre_position`/`pre_margin` are read *before* the order is sent, and the decision keyed by
+  `(symbol, client order id)` —
   every order
   gets a `newClientOrderId` (auto-generated for market orders, the strategy's `client_id` for
   resting ones) which the exchange echoes back as `c`, so a resting order that fills hours later is

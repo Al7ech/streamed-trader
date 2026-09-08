@@ -59,11 +59,11 @@ if __name__ == "__main__":
     # 4. 결과 출력
     print(f"Max Leverage: {report.max_leverage}")
     # 런 JSON의 summary와 같은 규칙: 실현이 일어난 체결만, 수수료 차감 후로 승패를 가른다.
-    closes = [t for t in report.trades if t.status.position_for(t.symbol).position * t.quantity < 0]
+    closes = [t for t in report.trades if t.pre_position * t.quantity < 0]
     win_trades = sum(1 for t in closes if t.wnl - t.fee > 0)
     lose_trades = sum(1 for t in closes if t.wnl - t.fee < 0)
     trades = win_trades + lose_trades
     win_pct = win_trades / trades * 100 if trades else 0.0
     print(f"Trade wins: {win_trades}/{trades} ({win_pct:.2f}%)")
-    # Trade.status는 **거래 전** 스냅샷이라 마지막 거래의 손익/수수료가 빠진다. 최종 상태를 쓴다.
+    # Trade.pre_margin은 **거래 전** 값이라 마지막 거래의 손익/수수료가 빠진다. 최종 상태를 쓴다.
     print(f"Profit: {(report.status.total_margin() / init_margin - 1) * 100:.2f}%")

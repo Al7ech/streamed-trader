@@ -9,7 +9,6 @@
 것이 의도다.
 """
 
-import copy
 from typing import Callable, Dict, Optional, Tuple
 
 from core.order import order_book
@@ -234,8 +233,9 @@ class SimulatedExecutor(Executor):
               order_type: str, submitted_at: int) -> Trade:
         """체결 하나를 반영하고 ``on_trade``로 흘려보낸다.
 
-        거래 전 스냅샷은 ``apply_fill`` **전에** 떠야 한다 — ``Trade.status``의 계약이고,
-        승패 분류(``result_writer._win_lose_counts``)가 그 시점의 포지션 부호를 본다.
+        거래 전 값(``pre_position``/``pre_margin``)은 ``apply_fill`` **전에** 읽어야 한다 —
+        ``Trade``의 계약이고, 승패 분류(``result_writer._win_lose_counts``)가 그 시점의
+        포지션 부호를 본다.
 
         모듈 함수 ``apply_fill``의 청산 손익은 ``unrealised_pnl``을 안분해서 구하므로, 그 값이
         **체결가 기준**이어야 실현손익이 맞는다. 시장가는 체결가가 곧 이벤트 종가라 직전
@@ -243,7 +243,8 @@ class SimulatedExecutor(Executor):
         매긴다 (시장가에는 같은 값을 다시 계산하는 무해한 no-op이다).
         """
         self.status.update_unrealised_pnl(symbol, price)
-        prev_status = copy.deepcopy(self.status)
+        pre_position = self.status.position_for(symbol).position
+        pre_margin = self.status.total_margin()
         wnl, fee = apply_fill(self.status, symbol, quantity, price)
         leverage = self.status.leverage()
         trade = Trade(
@@ -253,7 +254,8 @@ class SimulatedExecutor(Executor):
             price=price,
             wnl=wnl,
             fee=fee,
-            status=prev_status,
+            pre_position=pre_position,
+            pre_margin=pre_margin,
             leverage=leverage,
             order_type=order_type,
             submitted_at=submitted_at,

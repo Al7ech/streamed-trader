@@ -29,8 +29,7 @@ from core.result.metrics import compute_max_drawdown, compute_sharpe
 # 2: added the top-level "benchmark" block (buy & hold curve) + summary.benchmark_profit_pct.
 # 3: added trades[].position (거래 **전** 포지션). 라이브 런은 재기동 시 자기 run JSON을 다시
 #    읽어 이어쓰는데, build_summary의 승패 판정이 그 심볼의 거래 전 포지션 부호를 보므로
-#    (v4부터는 Trade.status.position_for(symbol).position) 이게 없으면 재개 후 승패 집계를
-#    복원할 수 없다.
+#    (Trade.pre_position) 이게 없으면 재개 후 승패 집계를 복원할 수 없다.
 # 4: 멀티심볼 — trades[]에 "symbol", series에 "symbols"(거래 대상 심볼 목록) 추가. 샤드의
 #    "ohlc"/"indicators"가 심볼별로 "symbols" 아래 중첩되고, "time"/"balance"(계좌 전체
 #    시가평가)는 최상위에 남는다 (증거금이 심볼 간 공유 풀이라 balance는 심볼별 값이 아니다).
@@ -295,9 +294,9 @@ def _sharpe_sampling(interval_ms: int) -> Tuple[int, float]:
 
 def _win_lose_counts(trades) -> Tuple[int, int, int]:
     """승패는 **실현이 일어난 체결**만 센다. 순수 진입은 wnl=0인데 수수료는 붙으므로 그냥
-    (wnl - fee)로 재면 진입이 전부 패배로 집계된다. 거래 전 스냅샷의 포지션과 체결 수량의
+    (wnl - fee)로 재면 진입이 전부 패배로 집계된다. 거래 전 포지션과 체결 수량의
     부호가 반대면 축소 또는 방향 전환 = 실현이 발생한 체결이다."""
-    closes = [t for t in trades if t.status.position_for(t.symbol).position * t.quantity < 0]
+    closes = [t for t in trades if t.pre_position * t.quantity < 0]
     wins = sum(1 for t in closes if t.wnl - t.fee > 0)
     losses = sum(1 for t in closes if t.wnl - t.fee < 0)
     return wins, losses, wins + losses
@@ -370,10 +369,10 @@ def write_run_json(dir_path: str, run_id: str, report: Report, metadata: Dict,
             "price": t.price,
             "wnl": t.wnl,
             "fee": t.fee,
-            "margin": t.status.total_margin(),
+            "margin": t.pre_margin,
             # 거래 **전** 포지션. build_summary의 승패 판정이 이 부호를 보므로, 라이브 런이
             # 재기동 후 자기 run JSON에서 Trade를 복원할 때 이게 없으면 집계가 무너진다.
-            "position": t.status.position_for(t.symbol).position,
+            "position": t.pre_position,
             "leverage": t.leverage,
             # 이 체결을 낳은 주문 종류와 그 주문이 제출된 시각. 지정가/조건부 주문은 둘이
             # 갈라진다 — "이 청산은 손절 체결이었다"를 사후에 구분하려면 필요하다.

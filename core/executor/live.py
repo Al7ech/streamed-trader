@@ -27,7 +27,6 @@
 """
 
 import asyncio
-import copy
 import logging
 import math
 from dataclasses import dataclass
@@ -195,7 +194,8 @@ class _PendingDecision:
     """주문을 내보내기 직전의 스냅샷. 나중에 도착할 체결 이벤트와 짝짓는다."""
     timestamp: int          # 결정 캔들의 end_time
     quantity: float
-    pre_status: Status      # 주문을 보내기 **전에** 뜬 깊은 복사
+    pre_position: float     # 주문을 보내기 **전에** 읽은 이 심볼의 signed 포지션
+    pre_margin: float       # 주문을 보내기 **전에** 읽은 계좌 전체 자본
     symbol: str = ""
     order_type: str = "MARKET"
     resting: bool = False   # True면 캔들 경계에서 버리지 않는다 (몇 봉 뒤 체결이 정상)
@@ -408,12 +408,13 @@ class LiveExecutor(Executor):
         if action.client_id is None:
             action.client_id = self._new_client_order_id()
 
-        # 거래 전 스냅샷은 주문을 내보내기 **전에** 떠야 한다. 주문을 보낸 뒤 이벤트 루프가
+        # 거래 전 값은 주문을 내보내기 **전에** 읽어야 한다. 주문을 보낸 뒤 이벤트 루프가
         # 양보되면 그 사이 체결/계정 갱신 이벤트가 self.status를 이미 바꿔놓을 수 있다.
         self._remember_decision(_PendingDecision(
             timestamp=event_time,
             quantity=action.quantity,
-            pre_status=copy.deepcopy(self.status),
+            pre_position=self.status.position_for(action.symbol).position,
+            pre_margin=self.status.total_margin(),
             symbol=action.symbol,
             order_type=action.order_type.value,
             resting=action.is_resting,
@@ -693,12 +694,13 @@ class LiveExecutor(Executor):
 
         if pending is None:
             # 청산/ADL/앱에서 낸 수동 주문/재기동 직후 남은 체결 등. 실제 자본을 움직이므로
-            # 기록은 하되, 거래 전 스냅샷이 없어 현재 status로 대신한다 — ACCOUNT_UPDATE가
+            # 기록은 하되, 거래 전 값이 없어 현재 status로 대신한다 — ACCOUNT_UPDATE가
             # 이미 반영된 뒤일 수 있어 승패 분류가 틀릴 수 있다.
             self.logger.warning(
                 f"결정과 짝지어지지 않은 체결 (order_id={agg.order_id}, qty={quantity}) — "
-                f"거래 전 스냅샷을 근사한다")
-            pre_status = copy.deepcopy(self.status)
+                f"거래 전 값을 근사한다")
+            pre_position = self.status.position_for(agg.symbol).position
+            pre_margin = self.status.total_margin()
             timestamp = agg.last_trade_ms
         else:
             if pending.quantity * quantity <= 0:
@@ -713,7 +715,8 @@ class LiveExecutor(Executor):
                     "(step size 양자화 미적용, order_id=%s)",
                     abs(quantity - pending.quantity) / abs(pending.quantity) * 100,
                     pending.quantity, quantity, agg.order_id)
-            pre_status = pending.pre_status
+            pre_position = pending.pre_position
+            pre_margin = pending.pre_margin
             if pending.resting:
                 # 미체결 주문은 결정이 몇 봉 전이므로, 결정 캔들에 버킷하면 오히려 틀리다 —
                 # **실제 체결 시각**을 쓴다. 백테스트는 체결을 감지한 봉의 마감 시각을 쓰므로
@@ -731,7 +734,8 @@ class LiveExecutor(Executor):
             price=agg.avg_price,
             wnl=agg.wnl,
             fee=agg.fee,
-            status=pre_status,
+            pre_position=pre_position,
+            pre_margin=pre_margin,
             leverage=self.status.leverage(),
             order_type=pending.order_type if pending is not None else ActionType.MARKET.value,
             submitted_at=pending.timestamp if pending is not None else timestamp,

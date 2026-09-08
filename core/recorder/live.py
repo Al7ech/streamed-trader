@@ -309,9 +309,8 @@ class LiveRecorder(Recorder):
     def _restore_trades(raw: List[Dict]) -> List[Trade]:
         """런 JSON의 체결 기록에서 Trade를 복원한다.
 
-        ``status``는 거래 전 스냅샷의 **대용**이다: ``build_summary``가 쓰는 것은
-        ``position``의 부호와 ``total_margin()``뿐이라, position/margin만 채운 Status면
-        집계 결과가 원본과 같다.
+        ``pre_position``/``pre_margin``은 run JSON의 ``position``/``margin`` 그대로다 —
+        Trade가 애초에 이 두 스칼라만 들므로 복원도 왕복이다.
 
         ``position``은 schema v3에서 추가됐다. 그 이전 파일에는 없어서 0으로 떨어지고, 그런
         체결은 승/패 어느 쪽으로도 세어지지 않는다 — 라이브 런은 v3부터 생기므로 실전에서는
@@ -327,10 +326,8 @@ class LiveRecorder(Recorder):
                 price=float(d["price"]),
                 wnl=float(d["wnl"]),
                 fee=float(d["fee"]),
-                # fee_ratio 미지정 — Status가 기본값을 박는다. 집계는 position 부호와
-                # total_margin()만 보므로 실제 요율은 필요 없다.
-                status=Status(margin=float(d.get("margin", 0.0)),
-                              positions={symbol: PositionState(position=float(d.get("position", 0.0)))}),
+                pre_position=float(d.get("position", 0.0)),
+                pre_margin=float(d.get("margin", 0.0)),
                 leverage=float(d.get("leverage", 0.0)),
                 order_type=d.get("order_type", "MARKET"),
                 submitted_at=d.get("submitted_at"),

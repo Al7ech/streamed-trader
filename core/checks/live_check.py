@@ -156,9 +156,11 @@ def compare_reports(label, ref_report, fast_report) -> bool:
         notional_tol = max(1e-9, 1e-11 * abs(a.quantity * a.price))
         if not (a.timestamp == b.timestamp and a.symbol == b.symbol and a.quantity == b.quantity
                 and a.order_type == b.order_type and a.submitted_at == b.submitted_at
+                and a.pre_position == b.pre_position
                 and math.isclose(a.price, b.price, rel_tol=1e-12, abs_tol=1e-9)
                 and math.isclose(a.wnl, b.wnl, rel_tol=1e-12, abs_tol=notional_tol)
                 and math.isclose(a.fee, b.fee, rel_tol=1e-12, abs_tol=1e-9)
+                and math.isclose(a.pre_margin, b.pre_margin, rel_tol=1e-12, abs_tol=1e-6)
                 and math.isclose(a.leverage, b.leverage, rel_tol=1e-12, abs_tol=1e-9)):
             print(f"  [{label}] FAIL: trade #{i} differs:\n    ref : {a}\n    fast: {b}")
             ok = False

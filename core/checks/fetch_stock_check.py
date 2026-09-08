@@ -124,7 +124,7 @@ def main():
     executor = SimulatedExecutor(init_margin, 0.0005)
     recorder = BacktestRecorder(streamer, executor.status, interval_ms=producer.interval_ms)
     report = TradingEngine(streamer, producer, executor, recorder).run()
-    # Trade.status는 거래 전 스냅샷이므로 최종 상태를 쓴다 (마지막 거래 손익/수수료 포함)
+    # Trade.pre_margin은 거래 전 값이므로 최종 상태를 쓴다 (마지막 거래 손익/수수료 포함)
     final = report.status.total_margin()
     print(f"[6] 백테스트 파이프라인 OK — {len(report.trades)} trades, "
           f"max leverage {report.max_leverage}, "
