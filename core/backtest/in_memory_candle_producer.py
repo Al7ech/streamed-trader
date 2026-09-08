@@ -6,7 +6,8 @@
 
 캔들을 스스로 가져오지 않는다. 이미 만들어진 ``candles_by_symbol``을 받는다 — 드라이런 대조
 검사(:mod:`core.checks.live_check`)나 비-바이낸스 소스(주식 등)처럼 캔들을 직접 넘기는 쪽이 쓴다.
-바이낸스에서 구간을 fetch해 백테스트하려면 :class:`~core.backtest.binance_candle_producer.BinanceBacktestCandleProducer`.
+바이낸스에서 구간을 fetch해 백테스트하려면
+:class:`~core.backtest.historical_candle_producer.BinanceHistoricalCandleProducer`.
 """
 
 import heapq
@@ -67,7 +68,7 @@ class InMemoryCandleProducer(CandleProducer):
                 continue
             if self.end_time and event_time > self.end_time:
                 break
-            yield event_time, dict(batch)
+            yield Event(event_time, dict(batch))
 
     async def __aiter__(self) -> AsyncIterator[Event]:
         """메모리 캔들을 시간순으로 내준다. 아무것도 ``await``하지 않는 async generator라

@@ -13,7 +13,7 @@ This package supplies the live implementations of the three pluggable pieces aro
 
 | | CandleProducer | Executor | Recorder |
 |---|---|---|---|
-| backtest | `BinanceBacktestCandleProducer` / `InMemoryCandleProducer` | `SimulatedExecutor` | `BacktestRecorder` |
+| backtest | `BinanceHistoricalCandleProducer` / `InMemoryCandleProducer` | `SimulatedExecutor` | `BacktestRecorder` |
 | dry run | `LiveCandleProducer` | **`SimulatedExecutor`** | `LiveRecorder` |
 | live | `LiveCandleProducer` | `LiveExecutor` | `LiveRecorder` |
 
@@ -58,8 +58,14 @@ Everything about *where candles come from*:
   order rather than something the processing path has to re-enter. A misaligned boundary, a gap
   larger than `MAX_BACKFILL_CANDLES`, or a failed backfill ends the stream (the trader then stops,
   and a restart recovers: warm-up rebuilds the indicators and the exchange owns the position).
-- `warmup_candles(windows)` fetches each symbol's indicator history. All symbols share the same
-  interval-boundary `end_time` so their windows stay aligned even though the fetches are sequential.
+- Backfilled candles are yielded as `Event(..., decide=False)`: they update indicators and run
+  through `executor.begin_event`, but never reach `streamer.decide_action`. A bar that already went
+  by must not produce a market order that fills at the current price.
+- **No indicator history is fetched here.** The trader warms up from a separate
+  `BinanceHistoricalCandleProducer` (REST fetcher, `use_cache=False`) via
+  `TradingEngine.warmup_from`, and this producer only receives the resulting continuity point
+  through `resume_after(last_starts)` — which is what makes the gap between the warm-up range and
+  the first live candle get backfilled instead of silently swallowed.
 
 Because a single consumer drives this source and fully runs each `process_event` before pulling the
 next message, *decision* processing across symbols is naturally serialized — no extra locking is

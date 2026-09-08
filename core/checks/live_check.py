@@ -3,7 +3,9 @@
 라이브 경로는 순수 백테스트 검증이 닿지 않는 곳이다 — 소켓과 거래소가
 필요하기 때문이다. 여기서는 둘 다 가짜로 세워 그 경로들을 오프라인으로 태운다:
 
-1. **캔들 공급자** — 연속/중복/구멍 백필/상한 초과/경계 불일치/에러 프레임 (가짜 소켓)
+1. **캔들 공급자** — 연속/중복/구멍 백필/상한 초과/경계 불일치/에러 프레임 (가짜 소켓),
+   그리고 **지표 워밍업 이어붙이기** — 워밍업 소스와 실시간 소스가 별개 객체라, 어디까지
+   먹였는지가 ``resume_after``로 넘어가야 그 사이 구멍이 백필된다
 2. **라이브 실행기** — 계좌 갱신, 부분 체결 합치기, 미체결 장부 동기화, 수수료 자산 분리
    (가짜 주문 클라이언트 + 손으로 만든 유저 데이터 메시지)
 3. **드라이런 == 백테스트** — 같은 캔들을 라이브의 이벤트 모양(심볼별 단일 키, 비동기)으로
@@ -30,7 +32,7 @@ from core.backtest.simulated_executor import SimulatedExecutor
 from core.domain.action import Action, ActionType
 from core.domain.candle import Candle
 from core.domain.status import Status
-from core.engine.candle_producer import CandleProducer
+from core.engine.candle_producer import CandleProducer, Event
 from core.engine.engine import TradingEngine
 from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
 from core.live import candle_producer as lcp
@@ -264,10 +266,11 @@ async def check_candle_producer():
     p, errs = make_producer([kline_msg(T0), kline_msg(T0 + MIN), kline_msg(T0 + 2 * MIN)])
     evs = await collect(p)
     check("producer: 연속 3캔들",
-          [t for t, _ in evs] == [T0 + MIN, T0 + 2 * MIN, T0 + 3 * MIN],
-          f"{[t for t, _ in evs]}")
-    check("producer: 이벤트는 단일 심볼", all(list(c) == [SYM] for _, c in evs))
-    c = evs[0][1][SYM]
+          [e.time for e in evs] == [T0 + MIN, T0 + 2 * MIN, T0 + 3 * MIN],
+          f"{[e.time for e in evs]}")
+    check("producer: 이벤트는 단일 심볼", all(list(e.candles) == [SYM] for e in evs))
+    check("producer: 실시간 캔들은 decide=True", all(e.decide for e in evs))
+    c = evs[0].candles[SYM]
     # 웹소켓의 T(closeTime)는 경계 - 1ms 지만 페처는 경계를 쓴다. 그대로 두면 백필 캔들과
     # 라이브 캔들의 타임스탬프가 1ms 어긋나고 백테스트 시계열과도 짝이 맞지 않는다.
     check("producer: end_time 인터벌 경계 정규화",
@@ -287,9 +290,14 @@ async def check_candle_producer():
     p, errs = make_producer([kline_msg(T0), kline_msg(T0 + 3 * MIN)], backfill=backfill)
     evs = await collect(p)
     check("producer: 구멍 백필이 먼저 나온다",
-          [t for t, _ in evs] == [T0 + MIN, T0 + 2 * MIN, T0 + 3 * MIN, T0 + 4 * MIN]
+          [e.time for e in evs] == [T0 + MIN, T0 + 2 * MIN, T0 + 3 * MIN, T0 + 4 * MIN]
           and fetched.get("range") == (T0 + MIN, T0 + 3 * MIN),
-          f"{[t for t, _ in evs]} range={fetched.get('range')}")
+          f"{[e.time for e in evs]} range={fetched.get('range')}")
+    # 백필 캔들은 이미 지나간 봉이다 — 지표와 실행기까지만 가고 decide_action에는 닿으면
+    # 안 된다. 여기가 True로 새면 몇 분 전 봉을 보고 지금 가격에 시장가가 나간다.
+    check("producer: 백필 캔들만 decide=False",
+          [e.decide for e in evs] == [True, False, False, True],
+          f"{[e.decide for e in evs]}")
 
     p, _ = make_producer([kline_msg(T0),
                           kline_msg(T0 + (lcp.MAX_BACKFILL_CANDLES + 5) * MIN)],
@@ -324,6 +332,56 @@ async def check_candle_producer():
         got.append(ev)
         p.request_stop()
     check("producer: request_stop", len(got) == 1, f"{len(got)}개")
+
+
+async def check_warmup():
+    """지표 워밍업: 별개 소스로 먹이고, 실시간 소스에 이어붙이는 지점까지 넘어가는가.
+
+    라이브 기동은 "과거 구간을 REST로 받아 지표에 먹인 뒤 소켓을 연다"인데, 그 두 소스는
+    서로 다른 객체다. 마지막으로 먹인 지점이 실시간 소스로 넘어가지 않으면 그 사이 마감한
+    봉이 조용히 사라져 모든 롤링 윈도우 지표가 백테스트와 영구히 갈라진다.
+    """
+    window = 5
+
+    def assemble():
+        streamer = KeltnerStreamer(symbols=[SYM], window=window)
+        p, _ = make_producer([kline_msg(T0 + (window + 1) * MIN)], backfill=backfill)
+        engine = TradingEngine(streamer, p, SimulatedExecutor(INIT_MARGIN))
+        return streamer, p, engine
+
+    fetched = {}
+
+    def backfill(symbol, start_ms, end_ms):
+        fetched["range"] = (start_ms, end_ms)
+        return synthetic_candles(start_ms, (end_ms - start_ms) // MIN)
+
+    streamer, p, engine = assemble()
+    warmup = InMemoryCandleProducer({SYM: synthetic_candles(T0, window)}, progress=False)
+    await engine.warmup_from(warmup)
+    check("warmup: 지표가 데워진다",
+          streamer.indicators[SYM]["MA"].get_latest() is not None)
+    # 마지막으로 먹인 캔들의 start_time — end_time이 아니다 (연속성 판정 기준이 start다).
+    check("warmup: 연속성 기준점이 실시간 공급자로 넘어간다",
+          p._last_candle_start[SYM] == T0 + (window - 1) * MIN,
+          f"{p._last_candle_start[SYM]}")
+
+    # 워밍업은 T0+4분까지 먹었고 첫 실시간 캔들은 T0+6분 — 그 사이 T0+5분이 백필돼야 한다.
+    evs = [ev async for ev in p]
+    check("warmup: 워밍업과 첫 실시간 캔들 사이 구멍이 백필된다",
+          fetched.get("range") == (T0 + window * MIN, T0 + (window + 1) * MIN)
+          and [e.time for e in evs] == [T0 + (window + 1) * MIN, T0 + (window + 2) * MIN]
+          and [e.decide for e in evs] == [False, True],
+          f"range={fetched.get('range')} {[(e.time, e.decide) for e in evs]}")
+
+    # 조용히 덜 데워진 지표로 매매하느니 기동에 실패하는 편이 낫다.
+    _, _, engine = assemble()
+    short = InMemoryCandleProducer({SYM: synthetic_candles(T0, window - 1)}, progress=False)
+    try:
+        await engine.warmup_from(short)
+        raised = False
+    except ValueError:
+        raised = True
+    check("warmup: 캔들이 모자라면 기동 실패", raised)
 
 
 # ============================================================ 2. 라이브 실행기
@@ -574,7 +632,7 @@ class ReplayProducer(CandleProducer):
 
     async def __aiter__(self):
         for end_time, symbol, candle in self._events:
-            yield end_time, {symbol: candle}
+            yield Event(end_time, {symbol: candle})
 
 
 def _assemble(streamer, producer, slippage_ratio, log_label=""):
@@ -633,6 +691,7 @@ async def main():
     # 판정 결과를 print로 읽는 게 본론이라 기본 레벨을 WARNING으로 둔다.
     setup_logging(default="WARNING")
     await check_candle_producer()
+    await check_warmup()
     await check_live_executor()
     if "--offline" not in sys.argv:
         await check_dry_run_parity()

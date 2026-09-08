@@ -26,6 +26,16 @@ class BaseStreamer(ABC):
         self.symbols = symbols
         self.indicators = indicators
 
+    def warmup_windows(self) -> Dict[str, int]:
+        """심볼별로 워밍업에 필요한 캔들 수 = 그 심볼 지표들의 최대 window.
+
+        :meth:`~core.engine.engine.TradingEngine.warmup_from`이 "충분히 데워졌는가"를 판정할
+        때, 그리고 워밍업 공급자를 만드는 쪽이 구간 길이를 정할 때 쓴다.
+        """
+        return {symbol: max((ind.window for ind in self.indicators.get(symbol, {}).values()),
+                            default=0)
+                for symbol in self.symbols}
+
     @abstractmethod
     def decide_action(self, candles: Dict[str, Candle], status: Status) -> List[Action]:
         """

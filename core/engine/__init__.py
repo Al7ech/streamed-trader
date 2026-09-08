@@ -7,7 +7,7 @@
 ===========  ==============================  ==================  ================
              CandleProducer                  Executor            Recorder
 ===========  ==============================  ==================  ================
-백테스트     backtest.BinanceBacktest        backtest.Simulated  backtest.Backtest
+백테스트     backtest.BinanceHistorical      backtest.Simulated  backtest.Backtest
              / InMemoryCandleProducer        Executor            Recorder
 드라이런     live.LiveCandleProducer         backtest.Simulated  live.LiveRecorder
                                              Executor

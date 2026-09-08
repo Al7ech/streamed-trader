@@ -9,7 +9,7 @@
   만들고, ``metadata``를 받았으면 런 JSON/시계열 샤드까지 쓴다
 - :class:`~core.backtest.in_memory_candle_producer.InMemoryCandleProducer` — 이미 로딩된
   캔들을 병합해 내주는 범용 공급자
-- :class:`~core.backtest.binance_candle_producer.BinanceBacktestCandleProducer` — 위를
+- :class:`~core.backtest.historical_candle_producer.BinanceHistoricalCandleProducer` — 위를
   상속해 구간을 바이낸스에서 스스로 fetch한다
 
 백테스트 한 번은 이 부품들을 만들어 엔진에 넘기는 것이다 (``core/examples/backtest.py`` 참고)::

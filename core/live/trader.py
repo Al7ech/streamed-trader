@@ -18,14 +18,17 @@
 import asyncio
 import copy
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from binance import AsyncClient, BinanceSocketManager
 
+from core.backtest.historical_candle_producer import BinanceHistoricalCandleProducer
 from core.backtest.simulated_executor import SimulatedExecutor
 from core.domain.status import DEFAULT_FEE_RATIO, Status
 from core.engine.engine import TradingEngine
 from core.engine.executor import Executor
+from core.fetcher.binance.rest_fetcher import BinanceCandleFetcher
 from core.live.candle_producer import LiveCandleProducer
 from core.live.executor import LiveExecutor, resolve_margin_asset
 from core.live.recorder import DEFAULT_SHARD_FLUSH_EVERY, LiveRecorder, default_run_id
@@ -262,16 +265,43 @@ class BinanceTrader:
     async def _prefeed_indicators(self):
         """Pre-feed every symbol's indicators with historical candle data.
 
-        과거 캔들을 어디서 어떻게 가져오는지는 :class:`LiveCandleProducer`가 알고, 그것을
-        지표에 먹이는 것은 엔진이 안다. ``status``는 넘어가지 않는다: 이 구간에는 대응하는
-        계좌 상태가 없으므로 status를 읽는 지표는 ``None``을 워밍업으로 다뤄야 한다.
+        과거 캔들은 **백테스트가 쓰는 그 공급자**가 내준다 — 워밍업이란 "직전 N개 봉을 받아
+        이벤트로 내주는 것" 이상이 아니라서 라이브 전용 구현이 따로 필요 없다. 다만 Vision
+        벌크 덤프는 하루쯤 지연되므로 REST fetcher를 넘기고, 월청크 pkl 캐시는 요청 구간이
+        아니라 달 경계로 fetch하므로(월말 기동이 그 달 전체를 받게 된다) 끈다.
 
-        엔진의 ``run_async``도 시작할 때 같은 것을 부르지만(멱등), 여기서 **미리** 부르는 게
-        중요하다 — 워밍업은 소켓을 열기 전에 끝나야 하고 엔진 루프는 그 뒤에야 돈다.
+        지표에 먹이고(``status`` 없이 — 이 구간에는 대응하는 계좌 상태가 없다) 실시간 공급자에
+        이어붙일 지점을 알려 주는 것은 엔진의 :meth:`~core.engine.engine.TradingEngine.warmup_from`이 한다.
+
+        구간은 심볼별 window가 아니라 **전 심볼 공통 ``max(window)``** 다. 롤링 윈도우 지표에
+        과거를 더 먹이는 것은 무해하고, 심볼마다 ``datetime.now()``를 다시 재면 순차 fetch에
+        걸린 시간만큼 뒤 심볼의 창이 밀려 서로 어긋난다.
+
+        소켓을 열기 **전에** 불러야 한다 — 수십 초가 걸릴 수 있는데 그동안 유저 데이터
+        스트림을 읽지 않으면 python-binance의 큐가 넘친다.
         """
+        max_window = max(self.streamer.warmup_windows().values(), default=0)
+        if max_window == 0:
+            self.logger.info("No indicators found, skipping pre-feeding")
+            return
+
+        # **인터벌 경계**로 내린다. 분 단위로만 자르면 1h 인터벌을 13:37에 기동할 때 구간이
+        # :37에서 시작해 Binance가 주는 정시 정렬 캔들과 어긋나고, 엔진의 개수 검증이 무조건
+        # 실패한다 — 사실상 1m 외에는 라이브 기동이 불가능해진다.
+        interval_delta = timedelta(minutes=interval_to_minutes(self.interval))
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        now = datetime.now(tz=timezone.utc)
+        end_time = epoch + (now - epoch) // interval_delta * interval_delta
+        start_time = end_time - max_window * interval_delta
+
+        self.logger.info("Pre-feeding indicators with historical data: %s ~ %s (%d candles)",
+                         start_time, end_time, max_window)
         try:
-            self.logger.info("Pre-feeding indicators with historical data...")
-            await self.engine.warmup_from_producer()
+            # 생성자가 그 자리에서 동기 HTTP를 친다 — 이벤트 루프를 막지 않게 스레드로 뺀다.
+            warmup_producer = await asyncio.to_thread(
+                BinanceHistoricalCandleProducer, start_time, end_time, self.symbols,
+                self.interval, fetcher=BinanceCandleFetcher(), use_cache=False, progress=False)
+            await self.engine.warmup_from(warmup_producer)
         except Exception as e:
             self.logger.error(f"Failed to pre-feed indicators: {e}")
             raise

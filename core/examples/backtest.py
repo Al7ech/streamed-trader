@@ -2,7 +2,7 @@ import sys
 from datetime import datetime, timezone
 
 from core.backtest import DEFAULT_INIT_MARGIN
-from core.backtest.binance_candle_producer import BinanceBacktestCandleProducer
+from core.backtest.historical_candle_producer import BinanceHistoricalCandleProducer
 from core.backtest.recorder import BacktestRecorder
 from core.backtest.simulated_executor import SimulatedExecutor
 from core.engine.engine import TradingEngine
@@ -25,7 +25,7 @@ if __name__ == "__main__":
     end_date = datetime(2026, 7, 10, tzinfo=timezone.utc)
     interval = "1m"
 
-    producer = BinanceBacktestCandleProducer(
+    producer = BinanceHistoricalCandleProducer(
         start_time=start_date, end_time=end_date, symbols=[symbol], interval=interval)
 
     # 2. 전략 생성 — 다른 전략을 돌리려면 여기만 바꾸면 된다 (streamer/strategies/ 참고)

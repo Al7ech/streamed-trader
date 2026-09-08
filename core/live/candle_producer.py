@@ -1,8 +1,10 @@
 """라이브 캔들 공급자.
 
 바이낸스 선물 kline 웹소켓에서 마감 캔들을 받아 :class:`~core.engine.engine.TradingEngine`이
-소비할 이벤트로 내준다. 캔들 소스에 관한 모든 것 — 소켓 연결/수신, 심볼별 연속성 판정,
-구멍 백필, 지표 워밍업용 과거 캔들 — 이 여기 모여 있다.
+소비할 이벤트로 내준다. 실시간 캔들 소스에 관한 모든 것 — 소켓 연결/수신, 심볼별 연속성
+판정, 구멍 백필 — 이 여기 모여 있다. 지표 워밍업용 과거 캔들은 여기 없다: 그건 별개의
+공급자(:class:`~core.backtest.historical_candle_producer.BinanceHistoricalCandleProducer`)가
+내주고, 어디까지 먹였는지만 :meth:`LiveCandleProducer.resume_after`로 넘어온다.
 
 라이브는 심볼을 병합하지 않는다. 각 심볼의 캔들이 도착하는 즉시 **키 하나짜리 이벤트**로
 내주므로, 엔진의 ``streamer.symbols`` 순회에서 나머지 심볼은 캔들이 없어 자연히 걸러진다.
@@ -10,17 +12,20 @@
 **백필이 스트림 순서로 표현된다**: 구멍을 발견하면 빠진 캔들을 먼저 yield하고 그다음에 방금
 받은 캔들을 yield한다. 예전에는 처리 경로를 재귀적으로 재진입해야 했던 것("라이브 캔들과
 백필 캔들이 같은 경로를 타야 한다")이, 소스가 순서를 책임지는 것으로 바뀌었다.
+
+다만 백필 캔들은 ``Event.decide=False``로 나간다 — **이미 지나간 봉이 새 주문을 내면 안 된다.**
+지표는 갱신해야 하고(안 그러면 롤링 윈도우가 영구히 갈라진다) 그 사이 거래소에서 벌어진
+미체결 체결도 반영해야 하지만, 몇 분 전 봉을 보고 지금 가격에 시장가를 내는 것은 다른 얘기다.
 """
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 from binance.enums import ContractType
 
 from core.domain.candle import Candle
-from core.engine.candle_producer import CandleProducer
+from core.engine.candle_producer import CandleProducer, Event
 from core.fetcher.binance.rest_fetcher import BinanceCandleFetcher
 from core.live.reliable_websocket import ReliableWebsocket
 from core.utils import interval_to_minutes, ms_timestamp_to_datetime
@@ -49,7 +54,7 @@ class LiveCandleProducer(CandleProducer):
         super().__init__(interval_to_minutes(interval) * 60_000)
         self._on_error = on_error
         #: 심볼별 마지막으로 내준 캔들의 시작 시각 — 중복/구멍 판정의 기준점. None이면 아직
-        #: 기준이 없다 (프리피드 전, 또는 프리피드할 지표가 하나도 없는 심볼).
+        #: 기준이 없다 (:meth:`resume_after`로 워밍업 지점을 받기 전).
         self._last_candle_start: Dict[str, Optional[int]] = {s: None for s in self.symbols}
         self.socket: Optional[ReliableWebsocket] = None
         self._running = False
@@ -87,7 +92,7 @@ class LiveCandleProducer(CandleProducer):
 
     # ------------------------------------------------------------- 캔들 공급
 
-    async def __aiter__(self) -> AsyncIterator[Tuple[int, Dict[str, Candle]]]:
+    async def __aiter__(self) -> AsyncIterator[Event]:
         """마감 캔들을 이벤트로 내준다. 스트림이 끝나면(정상/치명적) 반복이 끝난다."""
         while self._running:
             try:
@@ -114,7 +119,7 @@ class LiveCandleProducer(CandleProducer):
                 self.logger.exception("Error processing kline message: %s", e)
                 await self._on_error(e)
 
-    async def _events_from(self, data: dict) -> AsyncIterator[Tuple[int, Dict[str, Candle]]]:
+    async def _events_from(self, data: dict) -> AsyncIterator[Event]:
         """메시지 하나에서 나올 이벤트들 (백필 캔들이 있으면 그것들이 먼저)."""
         if await self._handle_stream_error_frame(data):
             return
@@ -143,12 +148,14 @@ class LiveCandleProducer(CandleProducer):
             end_time=start_time + self.interval_ms,
         )
 
+        # 백필 캔들은 decide=False — 지표와 실행기의 이벤트 경계 훅까지만 가고
+        # streamer.decide_action에는 닿지 않는다 (지나간 봉이 새 주문을 내면 안 된다).
         for missed in await self._missing_before(symbol, candle):
             self._last_candle_start[symbol] = missed.start_time
-            yield missed.end_time, {symbol: missed}
+            yield Event(missed.end_time, {symbol: missed}, decide=False)
 
         self._last_candle_start[symbol] = candle.start_time
-        yield candle.end_time, {symbol: candle}
+        yield Event(candle.end_time, {symbol: candle})
 
     async def _missing_before(self, symbol: str, candle: Candle) -> List[Candle]:
         """이 캔들 앞에 빠진 캔들들. 이 캔들 자체를 버려야 하면 :class:`_FatalStream`이나
@@ -207,7 +214,7 @@ class LiveCandleProducer(CandleProducer):
         """``[start_ms, end_ms)`` 구간의 마감 캔들을 REST로 가져온다.
 
         ``get_candles``의 구간 규약이 반열린 구간이라 정확히 빠진 캔들만 돌아온다 —
-        :meth:`warmup_candles`가 쓰는 규약과 같다. 개수와 정렬을 검증해서, 어긋난 캔들이
+        지표 워밍업 공급자가 쓰는 규약과 같다. 개수와 정렬을 검증해서, 어긋난 캔들이
         조용히 지표에 먹히는 일이 없게 한다.
         """
         # 동기 HTTP + tqdm이라 스레드로 뺀다 — 이벤트 루프를 막으면 그동안 유저 데이터
@@ -230,69 +237,34 @@ class LiveCandleProducer(CandleProducer):
                     f"{ms_timestamp_to_datetime(want)}")
         return candles
 
-    # ------------------------------------------------------------- 워밍업
+    # ------------------------------------------------------------- 이어붙이기
 
-    async def warmup_candles(self, windows: Dict[str, int]) -> Dict[str, List[Candle]]:
-        """지표 워밍업용 과거 캔들을 심볼별로 가져온다.
+    def resume_after(self, last_starts: Dict[str, int]) -> None:
+        """지표 워밍업이 어디까지 먹였는지 받아 심볼별 연속성 기준점으로 삼는다.
 
-        심볼마다 독립적으로(순차) 페치하지만, 봉 경계로 내림한 ``end_time``은 전 심볼이
-        공유한다 — 심볼마다 ``datetime.now()``에서 다시 계산하면, 순차 페치가 실제로 걸리는
-        시간만큼 뒤 심볼의 창이 앞 심볼보다 늦은 경계로 밀려 서로 어긋난다.
+        워밍업 소스와 이 소스는 서로 다른 객체라(전자는 REST로 과거 구간, 여기는 웹소켓),
+        엔진이 워밍업을 마치며 이 값을 넘겨 준다
+        (:meth:`~core.engine.engine.TradingEngine.warmup_from`). 이 한 줄이 양방향을 막는다:
 
-        가져온 마지막 캔들이 그 심볼의 연속성 기준점이 된다 — 프리피드와 첫 라이브 캔들
-        사이에 생긴 구멍도 백필로 메워진다 (프리피드는 레이트리밋 대기까지 포함해 수십 초가
-        걸릴 수 있어 실제로 벌어지는 일이다).
+        - **중복** — 워밍업이 이미 먹인 봉이 소켓 첫 메시지로 들어오면(재연결 직후 재전송 등)
+          :meth:`_missing_before`가 ``_SkipCandle``로 버린다. 안 버리면 지표가 같은 봉을 두 번
+          먹고 ``decide_action``이 두 번 불려 **주문이 두 번** 나간다.
+        - **구멍** — 워밍업(수십 초가 걸릴 수 있다)이 끝나고 소켓이 붙는 사이에 봉이 마감했다면
+          첫 실시간 캔들에서 그만큼이 백필된다. 기준점이 없으면 그 구멍은 조용히 지나가고
+          모든 롤링 윈도우 지표가 백테스트와 영구히 갈라진다.
 
-        :param windows: 심볼별로 필요한 캔들 수 (보통 그 심볼 지표들의 최대 window).
+        :param last_starts: 심볼 → 마지막으로 먹인 캔들의 ``start_time``. ``end_time``이 아니다
+            (연속성 판정이 ``start_time + interval_ms`` 기준이다).
         """
-        interval_minutes = interval_to_minutes(self.interval)
-
-        current_sec = datetime.now().second
-        if 55 <= current_sec:
-            sleep_sec = 61 - current_sec
-            self.logger.info(f"skipping to next minute ({sleep_sec} seconds)")
-            await asyncio.sleep(sleep_sec)
-
-        # **인터벌 경계**로 내림한다. 분 단위로만 자르면 1h 인터벌을 13:37에 기동할 때
-        # start_time이 :37이 되고 Binance가 주는 정시 정렬 캔들과 어긋나 아래 검증이 무조건
-        # 실패한다 — 사실상 1m 외에는 라이브 기동이 불가능해진다.
-        interval_delta = timedelta(minutes=interval_minutes)
-        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-        now = datetime.now(tz=timezone.utc)
-        end_time = epoch + (now - epoch) // interval_delta * interval_delta
-
-        fetcher = BinanceCandleFetcher()
-        out: Dict[str, List[Candle]] = {}
-        for symbol in self.symbols:
-            max_window = windows.get(symbol, 0)
-            if max_window == 0:
-                self.logger.info(f"No indicators found for {symbol}, skipping pre-feeding")
+        for symbol, start_time in last_starts.items():
+            if symbol not in self._symbol_set:
+                self.logger.warning(
+                    f"거래하지 않는 심볼의 워밍업 지점은 무시한다: {symbol}")
                 continue
-
-            self.logger.info(f"[{symbol}] Maximum indicator window size: {max_window}")
-            start_time = end_time - timedelta(minutes=max_window * interval_minutes)
-            self.logger.info(f"[{symbol}] Fetching historical data from {start_time} to {end_time}")
-
-            candles = await asyncio.to_thread(
-                fetcher.get_candles, symbol=symbol, interval=self.interval,
-                start_date=start_time, end_date=end_time)
-
-            actual_start = ms_timestamp_to_datetime(candles[0].start_time) if candles else None
-            actual_end = ms_timestamp_to_datetime(candles[-1].end_time) if candles else None
-            if max_window != len(candles) or actual_start != start_time or actual_end != end_time:
-                raise ValueError(
-                    f"historical kline assert error for {symbol}: "
-                    f"count {len(candles)} != {max_window}, "
-                    f"start {actual_start} != {start_time}, "
-                    f"end {actual_end} != {end_time}")
-
-            out[symbol] = candles
-            self._last_candle_start[symbol] = candles[-1].start_time
+            self._last_candle_start[symbol] = start_time
             self.logger.info(
-                f"[{symbol}] Pre-fed indicators with {len(candles)} historical candles: "
-                f"{ms_timestamp_to_datetime(candles[0].start_time)} ~ "
-                f"{ms_timestamp_to_datetime(candles[-1].end_time)}")
-        return out
+                f"[{symbol}] 연속성 기준점: "
+                f"{ms_timestamp_to_datetime(start_time)} 이후부터 실시간 캔들을 받는다")
 
     # ------------------------------------------------------------- 내부
 

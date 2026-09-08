@@ -22,7 +22,9 @@ There is no automated test suite (no `pytest`/`unittest` files in `core/`, only 
 `react-scripts test` in `visualise/`). The de-facto correctness check is:
 
 - `core/checks/live_check.py` — covers the live path (it needs a socket and an exchange, so it fakes
-  both) and asserts the candle producer's continuity/backfill rules, the live executor's
+  both) and asserts the candle producer's continuity/backfill rules, the indicator warm-up
+  handoff (`warmup_from` -> `resume_after`, including the gap between the warm-up range and the
+  first live candle), the live executor's
   account/fill handling, and that **a dry run produces exactly the trades a backtest of the same
   candles does** (over Keltner, a stateful mean-reversion strategy, and toy limit/stop-ladder
   fixtures). The vectorized backtest path and its `backtest_fast_check.py` parity harness were
@@ -108,7 +110,7 @@ core/
   fetcher/    BaseCandleFetcher + pickle cache; binance/ and stock/ under it
   engine/     TradingEngine + the three ports: CandleProducer, Executor, Recorder
   result/     writer.py (run JSON + shards), metrics.py, indicator_columns.py
-  backtest/   SimulatedExecutor, BacktestRecorder, the two backtest producers
+  backtest/   SimulatedExecutor, BacktestRecorder, in-memory + historical candle producers
   live/       BinanceTrader, LiveCandleProducer/Executor/Recorder, BinanceOrderClient
   checks/     live_check.py, fetch_stock_check.py
   examples/   backtest.py, trader.py
@@ -185,7 +187,10 @@ carrying a frontend hint (`scale_group`) would blur what `domain/` means.
    Adding a *field* is different: older chunks simply lack it in `__dict__` and `Candle`'s
    class-attribute defaults cover it, so no migration is needed. Only a class **move or rename**
    forces one. Note this applies to the backtest cache only — the live trader's indicator prefeed
-   calls `get_candles` directly and never touches a `.pkl`.
+   passes `use_cache=False` so it calls `get_candles` directly and never touches a `.pkl`. That is
+   not merely tidiness: `get_candles_with_cache` fetches on **month boundaries**, not the requested
+   range, so a 200-candle warm-up started late in a month would pull the whole month to date
+   (~40k 1m candles) before the trader could open a socket.
 
 3. **Backtest.** There is no `run_backtest` function any more — a backtest *is* the four engine
    parts assembled by the caller (`core/examples/backtest.py` is the reference; see "The trading
@@ -213,10 +218,13 @@ carrying a frontend hint (`scale_group`) would blur what `domain/` means.
      same time), merged by its own `merge_by_end_time` (same module — same `end_time` is one
      event) into one chronological stream of **events**. Used by the check scripts and
      non-Binance sources.
-   - `BinanceBacktestCandleProducer` (`backtest/binance_candle_producer.py`), which subclasses
-     `InMemoryCandleProducer` and fetches the `[start, end)` range itself (default fetcher
-     `BinanceVisionFetcher`, injectable) before merging. This is what `core/examples/backtest.py`
-     uses.
+   - `BinanceHistoricalCandleProducer` (`backtest/historical_candle_producer.py`), which
+     subclasses `InMemoryCandleProducer` and fetches the `[start, end)` range itself (default
+     fetcher `BinanceVisionFetcher`, injectable; `use_cache=False` bypasses the month-chunk pkl
+     cache) before merging. This is what `core/examples/backtest.py` uses — and, with a REST
+     fetcher and `use_cache=False`, what the live trader warms its indicators from (see "The
+     trading engine" below). Warm-up is "fetch the last N bars and yield them as events" and
+     nothing more, so it needs no second implementation.
 
    `BacktestRecorder` owns the output as well as the in-memory `Report`: give it `metadata` and it
    writes the run JSON on `close()` (which the engine calls at the end of the run), plus the
@@ -239,7 +247,7 @@ Backtest, dry run and live are **one domain**. The order-of-operations exists ex
 
 | | CandleProducer | Executor | Recorder |
 |---|---|---|---|
-| backtest | `backtest.BinanceBacktestCandleProducer` / `backtest.InMemoryCandleProducer` | `backtest.SimulatedExecutor` | `backtest.BacktestRecorder` |
+| backtest | `backtest.BinanceHistoricalCandleProducer` / `backtest.InMemoryCandleProducer` | `backtest.SimulatedExecutor` | `backtest.BacktestRecorder` |
 | dry run | `live.LiveCandleProducer` | **`backtest.SimulatedExecutor`** | `live.LiveRecorder` |
 | live | `live.LiveCandleProducer` | `live.LiveExecutor` | `live.LiveRecorder` |
 
@@ -249,8 +257,8 @@ implementation lives in `core/backtest/` or `core/live/`, and the engine imports
 **Assembling and running is the engine's job too.** The caller builds the four parts and hands them
 over — `TradingEngine(streamer, producer, executor, recorder, on_error=...)` — and the engine does
 the wiring (`executor.on_trade = recorder.record_trade`, `NullRecorder` when no recorder is given),
-the indicator warm-up, the event loop, and the finish (`recorder.close()`), returning
-`recorder.report`. That wiring used to be hand-repeated at each of the three entry points; the
+the event loop, and the finish (`recorder.close()`), returning
+`recorder.report`. (Indicator warm-up is the engine's too, but as a separate call — see below.) That wiring used to be hand-repeated at each of the three entry points; the
 `on_trade` line alone existed in three places. Only *constructing* the parts stays with the caller,
 because those implementations live in the mode packages — which is what keeps the engine from
 importing `backtest/` or `live/`.
@@ -277,15 +285,20 @@ sending N+1" guarantee is deliberately gone — live `status` is exchange truth 
 stream updates it out of band), so a dropped order self-heals on the next candle. The flip side is
 that **intra-event action execution order is not guaranteed in live** (the thread pool runs them);
 backtest/dry run keep list order because `SimulatedExecutor` is synchronous. Every `CandleProducer`
-implements one method, `__aiter__` — nothing else in the codebase has to know sync from async.
+implements `__aiter__` and nothing else is required of it — nothing else in the codebase has to
+know sync from async. (`resume_after` is the one other method on the ABC, a no-op by default; see
+"Indicator warm-up" below.)
 
-`process_event(event_time, candles)` — the contract every mode goes through:
+`process_event(event)` — the contract every mode goes through. An `Event` is
+`(time, candles, decide)`; `decide=False` means **this bar already went by** (the live producer's
+gap backfill is the only source of it) and steps 4b/7 are skipped, so an outdated candle can never
+reach `streamer.decide_action` and can never produce a new order:
 
 ```
 0-2. executor.begin_event()        # sim: per symbol with a candle — refresh last_close + match resting orders (fills happen here) + tick expiry; then mark every open position (incl. symbols with no candle this event) to its last_close, which also re-marks a just-filled symbol from its fill price back to the bar close; then if status.total_margin() <= 0 -> cancel_all + flatten every open position at last_close and latch _bankrupt. live: drop unmatched market decisions from the last candle (no matching, no bankruptcy check — the exchange fills resting orders and liquidates)
-4. update every symbol's indicators, then one streamer.decide_action(candles, status) for the whole event (still called after bankruptcy — the executor just discards the resulting actions)
+4. update every symbol's indicators, then (if event.decide) one streamer.decide_action(candles, status) for the whole event (still called after bankruptcy — the executor just discards the resulting actions)
 6. recorder.record_event()         # the recorder reads status.total_margin() itself for the equity point
-7. per action: executor.submit()   # sim: CANCEL/register/fill in list order, or no-op once _bankrupt is latched; live: fire the order, return
+7. per action: executor.submit()   # sim: CANCEL/register/fill in list order, or no-op once _bankrupt is latched; live: fire the order, return. no actions at all when event.decide is False
 8. recorder.end_event()
 ```
 
@@ -302,6 +315,30 @@ snapshot of the first can show the other still marked to the previous event's cl
 point comes from `record_event` reading `status.total_margin()` after `begin_event` and before
 MARKET submits (step 7), which is why a MARKET fill's state applies from the *next* event while a
 resting fill's applies from this one.
+
+**Indicator warm-up is a separate call with a separate source.** `TradingEngine.warmup_from(
+producer)` consumes a *second* `CandleProducer` to completion and feeds its candles **to the
+indicators only** — no `begin_event`, no `decide_action`, no orders, no recording, and `update()`
+gets no `status` (that stretch of history has no corresponding account state, so status-aware
+indicators must treat `None` as warm-up). It then raises `ValueError` if any symbol received fewer
+candles than its own window (`streamer.warmup_windows()`), because silently under-warmed indicators
+are worse than a failed startup, and finishes by handing the last fed `start_time` per symbol to
+the *main* producer's `resume_after()`.
+
+That handoff is the whole reason the warm-up source can be a plain producer. The two sources are
+different objects — live warms from `BinanceHistoricalCandleProducer` over REST and then trades off
+a websocket — so someone has to splice them, and one value does it in both directions: a candle the
+warm-up already ate must not arrive again (double-fed indicators, and `decide_action` re-running
+means **a second order**), and a bar that closed while the sockets were still connecting must be
+backfilled (otherwise every rolling-window indicator diverges from the backtest permanently).
+`resume_after` is a no-op on the ABC; only `LiveCandleProducer` implements it.
+
+Only live calls `warmup_from`, and it calls it *before opening any socket* (a long backfill would
+overflow python-binance's user-data queue), which is why it is not inside `run_async`. A backtest
+does not warm up at all: its first `window` events are the warm-up, indicators read NaN through
+them, and that NaN prefix is visible in the recorded series. Nothing stops a backtest from passing
+a second `BinanceHistoricalCandleProducer` over the preceding range to start warm instead — the
+capability is free now — but no entry point does that today.
 
 **Fills flow through a sink, not a return value** (`executor.on_trade`). The simulated executor
 calls it synchronously right after `apply_fill`; the live executor calls it when
@@ -506,7 +543,10 @@ those check scripts default to WARNING.
 - `BaseStreamer` (ABC) is multi-symbol and **cross-symbol aware**: `__init__(symbols,
   indicators)` takes the list of symbols it trades and `indicators: Dict[str, Dict[str,
   BaseIndicator]]` — one indicator instance per `(symbol, name)` pair (never shared across
-  symbols, since each instance carries its own series state). It exposes the abstract
+  symbols, since each instance carries its own series state). `warmup_windows()` derives each
+  symbol's required warm-up length (its indicators' largest `window`) off that dict — the engine
+  uses it to verify a warm-up actually warmed everything, the live trader to size the range it
+  fetches. It exposes the abstract
   `decide_action(candles, status) -> List[Action]`, called by all three engines **once per event**,
   after every traded symbol's indicators are updated. `candles: Dict[str, Candle]` holds each
   symbol whose candle just closed this event mapped to that candle — live always has exactly one
@@ -519,7 +559,7 @@ those check scripts default to WARNING.
   coupling (`KeltnerStreamer`) just loops `self.symbols` inside `decide_action`.
 - Indicators come in two types. `BaseIndicator` (ABC) is a loop-updated rolling-window indicator:
   `update(candle, status=None)` ingests one candle plus the *pre-trade* `Status` snapshot — the
-  same one `decide_action` sees for that event (`TradingEngine.warmup` passes `None`, so
+  same one `decide_action` sees for that event (`TradingEngine.warmup_from` passes `None`, so
   status-aware indicators must treat `None` as warm-up); `read(idx)`/`get_latest()`
   read back past values (`-1` = latest, `-2` = previous, ...). An indicator that reads `status`
   cannot be vectorized (account state is a feedback loop of the strategy's own trades) and must
@@ -772,12 +812,23 @@ straight to `executor.on_user_data(...)`.
   - A misaligned boundary, a gap larger than `MAX_BACKFILL_CANDLES`, or a failed backfill **ends
     the stream**; the trader then stops and a restart recovers (warm-up rebuilds the indicators,
     the exchange owns the position).
-  - `warmup_candles(windows)` fetches each symbol's indicator history (via `BinanceCandleFetcher`,
-    off the event loop through `asyncio.to_thread`, one symbol at a time), asserting each fetched
-    range exactly matches what was expected. Every symbol shares the same interval-boundary
-    `end_time` (not recomputed per symbol) so their windows stay aligned despite the sequential
-    fetches, and the range is floored to the **interval** boundary, not the minute, so the
-    assertion holds for every interval and not just `1m`.
+  - **Indicator history is not fetched here.** `BinanceTrader._prefeed_indicators` builds a
+    `BinanceHistoricalCandleProducer` over `[end - max(window)*interval, end)` (REST fetcher,
+    `use_cache=False`, constructed inside `asyncio.to_thread` because its constructor does
+    synchronous HTTP) and hands it to `TradingEngine.warmup_from`; this producer only learns the
+    result through `resume_after(last_starts)`, which seeds `_last_candle_start` — see "Indicator
+    warm-up" under "The trading engine". `end` is floored to the **interval** boundary, not the
+    minute, or a `1h` run started at 13:37 would ask for a range Binance's hour-aligned candles
+    can't fill; every symbol shares that one `end` and one `max(window)`-long range, so sequential
+    fetches can't stagger the symbols' windows relative to each other (a symbol with a shorter
+    window is simply over-warmed, which is harmless for rolling indicators). The old
+    sleep-to-the-next-minute guard is gone: if a boundary passes mid-fetch, the resulting gap is
+    just a gap, and `resume_after` + the backfill path above closes it.
+  - **Backfilled candles do not trade.** They are yielded as `Event(..., decide=False)`, so they
+    update indicators and go through `executor.begin_event` (in dry run, a stop that the exchange
+    would really have filled during that bar still fills) but never reach `streamer.decide_action`.
+    An outdated bar must not produce a market order that fills at the current price. The cost —
+    an entry signal on a bar missed during a disconnect is skipped entirely — is deliberate.
 - **`live/executor.py` — orders and account state.** `submit()` fires the order and returns `None`;
   a detached task (`_await_order_result`) awaits the submission result and routes a failure to
   `on_error`. The fill arrives later on the user-data stream, so the pre-trade `Status`

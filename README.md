@@ -166,12 +166,12 @@ A backtest is the four engine parts assembled and handed to `TradingEngine`:
 
 ```python
 from core.backtest import DEFAULT_INIT_MARGIN
-from core.backtest.binance_candle_producer import BinanceBacktestCandleProducer
+from core.backtest.historical_candle_producer import BinanceHistoricalCandleProducer
 from core.backtest.recorder import BacktestRecorder
 from core.backtest.simulated_executor import SimulatedExecutor
 from core.engine.engine import TradingEngine
 
-producer = BinanceBacktestCandleProducer(
+producer = BinanceHistoricalCandleProducer(
     start_time=start, end_time=end, symbols=["ETHUSDT"], interval="1m")
 executor = SimulatedExecutor(DEFAULT_INIT_MARGIN, fee_ratio=0.0004)
 recorder = BacktestRecorder(streamer, executor.status, interval_ms=producer.interval_ms,
@@ -184,11 +184,12 @@ The executor writes `fee_ratio` into the `Status` it builds, so the fee accounti
 value. `slippage_ratio` is a `SimulatedExecutor` argument only — it is a simulation modelling knob,
 not account state, and no strategy sizes with it.
 
-The candle source is either `BinanceBacktestCandleProducer` (fetches the `[start, end)` range
+The candle source is either `BinanceHistoricalCandleProducer` (fetches the `[start, end)` range
 itself via `BinanceVisionFetcher` and merges) or `InMemoryCandleProducer(candles_by_symbol)` — a
 `Dict[str, List[Candle]]` you built yourself (used by the check scripts and non-Binance sources).
-Everything else — wiring the fill sink, warming up indicators, driving the loop, finishing the
-recorder — is the engine's; `run()` returns the `Report`.
+Everything else — wiring the fill sink, driving the loop, finishing the recorder — is the
+engine's; `run()` returns the `Report`. A backtest does not warm indicators up separately: its
+first `window` events are the warm-up, and indicators read NaN through them.
 
 `Report` gives you `trades`, `max_leverage`, the final `Status` and the equity curve. Giving the
 recorder `metadata` writes `asset/backtest/<run_id>.json` (summary, Sharpe, max drawdown, trade
@@ -211,7 +212,8 @@ the *backtest's* executor, so it produces exactly the trades a backtest of the s
 - **`BinanceVisionFetcher`** (default) — bulk-downloads monthly/daily zips from
   data.binance.vision. Fast for long histories.
 - **`BinanceCandleFetcher`** — the REST klines API in ≤1500-candle pages. Used by the live trader
-  to prefeed indicators.
+  to prefeed indicators (through a `BinanceHistoricalCandleProducer` with `use_cache=False`, so the
+  warm-up asks for exactly the bars it needs instead of the whole month chunk).
 - **`MassiveStockFetcher`** — US equity minute bars from Massive (formerly Polygon.io), needs
   `MASSIVE_API_KEY`. Session-aware: `nyse_session` builds the NYSE trading-hours grid so a
   1200-candle window means the same wall-clock span on every symbol instead of silently spanning
