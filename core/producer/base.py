@@ -10,12 +10,16 @@
 - :class:`~core.producer.in_memory.InMemoryCandleProducer` — 이미 메모리에
   로딩된 캔들을 병합해 내준다 (내부에서 아무것도 ``await``하지 않는 async generator).
 - :class:`~core.producer.historical.BinanceHistoricalCandleProducer` — 위를
-  상속해, 구간을 바이낸스에서 스스로 fetch한 뒤 병합한다. 백테스트의 캔들 소스이자 라이브의
-  **지표 워밍업 소스**이며, 라이브 스트림에 구멍이 났을 때 엔진이 그 구간용으로 즉석에서
-  만들어 소비하는 **백필 소스**이기도 하다
-  (:meth:`~core.engine.engine.TradingEngine.warmup_from` 참고).
+  상속해, 구간을 바이낸스에서 스스로 fetch한 뒤 병합한다. 백테스트의 캔들 소스다.
 - ``LiveCandleProducer`` (:mod:`core.producer.live`) — 웹소켓에서 캔들이 마감할
   때마다 내준다. 연속성 판정(중복·구멍)은 하지 않는다 — 엔진 몫이다.
+
+:class:`CandleProducer`는 "어디서부터 어디까지"가 **생성 시점에 굳은** 시간순 스트림이다.
+구간이 런타임에 정해지는 두 요구 —— 기동한 순간에야 알 수 있는 **지표 워밍업** 구간과, 구멍이
+난 순간에야 알 수 있는 **백필** 구간 —— 은 이 포트로 표현하지 못하므로, 구간을 인자로 받는
+별개의 조회 포트 :class:`~core.history.base.CandleHistory`가 담당한다
+(:meth:`~core.engine.engine.TradingEngine.warmup` 참고). 위 백테스트 공급자도 결국 그 조회
+위에 서 있다 — 구간이 미리 정해져 있을 뿐 같은 조회다.
 
 의존 방향은 **엔진 → Producer 한 방향**이다. Producer는 실행기도, 레코더도, 액션도 모른다.
 """
@@ -80,3 +84,4 @@ class CandleProducer(ABC):
         실시간 소스만 의미가 있다 — :class:`~core.producer.live.LiveCandleProducer`가
         ``_running`` 플래그를 내려 :meth:`__aiter__` 루프를 끝낸다.
         """
+

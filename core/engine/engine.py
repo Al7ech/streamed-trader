@@ -14,7 +14,7 @@
 
 **부품을 엮는 것도 엔진의 일이다.** 호출자는 네 부품(스트리머·공급자·실행기·레코더)을
 생성자에 넘기기만 하고, 체결 싱크 연결(``executor.on_trade``), 레코더 기본값, 루프,
-마무리(``recorder.close()``)는 엔진이 한다. 지표 워밍업(:meth:`TradingEngine.warmup_from`)도
+마무리(``recorder.close()``)는 엔진이 한다. 지표 워밍업(:meth:`TradingEngine.warmup`)도
 엔진이 갖지만 루프 밖의 별개 단계다 — 캔들 소스가 본 공급자와 다르고, 라이브는 소켓을 열기
 전에 끝내야 하기 때문이다. 예전에는 이 배선이 진입점마다 손으로
 반복됐다. 실행기와 레코더의 **구현체**는 각 포트 패키지(:mod:`core.executor`,
@@ -36,11 +36,12 @@
 
 import asyncio
 import logging
-from datetime import datetime
-from typing import Awaitable, Callable, Dict, List, NoReturn, Optional
+from datetime import datetime, timezone
+from typing import Awaitable, Callable, Dict, NoReturn, Optional
 
 from core.account.report import Report
 from core.candle.candle import Candle
+from core.history.base import CandleHistory
 from core.producer.base import CandleProducer, Event
 from core.executor.base import Executor
 from core.recorder.base import NullRecorder, Recorder
@@ -52,16 +53,17 @@ class TradingEngine:
     """네 부품을 엮어 매매 루프를 돌린다.
 
     :param producer: 캔들 공급자. 지표 워밍업용 과거 캔들은 여기서 나오지 않는다 —
-        그건 별도의 공급자를 :meth:`warmup_from`에 넘긴다.
+        그건 아래 ``history``에서 온다.
     :param recorder: None이면 :class:`~core.recorder.base.NullRecorder` — 기록이 꺼진
         라이브 실행처럼 엔진은 돌려야 하지만 적재할 필요가 없을 때다.
     :param on_error: 주면 한 이벤트의 처리 실패가 루프를 끝내지 않고 여기로 넘어간다.
         None이면 그대로 올라간다 (:meth:`run_async` 참고).
-    :param backfill_source: ``(symbols, start, end) -> CandleProducer`` 팩토리. 라이브
-        스트림이 앞으로 건너뛰면(구멍) 엔진이 이걸로 그 구간 ``[start, end)`` 공급자를
-        즉석에서 만들어 지표만 채운다 — 워밍업 소스와 같은 모양이다. None이면 스트림의
-        점프를 채울 수 있는 구멍으로 취급하지 않는다 (백테스트의 ragged 시계열은 그대로
-        통과). 생성자가 동기 HTTP를 칠 수 있어 :func:`asyncio.to_thread`로 부른다.
+    :param history: 과거 캔들 조회 (:class:`~core.history.base.CandleHistory`).
+        **워밍업과 구멍 백필이 함께 쓴다** — 둘 다 "지금이 아닌 과거 구간을 받아온다"는 한
+        가지 일이고, 구간이 런타임에 정해진다는 것도 같다(기동 시각/구멍이 난 시각). 본
+        공급자(``producer``)는 구간이 생성 시점에 굳은 스트림이라 그것을 표현할 수 없어서
+        포트가 따로 있다. None이면 워밍업을 부를 수 없고, 스트림의 점프도 채울 수 있는 구멍으로
+        취급하지 않는다 (백테스트의 ragged 시계열은 그대로 통과).
     :param max_backfill_candles: 한 번에 백필할 캔들 수 상한. 넘으면 스트림을 치명적으로
         끊는다 — 프로세스가 오래 죽어 있었다는 뜻이고, 재기동이 지표를 프리피드로 다시
         세우고 포지션은 거래소에서 다시 읽는다.
@@ -75,20 +77,19 @@ class TradingEngine:
     def __init__(self, streamer: BaseStreamer, producer: CandleProducer, executor: Executor,
                  recorder: Optional[Recorder] = None, *,
                  on_error: Optional[Callable[[Exception], Awaitable[None]]] = None,
-                 backfill_source: Optional[
-                     Callable[[List[str], datetime, datetime], CandleProducer]] = None,
+                 history: Optional[CandleHistory] = None,
                  max_backfill_candles: int = 60):
         self.streamer = streamer
         self.producer = producer
         self.executor = executor
         self.recorder = recorder if recorder is not None else NullRecorder()
         self.on_error = on_error
-        self._backfill_source = backfill_source
+        self.history = history
         self.max_backfill_candles = max_backfill_candles
         self.logger = logging.getLogger(__name__)
 
         #: 심볼별로 마지막으로 지표에 먹인 캔들의 ``start_time`` — 연속성 앵커.
-        #: :meth:`warmup_from`이 워밍업 지점으로 채우고, :meth:`run_async`가 실시간 캔들마다
+        #: :meth:`warmup`이 워밍업 지점으로 채우고, :meth:`run_async`가 실시간 캔들마다
         #: 갱신하며, 그 사이 앞으로 건너뛴 구간을 :meth:`_backfill_gap`이 메운다.
         self._last_start: Dict[str, int] = {}
 
@@ -169,47 +170,87 @@ class TradingEngine:
         # 8. 이벤트 마무리 (라이브 레코더의 flush 등)
         self.recorder.end_event(event.time)
 
-    # TODO: warmup은 별도의 producer가 처리해야 함
-    async def warmup_from(self, producer: CandleProducer) -> None:
-        """워밍업 공급자를 끝까지 소비해 **지표에만** 먹이고, 연속성 앵커를 남긴다.
+    async def warmup(self, end: Optional[datetime] = None) -> None:
+        """``history`` 조회로 직전 구간을 받아 **지표에만** 먹이고, 연속성 앵커를 남긴다.
+
+        구간을 엔진이 정하는 것이 요점이다 — 필요한 길이는 스트리머의
+        :meth:`~core.streamer.base_streamer.BaseStreamer.warmup_windows`, 봉 크기는 본
+        공급자의 ``interval_ms``에서 나오므로 둘 다 여기 있다. 그 구간을 실제로 받아오는
+        일만 :class:`~core.history.base.CandleHistory`가 하고, 그건 구멍 백필이 쓰는
+        바로 그 조회다.
+
+        구간은 심볼별 window가 아니라 **전 심볼 공통 ``max(window)``** 다. 롤링 윈도우 지표에
+        과거를 더 먹이는 것은 무해한 반면, 심볼마다 "지금"을 다시 재면 순차 fetch에 걸린
+        시간만큼 뒤 심볼의 창이 앞 심볼과 어긋난다. ``end``는 **인터벌 경계**로 내린다 —
+        분 단위로만 자르면 ``1h`` 런을 13:37에 기동할 때 구간이 :37에서 시작해 Binance가 주는
+        정시 정렬 캔들과 어긋나고, 아래 개수 검증이 무조건 실패한다.
 
         이 캔들들은 :meth:`process_event`를 타지 않는다 — 주문도, 기록도, 시가평가도 없다.
         워밍업 구간은 이 프로세스가 돌고 있지 않던 과거라 대응하는 계좌 상태 자체가 없기
         때문이다. 같은 이유로 ``update``에 ``status``를 넘기지 않는다 (status를 읽는 지표는
-        ``None``을 워밍업으로 다뤄야 한다).
+        ``None``을 워밍업으로 다뤄야 한다). 그래서 이 단계는 백필과 소스는 같아도 경로가
+        다르다 — 백필은 지나간 봉이어도 그 사이 계좌에서 실제로 벌어진 일이 있다.
 
-        워밍업 소스가 본 공급자와 **다른 객체**라는 것이 이 메서드의 전제다: 라이브는 REST로
-        과거 구간을 받아오는 ``BinanceHistoricalCandleProducer``를 넘기고 본 공급자는
-        웹소켓이다. 그래서 마지막으로 먹인 캔들의 ``start_time``을 심볼별로 ``_last_start``에
-        남긴다 (``end_time``이 아니다 — 연속성 판정이 ``start_time + interval_ms`` 기준이다).
+        마지막으로 먹인 캔들의 ``start_time``을 심볼별로 ``_last_start``에 남긴다
+        (``end_time``이 아니다 — 연속성 판정이 ``start_time + interval_ms`` 기준이다).
         :meth:`run_async`가 첫 실시간 캔들을 이 앵커와 대조한다: 워밍업이 먹은 캔들이 다시
         오면 **중복**(지표 이중 투입 + 결정 재실행 = 주문 이중 발행)이라 버리고, 워밍업과 첫
         실시간 캔들 사이가 벌어졌으면 **구멍**(모든 롤링 윈도우 지표가 백테스트와 영구히
-        갈라진다)이라 :meth:`_backfill_gap`이 그 구간용 공급자로 메운다.
+        갈라진다)이라 :meth:`_backfill_gap`이 같은 ``history`` 조회로 메운다.
 
         라이브는 이걸 **소켓을 열기 전에** 부른다. 수십 초가 걸릴 수 있는데 그동안 유저 데이터
-        스트림을 읽지 않으면 python-binance의 큐가 넘치기 때문이다.
+        스트림을 읽지 않으면 python-binance의 큐가 넘치기 때문이다. 그래서 :meth:`run_async`
+        안이 아니라 호출자가 부르는 별개 단계다 (백테스트는 아예 안 부르고, 첫 window개
+        이벤트로 지표가 데워진다).
 
+        :param end: 워밍업 구간의 끝(배타). None이면 "지금"을 인터벌 경계로 내린 값.
+            검사 스크립트가 결정적으로 부르기 위한 인자다.
         :raise ValueError: 어떤 심볼이 자기 지표 window보다 적은 캔들을 받았을 때. 조용히 덜
             데워진 지표로 매매하는 것보다 기동에 실패하는 편이 낫다 — 라이브에서는 상장 직후
-            심볼이나 데이터 구멍이 여기서 잡힌다.
+            심볼이나 데이터 구멍이 여기서 잡힌다. ``history`` 조회가 아예 없을 때도 같다.
         """
-        fed: Dict[str, int] = {}
-        last: Dict[str, int] = {}
-        async for event in producer:
-            for symbol, candle in event.candles.items():
-                for indicator in self.streamer.indicators.get(symbol, {}).values():
-                    indicator.update(candle)
-                fed[symbol] = fed.get(symbol, 0) + 1
-                last[symbol] = candle.start_time
+        windows = self.streamer.warmup_windows()
+        max_window = max(windows.values(), default=0)
+        if max_window == 0:
+            self.logger.info("워밍업할 지표가 없다 — 건너뛴다")
+            return
+        if self.history is None:
+            raise ValueError("워밍업하려면 과거 캔들 조회(history)가 필요하다")
 
-        short = {s: f"{fed.get(s, 0)}/{w}" for s, w in self.streamer.warmup_windows().items()
-                 if fed.get(s, 0) < w}
+        interval = self.producer.interval_ms
+        if interval <= 0:
+            raise ValueError(f"워밍업 구간을 정할 수 없다: interval_ms={interval}")
+        now_ms = (round(end.timestamp() * 1000) if end is not None
+                  else round(datetime.now(tz=timezone.utc).timestamp() * 1000))
+        end_ms = now_ms // interval * interval
+        start_ms = end_ms - max_window * interval
+
+        self.logger.info("Pre-feeding indicators with historical data: %s ~ %s (%d candles)",
+                         ms_timestamp_to_datetime(start_ms), ms_timestamp_to_datetime(end_ms),
+                         max_window)
+
+        # 심볼별로 먹인다 — 지표는 자기 심볼 캔들만 보므로 이벤트로 묶어 시간순으로 섞을
+        # 이유가 없다 (본 루프의 이벤트 병합은 크로스심볼 *결정*을 위한 것이고, 워밍업에는
+        # 결정이 없다).
+        fetched = await self.history.fetch(list(self.streamer.symbols),
+                                           ms_timestamp_to_datetime(start_ms),
+                                           ms_timestamp_to_datetime(end_ms))
+        last: Dict[str, int] = {}
+        for symbol, candles in fetched.items():
+            indicators = list(self.streamer.indicators.get(symbol, {}).values())
+            for candle in candles:
+                for indicator in indicators:
+                    indicator.update(candle)
+            if candles:
+                last[symbol] = candles[-1].start_time
+
+        short = {s: f"{len(fetched.get(s, ()))}/{w}" for s, w in windows.items()
+                 if len(fetched.get(s, ())) < w}
         if short:
             raise ValueError(f"워밍업 캔들이 모자란다 (심볼: 받은 개수/필요 window): {short}")
 
-        for symbol, count in fed.items():
-            self.logger.info("[%s] Pre-fed indicators with %d candles: %s", symbol, count,
+        for symbol, candles in fetched.items():
+            self.logger.info("[%s] Pre-fed indicators with %d candles: %s", symbol, len(candles),
                              generate_dict_string(self.streamer.indicators.get(symbol, {})))
         self._last_start.update(last)
 
@@ -218,7 +259,7 @@ class TradingEngine:
 
         이벤트 루프 → ``recorder.close()`` 순서로, 한 번의 실행 전체를 여기가 갖는다.
         이벤트 루프가 없는 호출자는 동기 래퍼 :meth:`run`을 쓴다. 지표 워밍업은 여기 없다 —
-        소스가 다른 별개의 단계라 :meth:`warmup_from`을 호출자가 먼저 부른다 (백테스트는
+        소스가 다른 별개의 단계라 :meth:`warmup`을 호출자가 먼저 부른다 (백테스트는
         아예 안 부르고 첫 window개 이벤트로 지표가 데워진다).
 
         생성자의 ``on_error``를 주면 한 이벤트의 처리 실패(전략/지표 버그 등)가 루프를 끝내지
@@ -233,8 +274,8 @@ class TradingEngine:
           구간용 공급자로 지표를 메운 뒤(``decide=False``) 이 이벤트를 정상 처리한다.
         - 그 외 → 연속. 정상 처리하고 앵커를 갱신한다.
 
-        ``backfill_source``가 None인 공급자(백테스트)는 구멍 판정을 건너뛴다 — ragged
-        시계열의 빈 구간은 유실이 아니라 데이터 그대로다.
+        ``history`` 조회가 없는 런(백테스트)은 구멍 판정을 건너뛴다 — ragged 시계열의 빈
+        구간은 유실이 아니라 데이터 그대로다.
 
         ``recorder.close()``를 ``finally``가 아니라 루프 **뒤**에 두는 것은 의도적이다: 실행이
         예외로 끝났다면 반쪽짜리 산출물을 남기지 않는다.
@@ -273,17 +314,19 @@ class TradingEngine:
         return self.recorder.report
 
     async def _backfill_gap(self, symbol: str, candle: Candle, last: Optional[int]) -> None:
-        """앵커 ``last``와 ``candle`` 사이에 빠진 캔들을 ``backfill_source`` 공급자로 메운다.
+        """앵커 ``last``와 ``candle`` 사이에 빠진 캔들을 ``history`` 조회로 메운다.
 
-        빠진 캔들들은 :meth:`process_event`\\ (``decide=False``)로 흘려보낸다 — 지표 갱신·
-        실행기의 이벤트 경계 훅·기록까지만 가고 ``streamer.decide_action``에는 닿지 않는다
+        워밍업과 **같은 조회**다 (:meth:`warmup` 참고). 다른 것은 소스가 아니라 그 뒤다:
+        워밍업은 지표에만 먹이지만, 여기 캔들들은 :meth:`process_event`\\ (``decide=False``)로
+        흘려보낸다 — 지표 갱신·실행기의 이벤트 경계 훅·기록까지만 가고
+        ``streamer.decide_action``에는 닿지 않는다
         (몇 분 전 봉을 보고 지금 가격에 시장가를 내면 안 된다). 그 사이 거래소에서 벌어진
         미체결 체결은 ``begin_event``에서 반영된다.
 
         복구 불가한 상황(봉 경계 불일치, 백필 상한 초과, fetch 실패, 개수/정렬 불일치)은
         :meth:`_fatal`로 스트림을 치명적으로 끊는다 — 재기동이 지표를 프리피드로 다시 세운다.
         """
-        if last is None or self._backfill_source is None:
+        if last is None or self.history is None:
             return
 
         interval = self.producer.interval_ms
@@ -313,31 +356,31 @@ class TradingEngine:
         # fetch/공급자 오류는 치명적(지표가 이미 갈라졌다). 아래 process_event의 오류는
         # run_async의 on_error 경로로 올려보낸다 — 그건 일시적 버그일 수 있다.
         try:
-            bp = await asyncio.to_thread(
-                self._backfill_source, [symbol],
-                ms_timestamp_to_datetime(gap_start), ms_timestamp_to_datetime(gap_end))
-            events = [ev async for ev in bp]
+            fetched = await self.history.fetch(
+                [symbol], ms_timestamp_to_datetime(gap_start),
+                ms_timestamp_to_datetime(gap_end))
         except Exception as e:
             self._fatal(f"빠진 캔들을 백필하지 못했다 (symbol={symbol}): {e}")
+        candles = fetched.get(symbol, [])
 
         # 개수·정렬 검증 — 어긋난 캔들이 조용히 지표에 먹히는 일이 없게 (예전 _fetch_range 몫).
-        got = sum(len(ev.candles) for ev in events)
         expected = gap_start
-        for ev in events:
-            for _, c in ev.candles.items():
-                if c.start_time != expected:
-                    self._fatal(
-                        f"백필 캔들의 시작 시각이 어긋난다 (symbol={symbol}): "
-                        f"{ms_timestamp_to_datetime(c.start_time)} != "
-                        f"{ms_timestamp_to_datetime(expected)}")
-                expected += interval
-        if got != missing:
-            self._fatal(f"백필 캔들 개수가 맞지 않는다 (symbol={symbol}): {got} != {missing}")
+        for c in candles:
+            if c.start_time != expected:
+                self._fatal(
+                    f"백필 캔들의 시작 시각이 어긋난다 (symbol={symbol}): "
+                    f"{ms_timestamp_to_datetime(c.start_time)} != "
+                    f"{ms_timestamp_to_datetime(expected)}")
+            expected += interval
+        if len(candles) != missing:
+            self._fatal(f"백필 캔들 개수가 맞지 않는다 (symbol={symbol}): "
+                        f"{len(candles)} != {missing}")
 
-        for ev in events:
-            self.process_event(ev, decide=False)
-            for s, c in ev.candles.items():
-                self._last_start[s] = c.start_time
+        # 한 심볼짜리 이벤트로 감싸 본 루프와 같은 process_event를 태운다 — 백필은 정의상
+        # 단일 심볼이라 병합할 것이 없다.
+        for c in candles:
+            self.process_event(Event(c.end_time, {symbol: c}), decide=False)
+            self._last_start[symbol] = c.start_time
 
     def _fatal(self, reason: str) -> NoReturn:
         """스트림을 치명적으로 끊는다: 공급자에 사유를 남기고 정지 요청한 뒤 루프를 깬다."""

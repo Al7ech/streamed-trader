@@ -34,6 +34,7 @@ from core.executor.simulated import SimulatedExecutor
 from core.order.action import Action, ActionType
 from core.candle.candle import Candle
 from core.account.status import Status
+from core.history.base import CandleHistory
 from core.producer.base import CandleProducer, Event
 from core.engine.engine import TradingEngine
 from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
@@ -45,7 +46,7 @@ from core.streamer.base_streamer import BaseStreamer
 from core.streamer.strategies.keltner_stop_streamer import KeltnerStopStreamer
 from core.streamer.strategies.keltner_streamer import KeltnerStreamer
 from core.streamer.strategies.mean_reversion_zscore import MeanReversionZScoreStreamer
-from core.utils import trunc_by_sign
+from core.utils import ms_timestamp_to_datetime, trunc_by_sign
 
 MIN = 60_000
 SYM, SYM2 = "ETHUSDT", "BTCUSDT"
@@ -260,12 +261,25 @@ def synthetic_candles(start_ms, n):
             for i in range(n)]
 
 
-def synthetic_backfill(symbols, start, end):
-    """엔진의 ``backfill_source`` 스텁 — ``[start, end)`` 를 합성 캔들 공급자로 돌려준다."""
-    start_ms = round(start.timestamp() * 1000)
-    end_ms = round(end.timestamp() * 1000)
-    return InMemoryCandleProducer(
-        {symbols[0]: synthetic_candles(start_ms, (end_ms - start_ms) // MIN)}, progress=False)
+class SyntheticHistory(CandleHistory):
+    """엔진의 ``history`` 스텁 — ``[start, end)`` 를 합성 캔들로 채워 돌려준다.
+
+    **워밍업과 구멍 백필이 같은 조회를 쓴다**는 것이 요점이라, 검사도 하나로 둔다.
+    ``short``면 요청보다 한 개 적게 돌려줘 "덜 데워졌는데도 기동하는가"를 찌른다.
+    """
+
+    def __init__(self, short=False, boom=False):
+        self.short, self.boom = short, boom
+        self.ranges = []
+
+    async def fetch(self, symbols, start, end):
+        if self.boom:
+            raise RuntimeError("REST 실패")
+        start_ms = round(start.timestamp() * 1000)
+        end_ms = round(end.timestamp() * 1000)
+        self.ranges.append((start_ms, end_ms))
+        count = (end_ms - start_ms) // MIN - (1 if self.short else 0)
+        return {symbol: synthetic_candles(start_ms, count) for symbol in symbols}
 
 
 class _DecideSpy(BaseStreamer):
@@ -290,8 +304,7 @@ class _EventSpy(NullRecorder):
         self.times.append(event_time)
 
 
-def make_engine(messages, *, backfill_source=synthetic_backfill, max_backfill_candles=60,
-                anchor=None):
+def make_engine(messages, *, history=None, max_backfill_candles=60, anchor=None):
     errors = []
 
     async def on_error(e):
@@ -303,7 +316,7 @@ def make_engine(messages, *, backfill_source=synthetic_backfill, max_backfill_ca
     p._running = True
     spy, rec = _DecideSpy(), _EventSpy()
     engine = TradingEngine(spy, p, SimulatedExecutor(INIT_MARGIN), rec,
-                           backfill_source=backfill_source,
+                           history=history if history is not None else SyntheticHistory(),
                            max_backfill_candles=max_backfill_candles)
     if anchor:
         engine._last_start.update(anchor)
@@ -358,7 +371,7 @@ async def check_candle_producer():
           spy.decided == [T0, T0 + MIN] and rec.times == [T0 + MIN, T0 + 2 * MIN] and not errs,
           f"decided={spy.decided} rec={rec.times}")
 
-    # 구멍: 빠진 캔들은 backfill_source로 메우고 decide_action에는 닿지 않는다.
+    # 구멍: 빠진 캔들은 history 소스로 메우고 decide_action에는 닿지 않는다.
     # 여기가 새면 몇 분 전 봉을 보고 지금 가격에 시장가가 나간다.
     engine, p, spy, rec, errs = make_engine(
         [kline_msg(T0), kline_msg(T0 + 3 * MIN)], anchor={SYM: T0 - MIN})
@@ -383,26 +396,18 @@ async def check_candle_producer():
           spy.decided == [T0] and "경계" in (p.fatal_reason or ""),
           f"decided={spy.decided} fatal={p.fatal_reason}")
 
-    def boom_backfill(symbols, start, end):
-        raise RuntimeError("REST 실패")
-
     engine, p, spy, rec, errs = make_engine(
         [kline_msg(T0), kline_msg(T0 + 3 * MIN)], anchor={SYM: T0 - MIN},
-        backfill_source=boom_backfill)
+        history=SyntheticHistory(boom=True))
     await engine.run_async()
     # 지표가 이미 갈라졌다. 이 상태로 계속 매매하면 전략이 백테스트와 다른 것을 본다.
     check("engine: 백필 fetch 실패 → 치명적",
           spy.decided == [T0] and "백필" in (p.fatal_reason or ""),
           f"decided={spy.decided} fatal={p.fatal_reason}")
 
-    def short_backfill(symbols, start, end):
-        start_ms = round(start.timestamp() * 1000)
-        return InMemoryCandleProducer(
-            {symbols[0]: synthetic_candles(start_ms, 1)}, progress=False)
-
     engine, p, spy, rec, errs = make_engine(
         [kline_msg(T0), kline_msg(T0 + 3 * MIN)], anchor={SYM: T0 - MIN},
-        backfill_source=short_backfill)
+        history=SyntheticHistory(short=True))
     await engine.run_async()
     check("engine: 백필 캔들 개수 불일치 → 치명적",
           spy.decided == [T0] and "개수" in (p.fatal_reason or ""),
@@ -410,24 +415,18 @@ async def check_candle_producer():
 
 
 async def check_warmup():
-    """지표 워밍업: 별개 소스로 먹이고, 그 앵커가 엔진에 남아 실시간 소스와 이어지는가.
+    """지표 워밍업: 엔진이 구간을 정하고, 그 앵커가 남아 실시간 소스와 이어지는가.
 
-    라이브 기동은 "과거 구간을 REST로 받아 지표에 먹인 뒤 소켓을 연다"인데, 그 두 소스는
-    서로 다른 객체다. 마지막으로 먹인 지점이 엔진의 연속성 앵커로 남지 않으면 그 사이 마감한
-    봉이 조용히 사라져 모든 롤링 윈도우 지표가 백테스트와 영구히 갈라진다.
+    라이브 기동은 "과거 구간을 받아 지표에 먹인 뒤 소켓을 연다"인데, 그 두 소스는 서로 다른
+    객체다. 마지막으로 먹인 지점이 엔진의 연속성 앵커로 남지 않으면 그 사이 마감한 봉이 조용히
+    사라져 모든 롤링 윈도우 지표가 백테스트와 영구히 갈라진다.
+
+    **워밍업과 구멍 백필이 같은 ``history`` 소스에서 나온다**는 것도 여기서 굳힌다 — 둘이
+    다른 경로로 캔들을 구하면 조용히 갈라질 수 있다.
     """
     window = 5
-    fetched = {}
 
-    def backfill_source(symbols, start, end):
-        start_ms = round(start.timestamp() * 1000)
-        end_ms = round(end.timestamp() * 1000)
-        fetched["range"] = (start_ms, end_ms)
-        return InMemoryCandleProducer(
-            {symbols[0]: synthetic_candles(start_ms, (end_ms - start_ms) // MIN)},
-            progress=False)
-
-    def assemble():
+    def assemble(history):
         streamer = KeltnerStreamer(symbols=[SYM], window=window)
         decided = []
         _orig = streamer.decide_action
@@ -438,13 +437,15 @@ async def check_warmup():
 
         streamer.decide_action = spy
         p, _ = make_producer([kline_msg(T0 + (window + 1) * MIN)])
-        engine = TradingEngine(streamer, p, SimulatedExecutor(INIT_MARGIN),
-                               backfill_source=backfill_source)
+        engine = TradingEngine(streamer, p, SimulatedExecutor(INIT_MARGIN), history=history)
         return streamer, p, engine, decided
 
-    streamer, p, engine, decided = assemble()
-    warmup = InMemoryCandleProducer({SYM: synthetic_candles(T0, window)}, progress=False)
-    await engine.warmup_from(warmup)
+    history = SyntheticHistory()
+    streamer, p, engine, decided = assemble(history)
+    # end만 주면 필요한 길이(window × 인터벌)는 엔진이 정한다 — 트레이더가 아니라.
+    await engine.warmup(end=ms_timestamp_to_datetime(T0 + window * MIN))
+    check("warmup: 엔진이 window만큼의 구간을 요청한다",
+          history.ranges == [(T0, T0 + window * MIN)], f"{history.ranges}")
     check("warmup: 지표가 데워진다",
           streamer.indicators[SYM]["MA"].get_latest() is not None)
     # 마지막으로 먹인 캔들의 start_time — end_time이 아니다 (연속성 판정 기준이 start다).
@@ -452,23 +453,32 @@ async def check_warmup():
           engine._last_start.get(SYM) == T0 + (window - 1) * MIN,
           f"{engine._last_start.get(SYM)}")
 
-    # 워밍업은 T0+4분까지 먹었고 첫 실시간 캔들은 T0+6분 — 그 사이 T0+5분이 백필돼야 한다.
+    # 워밍업은 T0+4분까지 먹었고 첫 실시간 캔들은 T0+6분 — 그 사이 T0+5분이 **같은 소스로**
+    # 백필돼야 한다.
     await engine.run_async()
-    check("warmup: 워밍업과 첫 실시간 캔들 사이 구멍이 백필된다",
-          fetched.get("range") == (T0 + window * MIN, T0 + (window + 1) * MIN)
+    check("warmup: 워밍업과 첫 실시간 캔들 사이 구멍이 같은 조회로 백필된다",
+          history.ranges[-1:] == [(T0 + window * MIN, T0 + (window + 1) * MIN)]
           and decided == [T0 + (window + 1) * MIN]
           and engine._last_start.get(SYM) == T0 + (window + 1) * MIN,
-          f"range={fetched.get('range')} decided={decided} anchor={engine._last_start.get(SYM)}")
+          f"ranges={history.ranges} decided={decided} anchor={engine._last_start.get(SYM)}")
 
     # 조용히 덜 데워진 지표로 매매하느니 기동에 실패하는 편이 낫다.
-    _, _, engine, _ = assemble()
-    short = InMemoryCandleProducer({SYM: synthetic_candles(T0, window - 1)}, progress=False)
+    _, _, engine, _ = assemble(SyntheticHistory(short=True))
     try:
-        await engine.warmup_from(short)
+        await engine.warmup(end=ms_timestamp_to_datetime(T0 + window * MIN))
         raised = False
     except ValueError:
         raised = True
     check("warmup: 캔들이 모자라면 기동 실패", raised)
+
+    # 과거 캔들 조회가 없으면(백테스트 조립) 워밍업 자체가 성립하지 않는다.
+    _, _, engine, _ = assemble(None)
+    try:
+        await engine.warmup(end=ms_timestamp_to_datetime(T0 + window * MIN))
+        raised = False
+    except ValueError:
+        raised = True
+    check("warmup: history 조회가 없으면 기동 실패", raised)
 
 
 # ============================================================ 2. 라이브 실행기

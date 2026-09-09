@@ -55,20 +55,22 @@ Everything about *where candles come from*:
   `boundary - 1ms`, the fetcher uses the boundary) so live and backfilled candles line up.
 - **Does no continuity check itself.** Gap and duplicate detection is the engine's: `run_async`
   compares `start_time + interval_ms` against its own per-symbol `_last_start` anchor, drops an
-  already-processed candle, and on a gap builds a throw-away producer for the missing range via the
-  `backfill_source` factory the trader supplied. A misaligned boundary, a gap larger than
+  already-processed candle, and on a gap asks its `history` port (a `CandleHistory`, which takes
+  the range as an argument) for the missing candles. A misaligned boundary, a gap larger than
   `max_backfill_candles`, or a failed backfill ends the stream (the engine sets
   `producer.fatal_reason` + `producer.request_stop()`; the trader then stops, and a restart
   recovers: warm-up rebuilds the indicators and the exchange owns the position).
 - Backfilled candles run through `process_event(..., decide=False)`: they update indicators and run
   through `executor.begin_event`, but never reach `streamer.decide_action`. A bar that already went
   by must not produce a market order that fills at the current price.
-- **No indicator history is fetched here.** The trader warms up from a separate
-  `BinanceHistoricalCandleProducer` (REST fetcher, `use_cache=False`, built by the
-  `_historical_producer` helper) via `TradingEngine.warmup_from`, which records the resulting
-  continuity point into the engine's `_last_start`. That **same** helper is passed to the engine as
-  `backfill_source`, so the gap between the warm-up range and the first live candle is backfilled by
-  the identical machinery instead of being silently swallowed.
+- **No indicator history is fetched here.** The trader hands the engine one
+  `FetcherCandleHistory(BinanceCandleFetcher(), interval)` (REST, `use_cache=False`) as its
+  `history` port and calls
+  `TradingEngine.warmup()`, which derives the range itself (`max(warmup_windows())` × interval,
+  ending at the interval boundary) and records the resulting continuity point into the engine's
+  `_last_start`. The gap backfill above uses that **same** source, so the gap between the warm-up
+  range and the first live candle is filled by the identical machinery instead of being silently
+  swallowed.
 
 Because a single consumer drives this source and fully runs each `process_event` before pulling the
 next message, *decision* processing across symbols is naturally serialized — no extra locking is

@@ -18,17 +18,16 @@
 import asyncio
 import copy
 import logging
-from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from binance import AsyncClient, BinanceSocketManager
 
-from core.producer.historical import BinanceHistoricalCandleProducer
+from core.fetcher.binance.rest_fetcher import BinanceCandleFetcher
+from core.history.fetcher import FetcherCandleHistory
 from core.executor.simulated import SimulatedExecutor
 from core.account.status import Status
 from core.engine.engine import TradingEngine
 from core.executor.base import Executor
-from core.fetcher.binance.rest_fetcher import BinanceCandleFetcher
 from core.producer.live import LiveCandleProducer
 from core.executor.live import LiveExecutor, resolve_margin_asset
 from core.recorder.live import DEFAULT_SHARD_FLUSH_EVERY, LiveRecorder, default_run_id
@@ -100,7 +99,7 @@ class BinanceTrader:
 
         self.client: Optional[AsyncClient] = None
         self.socket_manager: Optional[BinanceSocketManager] = None
-        #: 마감 캔들 공급자. 소켓 연결/연속성/백필/워밍업 페치를 전부 소유한다.
+        #: 마감 캔들 공급자. 소켓 연결과 봉투 파싱만 한다 — 연속성/백필/워밍업은 엔진 몫이다.
         self.producer: Optional[LiveCandleProducer] = None
         self.user_socket: Optional[ReliableWebsocket] = None
         self.engine: Optional[TradingEngine] = None
@@ -171,16 +170,22 @@ class BinanceTrader:
                     self.recorder.resumed_status if self.recorder else None)
 
             # 부품을 넘기면 배선(체결 싱크, 레코더 기본값)과 실행은 엔진이 갖는다.
-            # backfill_source: 라이브 스트림에 구멍이 나면 엔진이 이걸로 그 구간 공급자를
-            # 만들어 지표를 메운다 — 워밍업 프리피드와 같은 팩토리다. 드라이런도 넘긴다
-            # (백필된 봉에서 드라이런 스탑이 체결돼야 백테스트와 대조된다).
-            self.engine = TradingEngine(self.streamer, self.producer, self.executor,
-                                        self.recorder, on_error=self._handle_error,
-                                        backfill_source=self._historical_producer)
+            # history: 구간이 런타임에 정해지는 과거 캔들 조회 — 아래 워밍업과 라이브 스트림의
+            # 구멍 백필이 **같은 것**을 쓴다. 드라이런도 넘긴다 (백필된 봉에서 드라이런 스탑이
+            # 체결돼야 백테스트와 대조된다). REST fetcher에 캐시는 끈다: Vision 벌크 덤프는
+            # 하루쯤 지연돼 "직전 N개 봉"을 못 주고, 월청크 캐시는 요청 구간이 아니라 달
+            # 경계로 받아 월말 기동이 그 달 전체를 끌어온다. fetcher 생성자가 동기 ping을
+            # 치므로 스레드로 뺀다.
+            fetcher = await asyncio.to_thread(BinanceCandleFetcher)
+            self.engine = TradingEngine(
+                self.streamer, self.producer, self.executor, self.recorder,
+                on_error=self._handle_error,
+                history=FetcherCandleHistory(fetcher, self.interval))
 
             # 4. 지표 워밍업. 소켓을 열기 **전에** 한다 — 수십 초가 걸릴 수 있는데 그동안
             #    유저 데이터 스트림을 읽지 않으면 python-binance의 큐가 넘쳐 죽는다.
-            await self._prefeed_indicators()
+            #    얼마만큼의 과거가 필요한지(지표 window × 인터벌)는 엔진이 안다.
+            await self.engine.warmup()
 
             # 5. 리스너 태스크 생성 전에 플래그를 세운다. 리스너 루프가 `while self.is_running`
             #    으로 시작하므로, 나중에 세우면 첫 await에서 태스크가 곧바로 빠져나간다.
@@ -267,61 +272,6 @@ class BinanceTrader:
         await self.engine.run_async()
         if self.is_running:
             await self.stop()
-
-    async def _prefeed_indicators(self):
-        """Pre-feed every symbol's indicators with historical candle data.
-
-        과거 캔들은 **백테스트가 쓰는 그 공급자**가 내준다 — 워밍업이란 "직전 N개 봉을 받아
-        이벤트로 내주는 것" 이상이 아니라서 라이브 전용 구현이 따로 필요 없다. 다만 Vision
-        벌크 덤프는 하루쯤 지연되므로 REST fetcher를 넘기고, 월청크 pkl 캐시는 요청 구간이
-        아니라 달 경계로 fetch하므로(월말 기동이 그 달 전체를 받게 된다) 끈다.
-
-        지표에 먹이고(``status`` 없이 — 이 구간에는 대응하는 계좌 상태가 없다) 실시간 공급자에
-        이어붙일 지점을 알려 주는 것은 엔진의 :meth:`~core.engine.engine.TradingEngine.warmup_from`이 한다.
-
-        구간은 심볼별 window가 아니라 **전 심볼 공통 ``max(window)``** 다. 롤링 윈도우 지표에
-        과거를 더 먹이는 것은 무해하고, 심볼마다 ``datetime.now()``를 다시 재면 순차 fetch에
-        걸린 시간만큼 뒤 심볼의 창이 밀려 서로 어긋난다.
-
-        소켓을 열기 **전에** 불러야 한다 — 수십 초가 걸릴 수 있는데 그동안 유저 데이터
-        스트림을 읽지 않으면 python-binance의 큐가 넘친다.
-        """
-        max_window = max(self.streamer.warmup_windows().values(), default=0)
-        if max_window == 0:
-            self.logger.info("No indicators found, skipping pre-feeding")
-            return
-
-        # **인터벌 경계**로 내린다. 분 단위로만 자르면 1h 인터벌을 13:37에 기동할 때 구간이
-        # :37에서 시작해 Binance가 주는 정시 정렬 캔들과 어긋나고, 엔진의 개수 검증이 무조건
-        # 실패한다 — 사실상 1m 외에는 라이브 기동이 불가능해진다.
-        interval_delta = timedelta(minutes=interval_to_minutes(self.interval))
-        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-        now = datetime.now(tz=timezone.utc)
-        end_time = epoch + (now - epoch) // interval_delta * interval_delta
-        start_time = end_time - max_window * interval_delta
-
-        self.logger.info("Pre-feeding indicators with historical data: %s ~ %s (%d candles)",
-                         start_time, end_time, max_window)
-        try:
-            # 생성자가 그 자리에서 동기 HTTP를 친다 — 이벤트 루프를 막지 않게 스레드로 뺀다.
-            warmup_producer = await asyncio.to_thread(
-                self._historical_producer, self.symbols, start_time, end_time)
-            await self.engine.warmup_from(warmup_producer)
-        except Exception as e:
-            self.logger.error(f"Failed to pre-feed indicators: {e}")
-            raise
-
-    def _historical_producer(self, symbols: List[str], start: datetime,
-                             end: datetime) -> BinanceHistoricalCandleProducer:
-        """``[start, end)`` 구간 공급자. 워밍업 프리피드와 엔진의 구멍 백필이 함께 쓴다.
-
-        REST fetcher + ``use_cache=False``: Vision 벌크 덤프는 하루쯤 지연되고, 월청크 pkl
-        캐시는 요청 구간이 아니라 달 경계로 fetch한다 (월말 기동이 그 달 전체를 받게 된다).
-        생성자가 동기 HTTP를 치므로 호출자가 :func:`asyncio.to_thread`로 감싼다.
-        """
-        return BinanceHistoricalCandleProducer(
-            start, end, symbols, self.interval,
-            fetcher=BinanceCandleFetcher(), use_cache=False, progress=False)
 
     # ----------------------------------------------------------------- 결과 기록
 
