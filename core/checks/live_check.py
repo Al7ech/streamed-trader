@@ -43,6 +43,7 @@ from core.executor.binance_order_client import OrderResult
 from core.executor.live import LiveExecutor, resolve_margin_asset
 from core.logging_config import setup_logging
 from core.streamer.base_streamer import BaseStreamer
+from core.streamer.indicator.base_indicator import BaseIndicator
 from core.streamer.strategies.keltner_stop_streamer import KeltnerStopStreamer
 from core.streamer.strategies.keltner_streamer import KeltnerStreamer
 from core.streamer.strategies.mean_reversion_zscore import MeanReversionZScoreStreamer
@@ -304,7 +305,41 @@ class _EventSpy(NullRecorder):
         self.times.append(event_time)
 
 
-def make_engine(messages, *, history=None, max_backfill_candles=60, anchor=None):
+class _FeedSpy(BaseIndicator):
+    """먹은 캔들의 ``start_time``을 기록한다. ``fail_at``이면 기록한 **뒤** 예외를 낸다 —
+    "지표는 이미 봉을 먹었는데 처리는 실패한" 상태를 만든다."""
+
+    window = 1
+
+    def __init__(self, fail_at=None):
+        self.fed, self.fail_at = [], fail_at
+
+    def update(self, candle, status=None):
+        self.fed.append(candle.start_time)
+        if candle.start_time == self.fail_at:
+            raise RuntimeError("지표 버그 (일시적)")
+
+    def read(self, idx):
+        return None
+
+
+class _FailingDecideSpy(_DecideSpy):
+    """``_FeedSpy``를 지표로 달고, ``fail_at`` 봉의 ``decide_action``에서 예외를 낸다."""
+
+    def __init__(self, feed, fail_at=None):
+        BaseStreamer.__init__(self, [SYM], {SYM: {"feed": feed}})
+        self.decided, self.fail_at = [], fail_at
+
+    def decide_action(self, candles, status):
+        if candles[SYM].start_time == self.fail_at:
+            raise RuntimeError("전략 버그 (일시적)")
+        return super().decide_action(candles, status)
+
+
+def make_engine(messages, *, history=None, max_backfill_candles=60, anchor=None,
+                streamer=None, recover=False):
+    """``recover``면 엔진에도 ``on_error``를 넘긴다 — 처리 중 예외가 루프를 끝내지 않는
+    라이브 경로. 기본은 넘기지 않아 예상 못 한 예외가 검사를 그대로 깨뜨린다."""
     errors = []
 
     async def on_error(e):
@@ -314,8 +349,9 @@ def make_engine(messages, *, history=None, max_backfill_candles=60, anchor=None)
                                on_error=on_error)
     p.socket = FakeKlineSocket(messages)
     p._running = True
-    spy, rec = _DecideSpy(), _EventSpy()
+    spy, rec = streamer or _DecideSpy(), _EventSpy()
     engine = TradingEngine(spy, p, SimulatedExecutor(INIT_MARGIN), rec,
+                           on_error=on_error if recover else None,
                            history=history if history is not None else SyntheticHistory(),
                            max_backfill_candles=max_backfill_candles)
     if anchor:
@@ -412,6 +448,31 @@ async def check_candle_producer():
     check("engine: 백필 캔들 개수 불일치 → 치명적",
           spy.decided == [T0] and "개수" in (p.fatal_reason or ""),
           f"decided={spy.decided} fatal={p.fatal_reason}")
+
+    # 처리 중 예외(on_error 경로) 뒤에도 앵커는 넘어가 있어야 한다. 남아 있으면 다음 캔들이
+    # 1봉짜리 구멍으로 보여, 이미 지표에 들어간 봉을 백필이 한 번 더 먹인다 — 경로 의존
+    # 지표(ADX, Supertrend 등)가 백테스트와 영구히 갈라진다.
+    feed = _FeedSpy()
+    engine, p, spy, rec, errs = make_engine(
+        [kline_msg(T0), kline_msg(T0 + MIN), kline_msg(T0 + 2 * MIN)], anchor={SYM: T0 - MIN},
+        streamer=_FailingDecideSpy(feed, fail_at=T0 + MIN), recover=True)
+    await engine.run_async()
+    check("engine: decide 예외 뒤 같은 봉을 다시 먹이지 않는다",
+          feed.fed == [T0, T0 + MIN, T0 + 2 * MIN] and spy.decided == [T0, T0 + 2 * MIN]
+          and len(errs) == 1,
+          f"fed={feed.fed} decided={spy.decided} errs={errs}")
+
+    # 백필 도중의 예외도 같다: 실패한 백필 봉까지는 소비된 것으로 보고, 다음 백필은 그 뒤부터.
+    # 이 이벤트의 트리거 봉(T0+3)은 버려지고 다음 백필이 decide 없이 채운다.
+    feed = _FeedSpy(fail_at=T0 + MIN)
+    engine, p, spy, rec, errs = make_engine(
+        [kline_msg(T0), kline_msg(T0 + 3 * MIN), kline_msg(T0 + 4 * MIN)],
+        anchor={SYM: T0 - MIN}, streamer=_FailingDecideSpy(feed), recover=True)
+    await engine.run_async()
+    check("engine: 백필 예외 뒤 같은 봉을 다시 먹이지 않는다",
+          feed.fed == [T0 + i * MIN for i in range(5)] and spy.decided == [T0, T0 + 4 * MIN]
+          and len(errs) == 1,
+          f"fed={feed.fed} decided={spy.decided} errs={errs}")
 
 
 async def check_warmup():

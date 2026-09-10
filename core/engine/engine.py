@@ -272,7 +272,11 @@ class TradingEngine:
         - ``start_time <= 앵커`` → **이미 처리한 캔들**. 통째로 버린다 (재연결 직후 재전송 등).
         - ``start_time``이 앵커보다 한 인터벌 넘게 앞 → **구멍**. :meth:`_backfill_gap`이 그
           구간용 공급자로 지표를 메운 뒤(``decide=False``) 이 이벤트를 정상 처리한다.
-        - 그 외 → 연속. 정상 처리하고 앵커를 갱신한다.
+        - 그 외 → 연속. 앵커를 갱신하고 정상 처리한다.
+
+        앵커는 **처리 결과와 무관하게** ``process_event``에 들어간 순간 소비된 것으로 본다.
+        처리 중 예외가 나도 지표는 이미 그 봉을 먹었을 수 있으므로, 앵커가 남아 다음 캔들의
+        백필이 같은 봉을 다시 먹이면 경로 의존 지표가 백테스트와 영구히 갈라진다.
 
         ``history`` 조회가 없는 런(백테스트)은 구멍 판정을 건너뛴다 — ragged 시계열의 빈
         구간은 유실이 아니라 데이터 그대로다.
@@ -296,9 +300,11 @@ class TradingEngine:
                             ms_timestamp_to_datetime(last))
                         raise _SkipEvent
                     await self._backfill_gap(symbol, candle, last)
-                self.process_event(event, decide=True)
+                # 앵커는 process_event **전에** 옮긴다. 뒤에 두면 처리 중 예외(on_error 경로)가
+                # 앵커를 남겨, 이미 지표에 들어간 이 봉을 다음 캔들의 백필이 한 번 더 먹인다.
                 for symbol, candle in event.candles.items():
                     self._last_start[symbol] = candle.start_time
+                self.process_event(event, decide=True)
             except _SkipEvent:
                 continue
             except _TerminalStream:
@@ -379,8 +385,8 @@ class TradingEngine:
         # 한 심볼짜리 이벤트로 감싸 본 루프와 같은 process_event를 태운다 — 백필은 정의상
         # 단일 심볼이라 병합할 것이 없다.
         for c in candles:
+            self._last_start[symbol] = c.start_time  # run_async와 같은 이유로 처리 전에 옮긴다
             self.process_event(Event(c.end_time, {symbol: c}), decide=False)
-            self._last_start[symbol] = c.start_time
 
     def _fatal(self, reason: str) -> NoReturn:
         """스트림을 치명적으로 끊는다: 공급자에 사유를 남기고 정지 요청한 뒤 루프를 깬다."""

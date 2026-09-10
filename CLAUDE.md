@@ -23,7 +23,8 @@ There is no automated test suite (no `pytest`/`unittest` files in `core/`, only 
 
 - `core/checks/live_check.py` — covers the live path (it needs a socket and an exchange, so it fakes
   both) and asserts the engine's continuity/backfill rules over a faked live producer (duplicate
-  skip, gap backfill via the `history` query, cap/boundary/fetch fatals), the indicator warm-up
+  skip, gap backfill via the `history` query, cap/boundary/fetch fatals, no re-feed of a candle whose
+  processing raised), the indicator warm-up
   handoff (`warmup()` derives its own range, seeds the engine's `_last_start` anchor, and the gap
   between the warm-up range and the first live candle is backfilled from that **same** source), the
   live executor's
@@ -398,7 +399,11 @@ the missing `[gap_start, next_start)` range — the same query warm-up used — 
 contiguous and complete, wraps each one in a single-symbol `Event` (a backfill is per symbol, so
 there is nothing to merge) and runs it through `process_event(..., decide=False)`
 (indicators + `begin_event` + recording, no
-`decide_action`), then processes the triggering candle with `decide=True`. This one anchor closes
+`decide_action`), then processes the triggering candle with `decide=True`. The anchor advances
+**before** each `process_event` call (live and backfill alike), not after it succeeds: a candle
+whose processing raised (the `on_error` path) may already be in the indicators, and an anchor left
+behind would make the next candle look like a one-bar gap whose backfill feeds it a second time —
+permanently skewing path-dependent indicators. This one anchor closes
 both failure modes the old `resume_after` handoff existed for: a warm-up candle re-arriving would
 double-feed indicators and re-run `decide_action` (**a second order**); a bar that closed while the
 sockets were connecting would leave every rolling-window indicator permanently diverged from the
