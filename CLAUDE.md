@@ -911,6 +911,17 @@ straight to `executor.on_user_data(...)`.
     `producer.request_stop()`) on a misaligned boundary, a gap over `max_backfill_candles`, or a
     failed/short backfill fetch. A restart then recovers (warm-up rebuilds the indicators, the
     exchange owns the position).
+  - **A stalled stream is the producer's to catch** — the one liveness check it does. The engine
+    only judges a gap when the *next* candle arrives, so a stream that simply goes quiet (the
+    connection alive but the exchange no longer pushing, or one symbol of the multiplex dying)
+    would leave a healthy-looking process waiting forever: python-binance treats a receive
+    timeout as "keep waiting" (its `NO_MESSAGE_RECONNECT_TIMEOUT` is defined but unused), and the
+    websockets ping only catches a dead TCP connection. `LiveCandleProducer` tracks each symbol's
+    last closed-candle arrival on `time.monotonic()` (immune to wall-clock steps) and, once any
+    symbol goes `stall_timeout_s` (default one interval + `DEFAULT_STALL_GRACE_S`, 60s — room for
+    python-binance's own reconnect backoff) without one, sets `fatal_reason` and ends the stream
+    so a restart recovers. Time the consumer spends holding an event (a backfill's REST fetch)
+    is added back to every deadline: the socket was not being read, which is not a stall.
   - **Indicator history is not fetched here, and the trader no longer computes the range.** It
     hands the engine one `FetcherCandleHistory(BinanceCandleFetcher(), interval)` as `history`
     (REST, `use_cache=False`; the synchronous-HTTP-in-a-thread detail lives inside that query) and

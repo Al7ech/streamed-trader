@@ -242,6 +242,34 @@ class FakeKlineSocket:
         pass
 
 
+class TimedKlineSocket:
+    """``delay``초 간격으로 메시지를 내주고, 다 떨어지면 **영원히 조용하다** — 연결은 살아
+    있는데 푸시가 멈춘 스트림. 예외를 내는 ``FakeKlineSocket``과 달리 끊김으로 드러나지 않는다."""
+
+    def __init__(self, messages, delay=0.0):
+        self._messages, self.delay = list(messages), delay
+
+    async def recv(self):
+        await asyncio.sleep(self.delay)
+        if not self._messages:
+            await asyncio.Event().wait()
+        return self._messages.pop(0)
+
+    async def close(self):
+        pass
+
+
+def make_timed_producer(messages, *, symbols=(SYM,), delay=0.0, stall_timeout_s=0.1):
+    async def on_error(e):
+        pass
+
+    p = lcp.LiveCandleProducer(socket_manager=None, symbols=list(symbols), interval="1m",
+                               on_error=on_error, stall_timeout_s=stall_timeout_s)
+    p.socket = TimedKlineSocket(messages, delay)
+    p._running = True
+    return p
+
+
 def make_producer(messages):
     """순수 공급자 — 파싱·정규화만 본다 (연속성은 엔진 몫이라 여기 없다)."""
     errors = []
@@ -395,6 +423,36 @@ async def check_candle_producer():
         got.append(ev)
         p.request_stop()
     check("producer: request_stop", len(got) == 1, f"{len(got)}개")
+
+    # --- 멈춘 스트림 감시 ---
+    # 연결은 살아 있는데 캔들이 안 오면 엔진의 구멍 판정(다음 캔들이 와야 일어난다)은 영영
+    # 돌지 않는다. 기한이 지나면 공급자가 스스로 치명적으로 끊어야 재기동으로 복구된다.
+    p = make_timed_producer([kline_msg(T0)])
+    evs = await asyncio.wait_for(collect(p), timeout=5)
+    check("producer: 전체 무소식 → 치명적",
+          len(evs) == 1 and "마감 캔들" in (p.fatal_reason or "") and SYM in p.fatal_reason,
+          f"evs={len(evs)} fatal={p.fatal_reason}")
+
+    # 멀티플렉스 중 한 심볼만 멈춘 경우: 다른 심볼 메시지가 계속 와서 recv는 매번 돌아온다.
+    p = make_timed_producer([kline_msg(T0 + i * MIN, symbol=SYM2) for i in range(50)],
+                            symbols=(SYM, SYM2), delay=0.01)
+    evs = await asyncio.wait_for(collect(p), timeout=5)
+    check("producer: 한 심볼만 멈춰도 치명적 (그 심볼만 지목)",
+          0 < len(evs) < 50 and f"symbols=['{SYM}']" in (p.fatal_reason or ""),
+          f"evs={len(evs)} fatal={p.fatal_reason}")
+
+    # 소비자(엔진)가 이벤트를 오래 붙잡는 동안(백필 REST 등)은 소켓을 읽지 않은 것이지 스트림이
+    # 멈춘 게 아니다. 그 시간이 기한을 잡아먹으면 느린 백필 한 번이 헛재기동을 부른다.
+    p = make_timed_producer([kline_msg(T0 + i * MIN) for i in range(3)], delay=0.01)
+    got = []
+    async for ev in p:
+        got.append(ev)
+        if len(got) == 1:
+            await asyncio.sleep(0.3)
+        if len(got) == 3:
+            p.request_stop()
+    check("producer: 소비자가 붙잡은 시간은 멈춤으로 세지 않는다",
+          len(got) == 3 and p.fatal_reason is None, f"got={len(got)} fatal={p.fatal_reason}")
 
     # --- 연속성은 엔진이 판정한다 ---
     engine, p, spy, rec, errs = make_engine(

@@ -5,14 +5,22 @@
 
 **연속성 판정은 하지 않는다.** 중복 캔들 감지, 구멍 백필, 워밍업↔라이브 이어붙이기는 모두
 엔진 몫이다 (:meth:`~core.engine.engine.TradingEngine` 참고) — 엔진이 심볼별 연속성 앵커를
-들고, 스트림이 앞으로 건너뛰면 그 구간용 공급자를 즉석에서 만들어 지표만 채운다.
+들고, 스트림이 앞으로 건너뛰면 그 구간을 ``history`` 조회로 받아 결정 없이 재생한다.
+
+**멈춘 스트림은 여기서 잡는다.** 엔진의 구멍 판정은 다음 캔들이 *도착해야* 일어나므로, 캔들이
+아예 안 오면 아무도 모른다 — 연결은 살아 있는데 거래소가 푸시를 멈추거나, 멀티플렉스 중 한
+심볼만 끊기면 python-binance는 그걸 끊김으로 보지 않는다(수신 타임아웃에서 그냥 다시 기다린다).
+그래서 심볼별로 마지막 마감 캔들 이후 ``stall_timeout_s``가 지나면 치명적으로 끊는다.
+재기동이 워밍업으로 지표를 다시 세운다.
 
 라이브는 심볼을 병합하지 않는다. 각 심볼의 캔들이 도착하는 즉시 **키 하나짜리 이벤트**로
 내주므로, 엔진의 ``streamer.symbols`` 순회에서 나머지 심볼은 캔들이 없어 자연히 걸러진다.
 """
 
+import asyncio
 import logging
-from typing import AsyncIterator, Awaitable, Callable, List, Optional
+import time
+from typing import AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 from binance.enums import ContractType
 
@@ -21,16 +29,24 @@ from core.producer.base import CandleProducer, Event
 from core.producer.reliable_websocket import ReliableWebsocket
 from core.utils import interval_to_minutes
 
+#: 멈춘 스트림 판정의 기본 여유(초). 한 인터벌에 이만큼 더 기다려도 마감 캔들이 없으면 멈춘
+#: 것으로 본다. python-binance의 내부 재연결(최대 5회, 백오프)이 끝날 시간을 준다.
+DEFAULT_STALL_GRACE_S = 60.0
+
 
 class LiveCandleProducer(CandleProducer):
     """바이낸스 kline 웹소켓에서 마감 캔들을 내주는 비동기 소스.
 
     :param socket_manager: 이미 만들어진 ``BinanceSocketManager``.
     :param on_error: 치명적이지 않은 오류(에러 프레임, 파싱 실패)를 흘려보낼 곳.
+    :param stall_timeout_s: 어떤 심볼이든 마지막 마감 캔들(첫 캔들이면 수신 시작) 뒤로 이만큼
+        마감 캔들이 없으면 스트림을 치명적으로 끊는다. None이면 한 인터벌 +
+        :data:`DEFAULT_STALL_GRACE_S`.
     """
 
     def __init__(self, socket_manager, symbols: List[str], interval: str,
-                 on_error: Callable[[Exception], Awaitable[None]]):
+                 on_error: Callable[[Exception], Awaitable[None]],
+                 stall_timeout_s: Optional[float] = None):
         self.logger = logging.getLogger(__name__)
         self._socket_manager = socket_manager
         self.symbols = [s.upper() for s in symbols]
@@ -39,6 +55,11 @@ class LiveCandleProducer(CandleProducer):
         # 라이브의 간격 출처는 config다 — 첫 캔들 전에 경계 정규화에 이미 필요하다.
         super().__init__(interval_to_minutes(interval) * 60_000)
         self._on_error = on_error
+        self.stall_timeout_s = (stall_timeout_s if stall_timeout_s is not None
+                                else self.interval_ms / 1000 + DEFAULT_STALL_GRACE_S)
+        #: 심볼별 마지막 마감 캔들 수신 시각 (``time.monotonic``). 벽시계가 아니라서 로컬
+        #: 시계 보정·밀림에 흔들리지 않는다. :meth:`__aiter__`가 수신을 시작할 때 채운다.
+        self._last_close_at: Dict[str, float] = {}
         self.socket: Optional[ReliableWebsocket] = None
         self._running = False
 
@@ -57,7 +78,7 @@ class LiveCandleProducer(CandleProducer):
             self._socket_manager.futures_multiplex_socket(streams=streams))
         # noinspection PyProtectedMember
         self.logger.info(f"connecting to kline: {self.socket._url}{self.socket._path} "
-                         f"({self.socket.id()})")
+                         f"({self.socket.id()}, stall_timeout={self.stall_timeout_s:g}s)")
         await self.socket.connect()
         self._running = True
 
@@ -74,10 +95,21 @@ class LiveCandleProducer(CandleProducer):
     # ------------------------------------------------------------- 캔들 공급
 
     async def __aiter__(self) -> AsyncIterator[Event]:
-        """마감 캔들을 이벤트로 내준다. 스트림이 끝나면(정상/치명적) 반복이 끝난다."""
+        """마감 캔들을 이벤트로 내준다. 스트림이 끝나면(정상/치명적/멈춤) 반복이 끝난다."""
+        # 감시는 수신을 시작하는 순간부터다 — 첫 마감 캔들도 기한 안에 와야 한다.
+        started = time.monotonic()
+        self._last_close_at = {symbol: started for symbol in self.symbols}
         while self._running:
+            # 가장 오래 조용한 심볼의 기한까지만 기다린다. 다른 심볼의 메시지가 계속 와서
+            # recv가 매번 돌아와도, 매 바퀴 여기서 기한을 다시 보므로 한 심볼의 멈춤도 잡힌다.
+            wait = min(self._last_close_at.values()) + self.stall_timeout_s - time.monotonic()
+            if wait <= 0:
+                self._fatal(self._stall_reason())
+                break
             try:
-                data = await self.socket.recv()
+                data = await asyncio.wait_for(self.socket.recv(), timeout=wait)
+            except asyncio.TimeoutError:
+                continue
             except Exception as e:
                 if not self._running:
                     break
@@ -88,7 +120,13 @@ class LiveCandleProducer(CandleProducer):
 
             try:
                 async for event in self._events_from(data):
+                    yielded_at = time.monotonic()
                     yield event
+                    # 소비자(엔진)가 이 이벤트를 처리하는 동안은 소켓을 읽지 않는다. 백필 REST로
+                    # 수십 초가 걸려도 스트림이 멈춘 게 아니므로, 그 시간만큼 모든 기한을 민다.
+                    paused = time.monotonic() - yielded_at
+                    for symbol in self._last_close_at:
+                        self._last_close_at[symbol] += paused
                     if not self._running:
                         return
             except Exception as e:
@@ -124,6 +162,7 @@ class LiveCandleProducer(CandleProducer):
             start_time=start_time,
             end_time=start_time + self.interval_ms,
         )
+        self._last_close_at[symbol] = time.monotonic()
         yield Event(candle.end_time, {symbol: candle})
 
     # ------------------------------------------------------------- 내부
@@ -140,6 +179,13 @@ class LiveCandleProducer(CandleProducer):
         message = data.get("m") or data.get("type") or str(data)
         await self._on_error(RuntimeError(f"kline stream error: {message}"))
         return True
+
+    def _stall_reason(self) -> str:
+        now = time.monotonic()
+        stalled = sorted(s for s, t in self._last_close_at.items()
+                         if now - t >= self.stall_timeout_s)
+        return (f"마감 캔들이 {self.stall_timeout_s:g}초 넘게 오지 않는다 (symbols={stalled}) "
+                f"— 스트림이 멈췄다고 보고 재기동으로 복구한다")
 
     def _fatal(self, reason: str) -> None:
         self.fatal_reason = reason
