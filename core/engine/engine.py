@@ -35,15 +35,18 @@
 """
 
 import asyncio
+import copy
 import logging
+import time
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, Dict, List, NoReturn, Optional
+from typing import Awaitable, Callable, Dict, List, NoReturn, Optional, Tuple
 
 from core.account.report import Report
 from core.candle.candle import Candle
 from core.history.base import CandleHistory
 from core.producer.base import CandleProducer, Event
 from core.executor.base import Executor
+from core.order.action import Action, ActionType
 from core.recorder.base import NullRecorder, Recorder
 from core.streamer import BaseStreamer
 from core.utils import generate_dict_string, ms_timestamp_to_datetime
@@ -67,6 +70,16 @@ class TradingEngine:
     :param max_backfill_candles: 한 번에 백필할 캔들 수 상한. 넘으면 스트림을 치명적으로
         끊는다 — 프로세스가 오래 죽어 있었다는 뜻이고, 재기동이 지표를 프리피드로 다시
         세우고 포지션은 거래소에서 다시 읽는다.
+    :param decide_deadline_ms: 결정 기한. 봉 경계(``event.time``)에서 이만큼 넘게 지나서야
+        처리하게 된 봉은 **늦은 봉**으로 보고, 결정은 받되 포지션을 늘리는 시장가를 버린다
+        (:meth:`process_event`의 ``late``). 시장가는 결정 봉의 종가에 체결된다고 가정하는데,
+        늦게 낸 주문은 그 가정 밖의 가격에 체결되기 때문이다. None이면 끈다 — 백테스트는
+        늦을 수가 없고, 드라이런은 늦어도 종가로 체결하므로 켜면 백테스트와 갈라지기만 한다.
+        기한은 소비자가 봉을 **처리하는 시점**에 잰다: 네트워크 지연뿐 아니라 다른 심볼의
+        구멍 백필이 소비자를 붙잡은 동안 큐에서 기다린 시간까지 들어가야 하기 때문이다.
+    :param clock: 결정 기한을 잴 "지금"(ms epoch)을 돌려주는 함수. 봉 경계가 거래소 시각이라
+        이것도 거래소 기준이어야 한다 — 로컬 시계가 몇 초만 어긋나도 기한 판정이 통째로
+        틀린다. None이면 로컬 시계. 기한이 None이면 부르지 않는다.
 
     **생성자가 ``executor.on_trade``를 레코더로 덮어쓴다.** 체결 싱크를 잇는 이 한 줄은
     예전에 백테스트/드라이런/라이브 진입점 세 곳에 각각 있었다 — 배선을 한 곳으로 모으는 것이
@@ -78,7 +91,9 @@ class TradingEngine:
                  recorder: Optional[Recorder] = None, *,
                  on_error: Optional[Callable[[Exception], Awaitable[None]]] = None,
                  history: Optional[CandleHistory] = None,
-                 max_backfill_candles: int = 60):
+                 max_backfill_candles: int = 60,
+                 decide_deadline_ms: Optional[int] = None,
+                 clock: Optional[Callable[[], int]] = None):
         self.streamer = streamer
         self.producer = producer
         self.executor = executor
@@ -86,6 +101,8 @@ class TradingEngine:
         self.on_error = on_error
         self.history = history
         self.max_backfill_candles = max_backfill_candles
+        self.decide_deadline_ms = decide_deadline_ms
+        self._clock = clock if clock is not None else (lambda: round(time.time() * 1000))
         self.logger = logging.getLogger(__name__)
 
         #: 심볼별로 마지막으로 지표에 먹인 캔들의 ``start_time`` — 연속성 앵커.
@@ -95,7 +112,7 @@ class TradingEngine:
 
         self.executor.on_trade = self.recorder.record_trade
 
-    def process_event(self, event: Event, *, decide: bool = True) -> None:
+    def process_event(self, event: Event, *, decide: bool = True, late: bool = False) -> None:
         """이벤트 하나를 처리한다.
 
         단계 순서가 이 클래스의 존재 이유다. 특히 미체결 주문 매칭이 ``decide_action`` **앞에**
@@ -109,6 +126,13 @@ class TradingEngine:
         이벤트 경계 훅까지만 도달하고 ``streamer``의 결정에는 아예 닿지 않는다. 무엇이 지나간
         봉인지는 :meth:`run_async`가 심볼별 연속성 앵커(``_last_start``)로 직접 판정해서 이
         파라미터로 넘긴다 — ``Event`` 자체는 그 구분을 모른다.
+
+        **``late``가 True면 결정은 받되 포지션을 늘리는 시장가를 버린다.** 결정 기한
+        (``decide_deadline_ms``)을 넘겨 처리하게 된 봉이다. 시장가는 결정 봉의 종가에 체결된다는
+        가정 위에 있는데, 늦게 낸 주문은 그 뒤의 가격에 체결된다. 그렇다고 결정을 통째로 버리면
+        청산 신호까지 사라진다 — 다음 봉에서 조건이 풀리면 그 청산은 영영 나가지 않는다. 그래서
+        포지션을 줄이는 시장가는 늦어도 내고(반전은 청산분까지만), 지정가·조건부·취소는 체결가가
+        종가와 무관하므로 그대로 둔다 (:meth:`_drop_exposure_increase`).
 
         **엔진은 파산을 모르고, 파산해도 루프는 안 멈춘다.** 시가평가 자본이 0 이하로
         떨어졌을 때의 강제청산은 ``begin_event`` 안(백테스트/드라이런 한정)에서 끝난다 —
@@ -143,6 +167,12 @@ class TradingEngine:
                 indicator.update(candle, st)
 
         actions = list(self.streamer.decide_action(candles, st)) if decide else []
+        if late and actions:
+            actions, dropped = self._drop_exposure_increase(actions, st)
+            if dropped:
+                self.logger.warning("늦은 봉이라 포지션을 늘리는 시장가를 버리거나 청산분으로 줄였다 "
+                                    "(time=%s): %s -> 낸 것 %s",
+                                    ms_timestamp_to_datetime(event.time), dropped, actions)
 
         # 이벤트당 DEBUG 한 줄. isEnabledFor로 감싸는 게 핵심이다 — generate_dict_string은
         # 전 지표를 순회하며 get_latest()를 부르는데, 인자로 넘기면 DEBUG가 꺼져 있어도
@@ -310,6 +340,9 @@ class TradingEngine:
         ``history`` 조회가 없는 런(백테스트)은 구멍 판정을 건너뛴다 — ragged 시계열의 빈
         구간은 유실이 아니라 데이터 그대로다.
 
+        **결정 기한도 여기서 잰다** (:meth:`_is_late`). 백필을 마친 **뒤**, ``process_event``
+        직전이다 — 백필 REST를 기다린 시간도 그 봉의 지연이다.
+
         ``recorder.close()``를 ``finally``가 아니라 루프 **뒤**에 두는 것은 의도적이다: 실행이
         예외로 끝났다면 반쪽짜리 산출물을 남기지 않는다.
 
@@ -333,7 +366,7 @@ class TradingEngine:
                 # 앵커를 남겨, 이미 지표에 들어간 이 봉을 다음 캔들의 백필이 한 번 더 먹인다.
                 for symbol, candle in event.candles.items():
                     self._last_start[symbol] = candle.start_time
-                self.process_event(event, decide=True)
+                self.process_event(event, decide=True, late=self._is_late(event))
             except _SkipEvent:
                 continue
             except _TerminalStream:
@@ -416,6 +449,53 @@ class TradingEngine:
         for c in candles:
             self._last_start[symbol] = c.start_time  # run_async와 같은 이유로 처리 전에 옮긴다
             self.process_event(Event(c.end_time, {symbol: c}), decide=False)
+
+    def _is_late(self, event: Event) -> bool:
+        """이 봉을 결정 기한을 넘겨 처리하게 됐는가. 기한이 없으면 항상 False."""
+        if self.decide_deadline_ms is None:
+            return False
+        delay = self._clock() - event.time
+        if delay <= self.decide_deadline_ms:
+            return False
+        self.logger.warning("결정 기한을 넘긴 봉 (symbols=%s, 봉 마감 %s 뒤 %dms > 기한 %dms) "
+                            "— 포지션을 늘리는 시장가는 내지 않는다",
+                            list(event.candles), ms_timestamp_to_datetime(event.time), delay,
+                            self.decide_deadline_ms)
+        return True
+
+    @staticmethod
+    def _drop_exposure_increase(actions: List[Action], st) -> Tuple[List[Action], List[Action]]:
+        """늦은 봉의 액션에서 포지션을 늘리는 시장가를 걷어낸다. ``(낼 것, 버리거나 줄인 원본)``.
+
+        - 지정가·조건부·취소는 그대로 낸다. 체결가가 결정 봉의 종가와 무관하다.
+        - 시장가는 심볼별 포지션(같은 이벤트의 앞선 액션까지 반영)과 부호를 비교한다. flat이거나
+          같은 방향이면 버린다. 반대 방향이면 내되, 포지션을 넘어서는 반전분은 잘라 청산까지만
+          낸다.
+
+        포지션은 결정이 본 것과 같은 거래 전 ``status``에서 읽는다. 라이브에서는 아직 체결 통지가
+        오지 않은 앞선 주문이 반영되지 않았을 수 있다 — 그 한계는 결정 자체와 같다.
+        """
+        kept: List[Action] = []
+        dropped: List[Action] = []
+        positions: Dict[str, float] = {}
+        for action in actions:
+            if action.order_type is not ActionType.MARKET or action.quantity == 0:
+                kept.append(action)
+                continue
+            pos = positions.get(action.symbol)
+            if pos is None:
+                state = st.positions.get(action.symbol)
+                pos = state.position if state is not None else 0.0
+            if pos == 0 or (action.quantity > 0) == (pos > 0):
+                dropped.append(action)
+                continue
+            if abs(action.quantity) > abs(pos):
+                dropped.append(action)
+                action = copy.copy(action)
+                action.quantity = -pos
+            kept.append(action)
+            positions[action.symbol] = pos + action.quantity
+        return kept, dropped
 
     def _fatal(self, reason: str) -> NoReturn:
         """스트림을 치명적으로 끊는다: 공급자에 사유를 남기고 정지 요청한 뒤 루프를 깬다."""

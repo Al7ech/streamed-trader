@@ -23,6 +23,7 @@
 import asyncio
 import math
 import sys
+import time
 from concurrent.futures import Future
 from datetime import datetime, timezone
 from typing import Dict, List
@@ -335,13 +336,29 @@ class _DecideSpy(BaseStreamer):
 
 
 class _EventSpy(NullRecorder):
-    """``process_event``에 들어온 모든 이벤트(decide 여부 무관)의 시각을 기록한다."""
+    """``process_event``에 들어온 모든 이벤트(decide 여부 무관)의 시각과 체결을 기록한다."""
 
     def __init__(self):
         self.times = []
+        self.trades = []
 
     def record_event(self, event_time, candles):
         self.times.append(event_time)
+
+    def record_trade(self, trade):
+        self.trades.append(trade)
+
+
+class _ScriptedStreamer(_DecideSpy):
+    """봉(``start_time``)마다 정해 둔 액션을 낸다. 결정에 닿은 봉도 기록한다."""
+
+    def __init__(self, script):
+        super().__init__()
+        self.script = script
+
+    def decide_action(self, candles, status):
+        super().decide_action(candles, status)
+        return list(self.script.get(candles[SYM].start_time, []))
 
 
 class _FeedSpy(BaseIndicator):
@@ -376,7 +393,7 @@ class _FailingDecideSpy(_DecideSpy):
 
 
 def make_engine(messages, *, history=None, max_backfill_candles=60, anchor=None,
-                streamer=None, recover=False):
+                streamer=None, recover=False, decide_deadline_ms=None, clock=None):
     """``recover``면 엔진에도 ``on_error``를 넘긴다 — 처리 중 예외가 루프를 끝내지 않는
     라이브 경로. 기본은 넘기지 않아 예상 못 한 예외가 검사를 그대로 깨뜨린다."""
     errors = []
@@ -392,7 +409,8 @@ def make_engine(messages, *, history=None, max_backfill_candles=60, anchor=None,
     engine = TradingEngine(spy, p, SimulatedExecutor(INIT_MARGIN), rec,
                            on_error=on_error if recover else None,
                            history=history if history is not None else SyntheticHistory(),
-                           max_backfill_candles=max_backfill_candles)
+                           max_backfill_candles=max_backfill_candles,
+                           decide_deadline_ms=decide_deadline_ms, clock=clock)
     if anchor:
         engine._last_start.update(anchor)
     return engine, p, spy, rec, errors
@@ -565,6 +583,51 @@ async def check_candle_producer():
           feed.fed == [T0 + i * MIN for i in range(5)] and spy.decided == [T0, T0 + 4 * MIN]
           and len(errs) == 1,
           f"fed={feed.fed} decided={spy.decided} errs={errs}")
+
+    # --- 결정 기한 ---
+    # 시장가는 결정 봉의 종가에 체결된다는 가정 위에 있다. 기한을 넘겨 처리한 봉에서 포지션을
+    # 늘리는 시장가가 나가면 그 가정 밖의 가격에 진입한다. 반대로 결정을 통째로 버리면 청산
+    # 신호까지 사라지므로, 줄이는 시장가와 지정가·조건부·취소는 그대로 나가야 한다.
+    # 시계는 이벤트마다 한 번 읽힌다 — 봉마다 "마감 뒤 몇 ms에 처리했는가"를 순서대로 준다.
+    delays = iter([100, 5_000, 5_000, 100])
+    clock_at = {"i": 0}
+
+    def clock():
+        clock_at["i"] += 1
+        return T0 + clock_at["i"] * MIN + next(delays)
+
+    script = {
+        T0: [Action(SYM, 2.0)],                                   # 제때: 롱 2 진입
+        T0 + MIN: [Action(SYM, 1.0),                              # 늦음: 늘리는 쪽 → 버림
+                   Action(SYM, -3.0),                             # 늦음: 반전 → 청산분(-2)만
+                   Action(SYM, 1.0, order_type=ActionType.LIMIT, price=50.0)],  # 지정가는 낸다
+        T0 + 2 * MIN: [Action(SYM, -1.0)],                        # 늦음 + flat: 새 숏 → 버림
+        T0 + 3 * MIN: [Action(SYM, -1.0)],                        # 제때: 숏 1 진입
+    }
+    engine, p, spy, rec, errs = make_engine(
+        [kline_msg(T0 + i * MIN) for i in range(4)], anchor={SYM: T0 - MIN},
+        streamer=_ScriptedStreamer(script), decide_deadline_ms=3_000, clock=clock)
+    await engine.run_async()
+    qty = [t.quantity for t in rec.trades]
+    check("engine: 늦은 봉에서도 결정은 받는다",
+          spy.decided == [T0 + i * MIN for i in range(4)], f"decided={spy.decided}")
+    check("engine: 늦은 봉은 포지션을 늘리는 시장가를 버리고 반전은 청산분까지만 낸다",
+          qty == [2.0, -2.0, -1.0], f"trades={qty}")
+    check("engine: 늦은 봉의 지정가는 그대로 낸다",
+          len(engine.executor.status.open_orders_for(SYM)) == 1,
+          f"open_orders={engine.executor.status.open_orders_for(SYM)}")
+
+    # 기한이 없으면(백테스트/드라이런) 시계를 보지도 않고 전부 낸다.
+    def no_clock():
+        raise AssertionError("기한이 없는데 시계를 읽었다")
+
+    engine, p, spy, rec, errs = make_engine(
+        [kline_msg(T0 + i * MIN) for i in range(4)], anchor={SYM: T0 - MIN},
+        streamer=_ScriptedStreamer(script), clock=no_clock)
+    await engine.run_async()
+    check("engine: 결정 기한이 없으면 늦음을 따지지 않는다",
+          [t.quantity for t in rec.trades] == [2.0, 1.0, -3.0, -1.0, -1.0],
+          f"trades={[t.quantity for t in rec.trades]}")
 
 
 async def check_warmup():
@@ -981,10 +1044,35 @@ async def check_dry_run_parity():
               f"trades={len(bt.trades)} final={bt.status.total_margin():.2f}")
 
 
+async def check_server_clock():
+    """결정 기한을 재는 서버 시계 — 로컬 벽시계가 아니라 서버 시각에 경과를 더한다."""
+    from core.trader.server_clock import ServerClock
+
+    class _TimeClient:
+        def __init__(self, server_ms):
+            self.server_ms = server_ms
+
+        async def futures_time(self):
+            return {"serverTime": self.server_ms}
+
+    # 로컬 시계가 한 시간 어긋난 서버라도 서버 쪽 시각을 따라야 한다.
+    server_ms = round(time.time() * 1000) - 3_600_000
+    clk = ServerClock(_TimeClient(server_ms))
+    unsynced = clk.now_ms()
+    got = await clk.sync()
+    await asyncio.sleep(0.05)
+    now = clk.now_ms()
+    check("server clock: 동기 전에는 로컬 시계", abs(unsynced - time.time() * 1000) < 1_000)
+    check("server clock: sync는 서버 시각을 돌려준다", got == server_ms)
+    check("server clock: 이후 시각은 서버 기준 + 경과", 40 <= now - server_ms < 1_000,
+          f"{now - server_ms}ms")
+
+
 async def main():
     # 판정 결과를 print로 읽는 게 본론이라 기본 레벨을 WARNING으로 둔다.
     setup_logging(default="WARNING")
     await check_candle_producer()
+    await check_server_clock()
     await check_warmup()
     await check_live_executor()
     if "--offline" not in sys.argv:

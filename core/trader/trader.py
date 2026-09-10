@@ -18,7 +18,6 @@
 import asyncio
 import copy
 import logging
-import time
 from datetime import datetime
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
@@ -35,13 +34,17 @@ from core.executor.live import LiveExecutor, resolve_margin_asset
 from core.recorder.live import DEFAULT_SHARD_FLUSH_EVERY, LiveRecorder, default_run_id
 from core.producer.reliable_websocket import ReliableWebsocket
 from core.streamer.base_streamer import BaseStreamer
+from core.trader.server_clock import ServerClock
 from core.utils import interval_to_minutes, ms_timestamp_to_datetime
 
 #: 드라이런의 합성 초기 증거금. 실제 지갑이 없으므로 고정값에서 시작한다.
 DRY_RUN_MARGIN = 1e6
 
-#: 로컬 시계와 거래소 서버 시각의 어긋남이 이보다 크면 기동 시 경고한다.
-CLOCK_SKEW_WARN_MS = 1000
+#: 라이브 결정 기한의 기본값(초). 봉 경계 뒤 이보다 늦게 처리한 봉에서는 포지션을 늘리는
+#: 시장가를 내지 않는다 (:class:`~core.engine.engine.TradingEngine`의 ``decide_deadline_ms``).
+#: 실측한 정상 도착은 경계 뒤 0.2초 안이다 — 3초면 정상 봉은 걸리지 않고, 기록 flush 같은
+#: 이벤트 루프의 짧은 정체도 흡수한다.
+DEFAULT_DECIDE_DEADLINE_S = 3.0
 
 
 class BinanceTrader:
@@ -60,7 +63,8 @@ class BinanceTrader:
                  result_path: str = "asset/",
                  run_id: Optional[str] = None,
                  run_metadata: Optional[Dict] = None,
-                 shard_flush_every: int = DEFAULT_SHARD_FLUSH_EVERY):
+                 shard_flush_every: int = DEFAULT_SHARD_FLUSH_EVERY,
+                 decide_deadline_s: Optional[float] = DEFAULT_DECIDE_DEADLINE_S):
         """
         :param streamer: 매매 결정을 내리는 스트리머. 다루는 심볼은 ``streamer.symbols``에서
             가져오므로 별도 인자가 없다 — 트레이더가 스트리머와 무엇을 거래하는지에 대해
@@ -76,6 +80,10 @@ class BinanceTrader:
             재기동해도 같은 런에 이어쓴다.
         :param run_metadata: 런 JSON metadata에 실을 추가 정보 (예: ``{"params": {...}}``).
         :param shard_flush_every: 월별 시계열 샤드를 다시 쓰는 주기(캔들 수).
+        :param decide_deadline_s: 라이브 결정 기한(초). 봉 경계 뒤 이보다 늦게 처리한 봉에서는
+            포지션을 늘리는 시장가를 버린다 (줄이는 쪽과 지정가·조건부·취소는 낸다). None이나
+            0 이하면 끈다. **드라이런에는 적용하지 않는다** — 드라이런은 늦어도 종가로 체결하므로
+            가격이 틀어지지 않고, 켜면 늦은 봉마다 백테스트와 결과가 갈라지기만 한다.
         """
         self.logger = logging.getLogger(__name__)
 
@@ -123,6 +131,13 @@ class BinanceTrader:
         self.shard_flush_every = shard_flush_every
         self.recorder: Optional[LiveRecorder] = None
 
+        self.decide_deadline_s: Optional[float] = (
+            decide_deadline_s if decide_deadline_s is not None and decide_deadline_s > 0
+            else None)
+        #: 거래소 서버 시각. 워밍업 구간의 끝과 결정 기한이 이걸로 잰다. ``start()``에서
+        #: 클라이언트와 함께 만들어진다.
+        self.clock: Optional[ServerClock] = None
+
         self.on_error_callbacks: List[Callable[[Exception], Coroutine[None, None, None]]] = [
             self._on_error]
 
@@ -145,6 +160,7 @@ class BinanceTrader:
 
             # 1. 소켓 매니저. 캔들 공급자와 유저 데이터 소켓이 이걸 참조하므로 먼저 만든다.
             self.socket_manager = BinanceSocketManager(self.client)
+            self.clock = ServerClock(self.client)
             self.producer = LiveCandleProducer(self.socket_manager, self.symbols,
                                                self.interval, self._handle_error)
 
@@ -182,10 +198,15 @@ class BinanceTrader:
             # 경계로 받아 월말 기동이 그 달 전체를 끌어온다. fetcher 생성자가 동기 ping을
             # 치므로 스레드로 뺀다.
             fetcher = await asyncio.to_thread(BinanceCandleFetcher)
+            # 결정 기한은 라이브에만 건다 (생성자 docstring 참고). 기한은 거래소 시각으로 재야
+            # 봉 경계와 같은 시계다.
+            deadline_ms = (round(self.decide_deadline_s * 1000)
+                           if self.decide_deadline_s is not None and not self.dry_run else None)
             self.engine = TradingEngine(
                 self.streamer, self.producer, self.executor, self.recorder,
                 on_error=self._handle_error,
-                history=FetcherCandleHistory(fetcher, self.interval))
+                history=FetcherCandleHistory(fetcher, self.interval),
+                decide_deadline_ms=deadline_ms, clock=self.clock.now_ms)
 
             # 4. 지표 워밍업. 소켓을 열기 **전에** 한다 — 수십 초가 걸릴 수 있는데 그동안
             #    유저 데이터 스트림을 읽지 않으면 python-binance의 큐가 넘쳐 죽는다.
@@ -202,16 +223,22 @@ class BinanceTrader:
                 await self._connect_user_websocket()
             await self.producer.connect()
             self._spawn(self._run_engine())
+            # 결정 기한을 재는 서버 시계는 monotonic으로 이어 재므로 주기적으로 다시 맞춘다
+            # (호스트 절전 동안 monotonic이 멈추면 늦은 봉이 늦지 않은 것으로 보인다).
+            if deadline_ms is not None:
+                self._spawn(self.clock.resync_forever())
 
             # 이 프로세스가 무엇인지 한 줄로 남긴다. 특히 **dry_run**은 여기 말고는 어디에도
             # 기록되지 않는다 — 체결이 나면 "[dry-run]" 접두사로 알 수 있지만, 전략이 며칠간
             # 매매를 안 하면 로그만 보고 실제 돈이 걸려 있는지 판단할 방법이 없었다.
             self.logger.info(
                 "BinanceTrader started: mode=%s symbols=%s interval=%s testnet=%s "
-                "streamer=%s fee_ratio=%s slippage_ratio=%s open_orders=%d record=%s run_id=%s",
+                "streamer=%s fee_ratio=%s slippage_ratio=%s decide_deadline=%s open_orders=%d "
+                "record=%s run_id=%s",
                 "DRY-RUN" if self.dry_run else "LIVE", self.symbols, self.interval,
                 self.testnet, type(self.streamer).__name__, self.status.fee_ratio,
-                self.slippage_ratio, self.status.total_open_orders(),
+                self.slippage_ratio, f"{deadline_ms}ms" if deadline_ms is not None else "off",
+                self.status.total_open_orders(),
                 bool(self.recorder), self.recorder.run_id if self.recorder else None)
 
         except Exception as e:
@@ -269,15 +296,10 @@ class BinanceTrader:
 
         로컬 시계를 쓰면, 시계가 거래소보다 몇 초만 앞서 있어도 경계 직후 기동에서 아직 진행
         중인 봉이 워밍업 구간에 들어와 마감봉처럼 지표에 먹히고, 그 봉의 진짜 마감 메시지는
-        중복으로 버려진다 (WSL2처럼 절전 뒤 시계가 밀리는 환경에서 실제로 난다). 어긋남이
-        크면 경고로 남긴다 — 왕복 지연의 절반이 섞이므로 작은 값은 의미가 없다.
+        중복으로 버려진다 (WSL2처럼 절전 뒤 시계가 밀리는 환경에서 실제로 난다). 이 조회가
+        결정 기한을 재는 :class:`ServerClock`의 첫 기준점도 된다 — 어긋남 경고도 거기서 한다.
         """
-        server_ms = int((await self.client.futures_time())["serverTime"])
-        skew_ms = round(time.time() * 1000) - server_ms
-        if abs(skew_ms) > CLOCK_SKEW_WARN_MS:
-            self.logger.warning("로컬 시계가 거래소 서버와 %+dms 어긋나 있다 — 워밍업 구간은 "
-                                "서버 시각 기준으로 정한다", skew_ms)
-        return ms_timestamp_to_datetime(server_ms)
+        return ms_timestamp_to_datetime(await self.clock.sync())
 
     def _spawn(self, coro) -> asyncio.Task:
         """리스너 태스크를 만들고 강한 참조를 유지한다 (GC 방지)."""

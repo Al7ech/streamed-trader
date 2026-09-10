@@ -41,6 +41,20 @@ its meaning — messages are routed straight to `executor.on_user_data(...)`.
   Warm-up happens before any socket opens because it can take tens of seconds, and an
   unread user-data stream overflows python-binance's queue.
 - `start()` re-raises on failure — a trader that could not start must not look like one that did.
+- **Decision deadline (live only).** The engine is built with `decide_deadline_ms` from
+  `decide_deadline_s` (default `DEFAULT_DECIDE_DEADLINE_S`, 3s) and the trader's `ServerClock`.
+  A candle processed later than that after its close still reaches the strategy, but market orders
+  that would open or grow a position are dropped, because the backtest models a market order as
+  filling at the decision candle's close. Reducing market orders, resting orders and cancels still
+  go out. Dry run never gets a deadline: it fills at the close regardless, so a deadline would only
+  make it diverge from a backtest.
+
+### `server_clock.py`
+
+`ServerClock` estimates the exchange's clock: one `futures_time()` sample, advanced by
+`time.monotonic()`, resynced every 5 minutes by a task the trader spawns when the deadline is on.
+The warm-up end (`_server_now`) syncs it, and the decision deadline reads `now_ms()` per candle.
+It warns once when the local wall clock is more than `CLOCK_SKEW_WARN_MS` off the server.
 
 ### `candle_producer.py`
 
@@ -159,6 +173,7 @@ reconnect count.
 | Recorded trades | local fill at `executor.last_close[action.symbol]` | real exchange fill (`ap` / `z` / `rp` / `n`) |
 | Forced liquidation | simulated when equity ≤ 0 | the exchange's |
 | Recorded run id | `dry_<Streamer>_<SYM1-SYM2-...>_<INTERVAL>` | `live_<Streamer>_<SYM1-SYM2-...>_<INTERVAL>` |
+| Decision deadline | off | `decide_deadline_s`; late candles drop exposure-increasing market orders |
 
 ## Usage
 
@@ -214,7 +229,8 @@ rate; default `DEFAULT_FEE_RATIO` — live ignores it and uses the exchange's ta
 `slippage_ratio` (dry-run STOP_MARKET slippage; default `0.0`),
 `record` (default `False`), `result_path` (`"asset/"`), `run_id` (default: derived and stable
 across restarts), `run_metadata` (extra keys for the run JSON, e.g. `{"params": {...}}`),
-`shard_flush_every` (`60`).
+`shard_flush_every` (`60`), `decide_deadline_s` (live-only decision deadline in seconds,
+default `3.0`; `None` or `<= 0` disables it).
 
 **`BinanceOrderClient`** — `api_key`, `api_secret`, `testnet` (default `True`),
 `max_workers` (`4`), `max_retries` (`2`), `base_retry_delay` (`0.1` s).

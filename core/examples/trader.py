@@ -11,7 +11,7 @@ import os
 
 from dotenv import load_dotenv
 
-from core.trader.trader import BinanceTrader
+from core.trader.trader import DEFAULT_DECIDE_DEADLINE_S, BinanceTrader
 from core.logging_config import setup_logging
 from core.streamer.strategies.keltner_streamer import KeltnerStreamer
 
@@ -49,6 +49,11 @@ async def main():
     RUN_ID = os.getenv("LIVE_RUN_ID") or None
     SHARD_FLUSH_EVERY = int(os.getenv("LIVE_SHARD_FLUSH_EVERY", 60))
 
+    # Live-only decision deadline (seconds after the candle close). A candle processed later
+    # than this still reaches the strategy, but market orders that would grow a position are
+    # dropped. 0 disables it. Dry run ignores it.
+    DECIDE_DEADLINE_S = float(os.getenv("DECIDE_DEADLINE_S", DEFAULT_DECIDE_DEADLINE_S))
+
     # Initialize the strategy. Swap KeltnerStreamer for any other BaseStreamer here — the
     # trader only needs `decide_action` and the `indicators` dict to prefeed.
     # `params` is built once and handed to both the streamer and the run metadata, so the
@@ -75,6 +80,7 @@ async def main():
         run_id=RUN_ID,
         run_metadata={"params": params},
         shard_flush_every=SHARD_FLUSH_EVERY,
+        decide_deadline_s=DECIDE_DEADLINE_S,
     )
 
     try:

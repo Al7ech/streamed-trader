@@ -24,7 +24,8 @@ There is no automated test suite (no `pytest`/`unittest` files in `core/`, only 
 - `core/checks/live_check.py` — covers the live path (it needs a socket and an exchange, so it fakes
   both) and asserts the engine's continuity/backfill rules over a faked live producer (duplicate
   skip, gap backfill via the `history` query, cap/boundary/fetch fatals, no re-feed of a candle whose
-  processing raised), the indicator warm-up
+  processing raised, the decision deadline dropping only exposure-increasing market orders on a late
+  candle), the indicator warm-up
   handoff (`warmup()` derives its own range, seeds the engine's `_last_start` anchor, and the gap
   between the warm-up range and the first live candle is backfilled from that **same** source, and a
   warm-up with a hole or an out-of-range/still-open candle fails startup), the
@@ -57,7 +58,8 @@ uv run streamed-trader                                # live/dry-run trader usin
 `core/examples/backtest.py` and `core/examples/trader.py` are edited directly to change symbol/date
 range/strategy params for one-off runs; `trader.py` also reads config from environment variables
 (see `.env.sample`: `API_KEY`, `API_SECRET`, `TESTNET`, `DRY_RUN`, `SYMBOLS` (comma-separated),
-`INTERVAL`, plus the current strategy's params — `WINDOW`, `M_ENTRY`, `M_EXIT`, `MAX_LOSS` for the
+`INTERVAL`, `DECIDE_DEADLINE_S` (live-only decision deadline, default 3s — see "Decision deadline"
+under "The trading engine"), plus the current strategy's params — `WINDOW`, `M_ENTRY`, `M_EXIT`, `MAX_LOSS` for the
 wired-up `KeltnerStreamer`). `streamed-trader` (a `[project.scripts]` console script defined in
 `pyproject.toml`) is `core.examples.trader:run`, a sync wrapper around `trader.py`'s `async def
 main()`.
@@ -130,7 +132,8 @@ core/
               binance_order_client.py
   recorder/   base.py = Recorder ABC + NullRecorder; backtest.py, live.py
   result/     writer.py (run JSON + shards), metrics.py, indicator_columns.py
-  trader/     BinanceTrader (trader.py) — live/dry-run assembly + lifecycle; README.md here
+  trader/     BinanceTrader (trader.py) — live/dry-run assembly + lifecycle; ServerClock
+              (server_clock.py) — exchange time for warm-up end + decision deadline; README.md here
   checks/     live_check.py, fetch_stock_check.py
   examples/   backtest.py, trader.py
   utils/      timestamp/rounding helpers, logging_config.py alongside
@@ -140,7 +143,7 @@ core/
 utils ← candle ← order ← account
               ← producer/base, executor/base, recorder/base, history/base  (the port ABCs)
               ← streamer ← result
-      engine ← {producer,executor,recorder,history}/base, account, streamer
+      engine ← {producer,executor,recorder,history}/base, account, order, streamer
       {producer,executor,recorder,history} impls ← their own base, account, order, candle,
                                                     fetcher, result
       trader ← engine, producer, executor, recorder, history, account, fetcher, streamer
@@ -330,20 +333,44 @@ implements `__aiter__` and nothing else is required of it — nothing else in th
 know sync from async. (`request_stop()` and a `fatal_reason` field are on the ABC too — the engine
 sets them to end a run on an unrecoverable gap; see "Indicator warm-up" below.)
 
-`process_event(event, *, decide=True)` — the contract every mode goes through. An `Event` is just
+`process_event(event, *, decide=True, late=False)` — the contract every mode goes through. An `Event` is just
 `(time, candles)` and does **not** know whether it is a fresh bar or an already-past one — the
 engine judges that itself from a per-symbol continuity anchor (`_last_start`) and passes `decide`.
 `decide=False` means **this bar already went by** (a gap candle the engine backfilled — see
 "Indicator warm-up") and steps 4b/7 are skipped, so an outdated candle can never reach
-`streamer.decide_action` and can never produce a new order:
+`streamer.decide_action` and can never produce a new order. `late=True` (see "Decision deadline"
+below) still runs step 4b but filters its actions before step 7:
 
 ```
 0-2. executor.begin_event()        # sim: per symbol with a candle — refresh last_close + match resting orders (fills happen here) + tick expiry; then mark every open position (incl. symbols with no candle this event) to its last_close, which also re-marks a just-filled symbol from its fill price back to the bar close; then if status.total_margin() <= 0 -> cancel_all + flatten every open position at last_close and latch _bankrupt. live: drop unmatched market decisions from the last candle (no matching, no bankruptcy check — the exchange fills resting orders and liquidates)
 4. update every symbol's indicators, then (if decide) one streamer.decide_action(candles, status) for the whole event (still called after bankruptcy — the executor just discards the resulting actions)
 6. recorder.record_event()         # the recorder reads status.total_margin() itself for the equity point
-7. per action: executor.submit()   # sim: CANCEL/register/fill in list order, or no-op once _bankrupt is latched; live: fire the order, return. no actions at all when decide is False
+7. per action: executor.submit()   # sim: CANCEL/register/fill in list order, or no-op once _bankrupt is latched; live: fire the order, return. no actions at all when decide is False; when late, only non-exposure-increasing ones
 8. recorder.end_event()
 ```
+
+**Decision deadline (live only).** A MARKET action is modelled as filling at the decision candle's
+close. Live can only honour that if the decision goes out right after the close; a candle processed
+seconds late (network delay, or — the commoner cause — waiting in the producer's queue while the
+consumer backfills another symbol's gap over REST) would fill at a later price the backtest never
+saw. `TradingEngine(..., decide_deadline_ms=..., clock=...)` measures `clock() - event.time` in
+`run_async` **after** any backfill and right before `process_event` (`_is_late`), and past the
+deadline passes `late=True`. The strategy still decides — dropping the decision outright would also
+drop exit signals, and a hand-rolled stop whose condition clears on the next bar would then never
+fire. Instead `_drop_exposure_increase` keeps every non-MARKET action (LIMIT/STOP_MARKET/CANCEL
+price independently of the close) and every MARKET action that reduces the symbol's position
+(tracked across the event's actions; a flip is clamped to the closing part), and drops MARKET
+actions from flat or in the position's direction, logging both the lateness and what it dropped.
+`decide_deadline_ms=None` (the default) disables it and never reads the clock — a backtest cannot
+be late, and `BinanceTrader` passes it **only in live mode**: dry run fills at the close however
+late it decides, so the deadline would only make it diverge from a backtest. The clock must be
+exchange time, since `event.time` is an exchange boundary and a few seconds of local skew would
+invert every verdict (measured: this dev machine's WSL2 clock ran 2.8s behind Binance). Live
+passes `ServerClock.now_ms` (`core/trader/server_clock.py`): one `futures_time()` sample, advanced
+by `time.monotonic()`, resynced every 5 minutes (monotonic can pause across host suspend). Closed
+candles were measured arriving 3-117ms after the boundary, so the 3s default
+(`DEFAULT_DECIDE_DEADLINE_S`, `DECIDE_DEADLINE_S` env var, `0` disables) never trips on a normal
+candle.
 
 Resting-order matching happens inside `begin_event`, ahead of `decide_action`, because on a real
 exchange a resting order fills before the bar closes — put it after and the strategy decides while
@@ -400,7 +427,8 @@ a leading shortfall after a recent listing and a not-yet-served last candle are 
 check and the first live candle's backfill cover those), because silently under-warmed or
 hole-ridden indicators are worse than a failed startup, and records the last fed `start_time` per
 symbol into the engine's own `_last_start` continuity anchor. `end=None` means the **local** clock;
-live passes the exchange's server time instead (`BinanceTrader._server_now`, which also warns past
+live passes the exchange's server time instead (`BinanceTrader._server_now`, which syncs the
+trader's `ServerClock` — the same clock the decision deadline reads — and warns once past
 `CLOCK_SKEW_WARN_MS`), because a local clock running even seconds ahead makes a start just after a
 boundary pull the still-open candle into the range — it would be fed as if closed, anchored, and
 its real close then dropped as a duplicate.
@@ -599,7 +627,9 @@ existing ragged-series contract with no changes needed there.
   `SimulatedExecutor` (or `DEFAULT_FEE_RATIO` when omitted), so position sizes can differ if the
   two rates differ; and BNB-denominated
   commissions (`N` != margin asset) are excluded from `fee` and flagged as
-  `metadata.fee_asset_mismatch`.
+  `metadata.fee_asset_mismatch`; and a candle processed past the decision deadline drops market
+  orders that would grow a position (see "Decision deadline" under "The trading engine"), which a
+  backtest and a dry run never do.
 
 ### Logging (`core/logging_config.py`)
 
@@ -959,6 +989,11 @@ straight to `executor.on_user_data(...)`.
     that bar still fills) but never reach `streamer.decide_action`. An outdated bar must not
     produce a market order that fills at the current price. The cost — an entry signal on a bar
     missed during a disconnect is skipped entirely — is deliberate.
+  - **Late candles do not grow positions (live only).** A candle the consumer gets to more than
+    `decide_deadline_s` (default 3s) after its close still reaches `decide_action`, but the engine
+    drops MARKET actions that would open or add to a position; reducing MARKET actions, resting
+    orders and cancels still go out. The triggering candle after a slow gap backfill is the usual
+    case. See "Decision deadline" under "The trading engine".
 - **`executor/live.py` — orders and account state.** `submit()` fires the order and returns `None`;
   a detached task (`_await_order_result`) awaits the submission result and routes a failure to
   `on_error`. The fill arrives later on the user-data stream, so the pre-trade
@@ -1018,7 +1053,7 @@ straight to `executor.on_user_data(...)`.
   (they loop on that flag), and **re-raises** on failure — a trader that could not start must not
   look like one that did. Listener tasks are kept in `self._tasks` so asyncio can't garbage-collect
   them mid-flight. On success it logs one line naming the whole configuration — mode
-  (LIVE/DRY-RUN), symbols, interval, testnet, streamer, fee ratio, run id. `dry_run` appears
+  (LIVE/DRY-RUN), symbols, interval, testnet, streamer, fee ratio, decision deadline, run id. `dry_run` appears
   nowhere else in the log, so without it a strategy that goes days without trading gives no way to
   tell whether real money is at stake.
 - With `record=True` (the `RECORD` env var, default on) the trader owns a `LiveRecorder` and
