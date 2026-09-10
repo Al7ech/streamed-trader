@@ -251,11 +251,13 @@ class TimedKlineSocket:
 
     def __init__(self, messages, delay=0.0):
         self._messages, self.delay = list(messages), delay
+        self.reads = 0
 
     async def recv(self):
         await asyncio.sleep(self.delay)
         if not self._messages:
             await asyncio.Event().wait()
+        self.reads += 1
         return self._messages.pop(0)
 
     async def close(self):
@@ -453,18 +455,32 @@ async def check_candle_producer():
           0 < len(evs) < 50 and f"symbols=['{SYM}']" in (p.fatal_reason or ""),
           f"evs={len(evs)} fatal={p.fatal_reason}")
 
-    # 소비자(엔진)가 이벤트를 오래 붙잡는 동안(백필 REST 등)은 소켓을 읽지 않은 것이지 스트림이
-    # 멈춘 게 아니다. 그 시간이 기한을 잡아먹으면 느린 백필 한 번이 헛재기동을 부른다.
-    p = make_timed_producer([kline_msg(T0 + i * MIN) for i in range(3)], delay=0.01)
-    got = []
+    # 소비자(엔진)가 이벤트를 오래 붙잡는 동안(백필 REST 등)에도 소켓은 계속 비워져야 한다.
+    # 안 비우면 심볼당 250ms마다 오는 kline 업데이트가 python-binance 큐(100)를 넘겨 read loop가
+    # 죽고, 재연결 사이 또 봉을 놓쳐 백필이 연쇄된다. 그리고 그 시간은 멈춤으로 세지 않는다 —
+    # 느린 백필 한 번이 헛재기동을 부르면 안 된다.
+    p = make_timed_producer([kline_msg(T0 + i * MIN) for i in range(60)], delay=0.01)
+    got, drained = [], 0
     async for ev in p:
         got.append(ev)
         if len(got) == 1:
+            before = p.socket.reads
             await asyncio.sleep(0.3)
-        if len(got) == 3:
+            drained = p.socket.reads - before
+        if len(got) == 5:
             p.request_stop()
+    check("producer: 소비자가 붙잡은 동안에도 소켓을 비운다", drained >= 10,
+          f"붙잡은 0.3초 동안 읽은 메시지 {drained}개")
     check("producer: 소비자가 붙잡은 시간은 멈춤으로 세지 않는다",
-          len(got) == 3 and p.fatal_reason is None, f"got={len(got)} fatal={p.fatal_reason}")
+          len(got) == 5 and p.fatal_reason is None, f"got={len(got)} fatal={p.fatal_reason}")
+
+    # 수신이 실패해도 그 전에 받아 둔 이벤트는 다 내준 뒤에 치명 처리한다 — reader가 앞서
+    # 읽는다고 해서 이미 도착한 마감 캔들을 버리면 안 된다.
+    p, _ = make_producer([kline_msg(T0), kline_msg(T0 + MIN)])
+    evs = await collect(p)
+    check("producer: 수신 실패 전 이벤트는 다 내준 뒤 치명적",
+          len(evs) == 2 and "받지 못했다" in (p.fatal_reason or ""),
+          f"evs={len(evs)} fatal={p.fatal_reason}")
 
     # --- 연속성은 엔진이 판정한다 ---
     engine, p, spy, rec, errs = make_engine(

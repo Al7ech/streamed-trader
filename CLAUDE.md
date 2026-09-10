@@ -896,8 +896,19 @@ straight to `executor.on_user_data(...)`.
   operationally, and only logging the failures made that impossible to read off the log).
   Multiplexed messages arrive wrapped as `{"stream": ..., "data": <rawPayload>}`; since the
   continuousKline payload carries no top-level `s`/`k.s`, the symbol is read from `data["ps"]`.
-  Since one consumer drives this source and fully runs each `process_event` before pulling the next
-  message, *decision* processing across symbols is naturally serialized and needs no extra locking.
+  The socket is drained by a **dedicated reader task** (`_read_socket`), not by the consumer: it
+  parses every message, keeps only closed-candle events and puts them on an internal queue that
+  `__aiter__` serves. Draining in the consumer meant nothing read the socket while the engine held
+  an event — a backfill awaiting REST — and continuousKline's 250ms-per-symbol updates fill
+  python-binance's 100-message queue in 25/N seconds; on overflow the library kills its read loop,
+  the reconnect misses more candles, and backfills cascade. The queue only ever holds closed
+  candles (1/240 of the traffic at `1m`), so it needs no bound. A receive failure only records
+  its reason in the reader; the consumer still yields every event queued before it and goes
+  fatal at the end-of-stream marker, so reading ahead never drops a candle that already arrived.
+  `request_stop()`/`close()` cancel the reader directly, because the engine leaves `async for`
+  on a fatal gap and the generator's `finally` may not run until GC.
+  Since one consumer drives the engine and fully runs each `process_event` before pulling the next
+  event, *decision* processing across symbols is naturally serialized and needs no extra locking.
   Live order submissions are fired to the thread pool and not awaited, so an order result may land
   after later candles; that race, plus the kline-vs-user-data-listener race, is tolerated because
   `status` is exchange truth and the pre-trade `pre_position`/`pre_margin` are read before the order is sent.
@@ -924,8 +935,8 @@ straight to `executor.on_user_data(...)`.
     last closed-candle arrival on `time.monotonic()` (immune to wall-clock steps) and, once any
     symbol goes `stall_timeout_s` (default one interval + `DEFAULT_STALL_GRACE_S`, 60s — room for
     python-binance's own reconnect backoff) without one, sets `fatal_reason` and ends the stream
-    so a restart recovers. Time the consumer spends holding an event (a backfill's REST fetch)
-    is added back to every deadline: the socket was not being read, which is not a stall.
+    so a restart recovers. The arrival times are stamped by the reader task, which keeps reading
+    while the consumer holds an event, so a slow backfill never counts as a stall.
   - **Indicator history is not fetched here, and the trader no longer computes the range.** It
     hands the engine one `FetcherCandleHistory(BinanceCandleFetcher(), interval)` as `history`
     (REST, `use_cache=False`; the synchronous-HTTP-in-a-thread detail lives inside that query) and

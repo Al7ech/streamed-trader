@@ -13,6 +13,13 @@
 그래서 심볼별로 마지막 마감 캔들 이후 ``stall_timeout_s``가 지나면 치명적으로 끊는다.
 재기동이 워밍업으로 지표를 다시 세운다.
 
+**소켓은 전용 reader 태스크가 쉬지 않고 비운다.** 소비자(엔진)가 이벤트를 붙잡고 있는 동안
+— 구멍 백필이 REST를 기다리는 동안 — 소켓을 읽지 않으면, 심볼당 250ms마다 오는 kline
+업데이트가 python-binance 큐(기본 100)를 25/N초 만에 채운다. 넘치면 라이브러리가 read loop를
+죽이고, 재연결하는 사이 또 봉을 놓쳐 백필이 연쇄된다. 그래서 reader가 소켓을 비워 **마감 캔들
+이벤트만** 내부 큐로 넘기고(1m 기준 메시지 수 1/240), 소비자는 그 큐를 읽는다. 멈춤 감시도
+reader가 기록한 실제 도착 시각으로 하므로 소비자가 붙잡은 시간이 멈춤으로 세지지 않는다.
+
 라이브는 심볼을 병합하지 않는다. 각 심볼의 캔들이 도착하는 즉시 **키 하나짜리 이벤트**로
 내주므로, 엔진의 ``streamer.symbols`` 순회에서 나머지 심볼은 캔들이 없어 자연히 걸러진다.
 """
@@ -32,6 +39,9 @@ from core.utils import interval_to_minutes
 #: 멈춘 스트림 판정의 기본 여유(초). 한 인터벌에 이만큼 더 기다려도 마감 캔들이 없으면 멈춘
 #: 것으로 본다. python-binance의 내부 재연결(최대 5회, 백오프)이 끝날 시간을 준다.
 DEFAULT_STALL_GRACE_S = 60.0
+
+#: reader 태스크가 끝났음을 소비자에게 알리는 내부 큐 표지.
+_STREAM_END = object()
 
 
 class LiveCandleProducer(CandleProducer):
@@ -58,10 +68,17 @@ class LiveCandleProducer(CandleProducer):
         self.stall_timeout_s = (stall_timeout_s if stall_timeout_s is not None
                                 else self.interval_ms / 1000 + DEFAULT_STALL_GRACE_S)
         #: 심볼별 마지막 마감 캔들 수신 시각 (``time.monotonic``). 벽시계가 아니라서 로컬
-        #: 시계 보정·밀림에 흔들리지 않는다. :meth:`__aiter__`가 수신을 시작할 때 채운다.
+        #: 시계 보정·밀림에 흔들리지 않는다. :meth:`__aiter__`가 수신을 시작할 때 채우고
+        #: reader가 마감 캔들을 파싱할 때마다 갱신한다.
         self._last_close_at: Dict[str, float] = {}
         self.socket: Optional[ReliableWebsocket] = None
         self._running = False
+        #: reader 태스크(:meth:`_read_socket`)와 그것이 채우는 마감 캔들 이벤트 큐. 큐는 상한이
+        #: 없지만 들어오는 것이 인터벌당 심볼 수만큼이라 소비자가 멈춰도 사실상 자라지 않는다.
+        self._reader: Optional[asyncio.Task] = None
+        self._events: asyncio.Queue = asyncio.Queue()
+        #: reader의 수신 실패 사유. 소비자가 큐를 다 비운 뒤 치명 처리한다.
+        self._reader_failure: Optional[str] = None
 
     # ------------------------------------------------------------- 수명주기
 
@@ -83,11 +100,17 @@ class LiveCandleProducer(CandleProducer):
         self._running = True
 
     def request_stop(self) -> None:
-        """다음 수신 후 스트림을 정상 종료한다."""
+        """스트림을 정상 종료한다 — 이미 받아 둔 이벤트도 더 내주지 않는다.
+
+        reader도 여기서 멈춘다. 엔진은 치명적 구멍에서 이걸 부른 뒤 ``async for``를 깨고
+        나가는데, 그러면 async generator의 ``finally``는 GC 때까지 미뤄질 수 있다.
+        """
         self._running = False
+        self._stop_reader()
 
     async def close(self) -> None:
         self._running = False
+        self._stop_reader()
         if self.socket:
             await self.socket.close()
             self.socket = None
@@ -99,55 +122,77 @@ class LiveCandleProducer(CandleProducer):
         # 감시는 수신을 시작하는 순간부터다 — 첫 마감 캔들도 기한 안에 와야 한다.
         started = time.monotonic()
         self._last_close_at = {symbol: started for symbol in self.symbols}
-        while self._running:
-            # 가장 오래 조용한 심볼의 기한까지만 기다린다. 다른 심볼의 메시지가 계속 와서
-            # recv가 매번 돌아와도, 매 바퀴 여기서 기한을 다시 보므로 한 심볼의 멈춤도 잡힌다.
-            wait = min(self._last_close_at.values()) + self.stall_timeout_s - time.monotonic()
-            if wait <= 0:
-                self._fatal(self._stall_reason())
-                break
-            try:
-                data = await asyncio.wait_for(self.socket.recv(), timeout=wait)
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
+        self._events = asyncio.Queue()
+        self._reader_failure = None
+        self._reader = asyncio.create_task(self._read_socket())
+        try:
+            while self._running:
+                # 가장 오래 조용한 심볼의 기한까지만 기다린다. 다른 심볼의 이벤트가 계속 와도
+                # 매 바퀴 여기서 기한을 다시 보므로 한 심볼의 멈춤도 잡힌다.
+                wait = (min(self._last_close_at.values()) + self.stall_timeout_s
+                        - time.monotonic())
+                if wait <= 0:
+                    self._fatal(self._stall_reason())
+                    break
+                try:
+                    item = await asyncio.wait_for(self._events.get(), timeout=wait)
+                except asyncio.TimeoutError:
+                    continue
+                if item is _STREAM_END:
+                    if self._reader_failure and self._running:
+                        self._fatal(self._reader_failure)
+                    break
                 if not self._running:
                     break
-                self._fatal(f"kline 메시지를 받지 못했다: {e}")
-                break
-            if not self._running:
-                break
+                yield item
+        finally:
+            self._stop_reader()
 
-            try:
-                async for event in self._events_from(data):
-                    yielded_at = time.monotonic()
-                    yield event
-                    # 소비자(엔진)가 이 이벤트를 처리하는 동안은 소켓을 읽지 않는다. 백필 REST로
-                    # 수십 초가 걸려도 스트림이 멈춘 게 아니므로, 그 시간만큼 모든 기한을 민다.
-                    paused = time.monotonic() - yielded_at
-                    for symbol in self._last_close_at:
-                        self._last_close_at[symbol] += paused
-                    if not self._running:
-                        return
-            except Exception as e:
-                # 파싱 중의 예상 못 한 오류. 한 메시지를 버리고 계속한다.
-                self.logger.exception("Error processing kline message: %s", e)
-                await self._on_error(e)
+    async def _read_socket(self) -> None:
+        """소켓을 쉬지 않고 비워 마감 캔들 이벤트만 내부 큐로 넘긴다 (모듈 docstring 참고).
 
-    async def _events_from(self, data: dict) -> AsyncIterator[Event]:
-        """메시지 하나에서 나올 이벤트 (마감 캔들이면 하나, 아니면 없음)."""
+        수신 실패는 치명적이다(``ReliableWebsocket``이 재연결까지 해 보고 포기한 것이다). 다만
+        여기서 바로 ``_running``을 내리지 않고 사유만 남긴다 — 실패 전에 받아 큐에 넣어 둔
+        이벤트는 소비자가 다 내준 뒤 :data:`_STREAM_END`에서 치명 처리한다. 파싱 실패와 에러
+        프레임은 그 메시지만 버리고 ``on_error``로 넘긴다. 어떻게 끝나든 표지를 넣어 소비자를
+        깨운다.
+        """
+        try:
+            while self._running:
+                try:
+                    data = await self.socket.recv()
+                except Exception as e:
+                    self._reader_failure = f"kline 메시지를 받지 못했다: {e}"
+                    break
+                try:
+                    event = await self._event_from(data)
+                except Exception as e:
+                    self.logger.exception("Error processing kline message: %s", e)
+                    await self._on_error(e)
+                    continue
+                if event is not None:
+                    self._events.put_nowait(event)
+        finally:
+            self._events.put_nowait(_STREAM_END)
+
+    def _stop_reader(self) -> None:
+        if self._reader is not None and not self._reader.done():
+            self._reader.cancel()
+
+    async def _event_from(self, data: dict) -> Optional[Event]:
+        """메시지 하나에서 나올 이벤트 (마감 캔들이면 하나, 아니면 None)."""
         if await self._handle_stream_error_frame(data):
-            return
+            return None
 
         payload = data.get("data") or {}
         symbol = (payload.get("ps") or "").upper()
         if symbol not in self._symbol_set:
             self.logger.warning(f"알 수 없는 심볼의 kline 메시지를 버린다: {payload.get('ps')!r}")
-            return
+            return None
 
         kline = payload.get("k", {})
         if not kline.get("x", False):  # x = is_closed
-            return
+            return None
 
         start_time = int(kline["t"])
         # 마감 시각은 **인터벌 경계**로 정규화한다. 웹소켓의 T(closeTime)는 경계 - 1ms 인데
@@ -168,7 +213,7 @@ class LiveCandleProducer(CandleProducer):
             trade_count=int(kline["n"]) if "n" in kline else None,
         )
         self._last_close_at[symbol] = time.monotonic()
-        yield Event(candle.end_time, {symbol: candle})
+        return Event(candle.end_time, {symbol: candle})
 
     # ------------------------------------------------------------- 내부
 
