@@ -373,7 +373,12 @@ through it, so the two can't silently diverge on where their candles come from �
 backtest producer, one layer up, which is why fetching Binance candles for a range exists once in
 the repo. `fetch` is async because the fetchers are blocking: `FetcherCandleHistory`
 (`history/fetcher.py`) wraps them in `asyncio.to_thread` itself rather than leaving every caller to
-remember (forgetting it in live blocks the loop and overflows the user-data queue). That adapter is
+remember (forgetting it in live blocks the loop and overflows the user-data queue). It also retries
+a symbol whose fetch raised (`retries=2`, backoff from `retry_delay_s=1.0`, doubling) before letting
+the exception through: the engine treats a failed fetch as fatal (a backfill ends the stream and
+restarts the process), and one REST 5xx/timeout should not cost a restart. Retries are per symbol,
+so a failure does not refetch symbols already received, and a *short* result is never retried —
+that is the data, and whether it is enough is the caller's check. That adapter is
 the only implementation and holds **no exchange-specific code** — it takes any `BaseCandleFetcher`
 and binds the two things the engine has no business deciding: the interval, and whether to use the
 month-chunk cache. Live passes the REST fetcher with `use_cache=False` (Vision dumps lag a day, and

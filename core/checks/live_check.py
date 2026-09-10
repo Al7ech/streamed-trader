@@ -35,6 +35,8 @@ from core.order.action import Action, ActionType
 from core.candle.candle import Candle
 from core.account.status import Status
 from core.history.base import CandleHistory
+from core.history.fetcher import FetcherCandleHistory
+from core.fetcher.base import BaseCandleFetcher
 from core.producer.base import CandleProducer, Event
 from core.engine.engine import TradingEngine
 from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
@@ -636,6 +638,35 @@ async def check_warmup():
             error = str(e)
         check(f"warmup: {label} → 기동 실패", reason in error and not engine._last_start,
               f"error={error!r} anchor={engine._last_start}")
+
+    # FetcherCandleHistory: 조회 예외는 몇 번 다시 해 본 뒤에야 올린다. 엔진은 조회 실패를
+    # 치명으로 다루므로(백필이면 재기동), REST 한 번 삐끗한 것에 프로세스를 내리면 안 된다.
+    class _FlakyFetcher(BaseCandleFetcher):
+        def __init__(self, failures):
+            super().__init__()
+            self.failures, self.calls = failures, []
+
+        def get_candles(self, symbol, start_date, end_date, interval):
+            self.calls.append(symbol)
+            if self.failures.get(symbol, 0) > 0:
+                self.failures[symbol] -= 1
+                raise ConnectionError("REST 5xx")
+            return synthetic_candles(T0, 3)
+
+    start, end = ms_timestamp_to_datetime(T0), ms_timestamp_to_datetime(T0 + 3 * MIN)
+    fetcher = _FlakyFetcher({SYM: 2})
+    got = await FetcherCandleHistory(fetcher, "1m", retry_delay_s=0).fetch([SYM2, SYM], start, end)
+    check("history: 일시적 조회 실패는 재시도로 흡수 (실패한 심볼만 다시)",
+          len(got[SYM]) == 3 and len(got[SYM2]) == 3 and fetcher.calls == [SYM2, SYM, SYM, SYM],
+          f"calls={fetcher.calls}")
+    fetcher = _FlakyFetcher({SYM: 3})
+    try:
+        await FetcherCandleHistory(fetcher, "1m", retry_delay_s=0).fetch([SYM], start, end)
+        raised = False
+    except ConnectionError:
+        raised = True
+    check("history: 재시도를 다 쓰면 예외를 그대로 올린다 (판단은 엔진 몫)",
+          raised and len(fetcher.calls) == 3, f"calls={fetcher.calls}")
 
     # 과거 캔들 조회가 없으면(백테스트 조립) 워밍업 자체가 성립하지 않는다.
     _, _, engine, _ = assemble(None)
