@@ -37,7 +37,7 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, Dict, NoReturn, Optional
+from typing import Awaitable, Callable, Dict, List, NoReturn, Optional
 
 from core.account.report import Report
 from core.candle.candle import Candle
@@ -203,11 +203,15 @@ class TradingEngine:
         안이 아니라 호출자가 부르는 별개 단계다 (백테스트는 아예 안 부르고, 첫 window개
         이벤트로 지표가 데워진다).
 
-        :param end: 워밍업 구간의 끝(배타). None이면 "지금"을 인터벌 경계로 내린 값.
-            검사 스크립트가 결정적으로 부르기 위한 인자다.
-        :raise ValueError: 어떤 심볼이 자기 지표 window보다 적은 캔들을 받았을 때. 조용히 덜
-            데워진 지표로 매매하는 것보다 기동에 실패하는 편이 낫다 — 라이브에서는 상장 직후
-            심볼이나 데이터 구멍이 여기서 잡힌다. ``history`` 조회가 아예 없을 때도 같다.
+        :param end: 워밍업 구간의 끝(배타). 인터벌 경계로 내려 쓴다. None이면 **로컬 시계**의
+            지금이다. 라이브는 거래소 서버 시각을 넘긴다 — 로컬 시계가 거래소보다 앞서 있으면
+            아직 진행 중인 봉이 구간에 들어와 마감봉처럼 지표에 먹히고, 그 봉의 진짜 마감
+            메시지는 앵커에 막혀 중복으로 버려진다.
+        :raise ValueError: 어떤 심볼이 자기 지표 window보다 적은 캔들을 받았을 때, 또는 받은
+            캔들이 구간을 벗어나거나 중간에 구멍이 있을 때 (:meth:`_check_warmup_candles`).
+            조용히 덜 데워진(혹은 구멍 난) 지표로 매매하는 것보다 기동에 실패하는 편이 낫다 —
+            라이브에서는 상장 직후 심볼이나 데이터 구멍이 여기서 잡힌다. ``history`` 조회가
+            아예 없을 때도 같다.
         """
         windows = self.streamer.warmup_windows()
         max_window = max(windows.values(), default=0)
@@ -235,6 +239,13 @@ class TradingEngine:
         fetched = await self.history.fetch(list(self.streamer.symbols),
                                            ms_timestamp_to_datetime(start_ms),
                                            ms_timestamp_to_datetime(end_ms))
+        for symbol, candles in fetched.items():
+            self._check_warmup_candles(symbol, candles, start_ms, end_ms)
+        short = {s: f"{len(fetched.get(s, ()))}/{w}" for s, w in windows.items()
+                 if len(fetched.get(s, ())) < w}
+        if short:
+            raise ValueError(f"워밍업 캔들이 모자란다 (심볼: 받은 개수/필요 window): {short}")
+
         last: Dict[str, int] = {}
         for symbol, candles in fetched.items():
             indicators = list(self.streamer.indicators.get(symbol, {}).values())
@@ -244,15 +255,33 @@ class TradingEngine:
             if candles:
                 last[symbol] = candles[-1].start_time
 
-        short = {s: f"{len(fetched.get(s, ()))}/{w}" for s, w in windows.items()
-                 if len(fetched.get(s, ())) < w}
-        if short:
-            raise ValueError(f"워밍업 캔들이 모자란다 (심볼: 받은 개수/필요 window): {short}")
-
         for symbol, candles in fetched.items():
             self.logger.info("[%s] Pre-fed indicators with %d candles: %s", symbol, len(candles),
                              generate_dict_string(self.streamer.indicators.get(symbol, {})))
         self._last_start.update(last)
+
+    def _check_warmup_candles(self, symbol: str, candles: List[Candle],
+                              start_ms: int, end_ms: int) -> None:
+        """워밍업 캔들이 ``[start_ms, end_ms)`` 안에서 빈틈없이 이어지는지 — 백필과 같은 기준.
+
+        구간 밖 캔들은 조회 계약 위반이다. 특히 ``end_ms``를 넘는 봉은 아직 진행 중인 봉이라,
+        먹이면 미마감 값이 지표에 들어가고 그 봉의 진짜 마감은 중복으로 버려진다. 앞쪽이 비는
+        것(상장 직후)과 맨 끝 봉이 아직 안 온 것은 허용한다 — 충분한가는 개수 검사가, 끝의
+        빈자리는 첫 실시간 캔들의 백필이 맡는다.
+        """
+        interval = self.producer.interval_ms
+        expected: Optional[int] = None
+        for c in candles:
+            if c.start_time < start_ms or c.end_time > end_ms:
+                raise ValueError(
+                    f"워밍업 구간 밖 캔들이 왔다 (symbol={symbol}): {c} — 구간 "
+                    f"{ms_timestamp_to_datetime(start_ms)} ~ {ms_timestamp_to_datetime(end_ms)}")
+            if expected is not None and c.start_time != expected:
+                raise ValueError(
+                    f"워밍업 캔들이 이어지지 않는다 (symbol={symbol}): "
+                    f"{ms_timestamp_to_datetime(expected)} 자리에 "
+                    f"{ms_timestamp_to_datetime(c.start_time)}")
+            expected = c.start_time + interval
 
     async def run_async(self) -> Optional[Report]:
         """공급자를 끝까지 흘려보낸다 — 백테스트/드라이런/라이브의 **유일한 드라이버**다.

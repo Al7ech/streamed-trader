@@ -26,7 +26,8 @@ There is no automated test suite (no `pytest`/`unittest` files in `core/`, only 
   skip, gap backfill via the `history` query, cap/boundary/fetch fatals, no re-feed of a candle whose
   processing raised), the indicator warm-up
   handoff (`warmup()` derives its own range, seeds the engine's `_last_start` anchor, and the gap
-  between the warm-up range and the first live candle is backfilled from that **same** source), the
+  between the warm-up range and the first live candle is backfilled from that **same** source, and a
+  warm-up with a hole or an out-of-range/still-open candle fails startup), the
   live executor's
   account/fill handling, and that **a dry run produces exactly the trades a backtest of the same
   candles does** (over Keltner, a stateful mean-reversion strategy, and toy limit/stop-ladder
@@ -388,9 +389,16 @@ stagger the symbols' windows by however long the sequential fetches took. It the
 candles **to the indicators only** — no `begin_event`, no `decide_action`, no orders, no recording,
 and `update()` gets no `status` (that stretch of history has no corresponding account state, so
 status-aware indicators must treat `None` as warm-up). It raises `ValueError` if any symbol received
-fewer candles than its own window (`streamer.warmup_windows()`), because silently under-warmed
-indicators are worse than a failed startup, and records the last fed `start_time` per symbol into
-the engine's own `_last_start` continuity anchor.
+fewer candles than its own window (`streamer.warmup_windows()`), or candles outside
+`[start, end)` or with a hole between them (`_check_warmup_candles` — the backfill's standard;
+a leading shortfall after a recent listing and a not-yet-served last candle are allowed, the count
+check and the first live candle's backfill cover those), because silently under-warmed or
+hole-ridden indicators are worse than a failed startup, and records the last fed `start_time` per
+symbol into the engine's own `_last_start` continuity anchor. `end=None` means the **local** clock;
+live passes the exchange's server time instead (`BinanceTrader._server_now`, which also warns past
+`CLOCK_SKEW_WARN_MS`), because a local clock running even seconds ahead makes a start just after a
+boundary pull the still-open candle into the range — it would be fed as if closed, anchored, and
+its real close then dropped as a duplicate.
 
 **The engine owns continuity end to end.** `run_async` checks each incoming candle's `start_time`
 against `_last_start[symbol]`: `<= anchor` is an already-processed candle (reconnect resend) and the
@@ -907,7 +915,8 @@ straight to `executor.on_user_data(...)`.
     hands the engine one `FetcherCandleHistory(BinanceCandleFetcher(), interval)` as `history`
     (REST, `use_cache=False`; the synchronous-HTTP-in-a-thread detail lives inside that query) and
     calls
-    `TradingEngine.warmup()`. The range — `[end - max(window)*interval, end)`, `end` floored to the
+    `TradingEngine.warmup(end=<exchange server time>)` — the only input the trader supplies is
+    the clock. The range — `[end - max(window)*interval, end)`, `end` floored to the
     **interval** boundary — is derived by the engine, which is where `warmup_windows()` and
     `interval_ms` already are; the same `history` object then fills any live gap, so warm-up and
     backfill are the identical machinery by construction rather than by two callers agreeing.

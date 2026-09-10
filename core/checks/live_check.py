@@ -266,11 +266,12 @@ class SyntheticHistory(CandleHistory):
     """엔진의 ``history`` 스텁 — ``[start, end)`` 를 합성 캔들로 채워 돌려준다.
 
     **워밍업과 구멍 백필이 같은 조회를 쓴다**는 것이 요점이라, 검사도 하나로 둔다.
-    ``short``면 요청보다 한 개 적게 돌려줘 "덜 데워졌는데도 기동하는가"를 찌른다.
+    ``short``면 요청보다 한 개 적게 돌려줘 "덜 데워졌는데도 기동하는가"를 찌른다. ``hole``이면
+    가운데 봉 하나를 빼고, ``ahead``면 구간 끝 뒤의 봉(= 아직 진행 중인 봉) 하나를 덧붙인다.
     """
 
-    def __init__(self, short=False, boom=False):
-        self.short, self.boom = short, boom
+    def __init__(self, short=False, boom=False, hole=False, ahead=False):
+        self.short, self.boom, self.hole, self.ahead = short, boom, hole, ahead
         self.ranges = []
 
     async def fetch(self, symbols, start, end):
@@ -280,7 +281,10 @@ class SyntheticHistory(CandleHistory):
         end_ms = round(end.timestamp() * 1000)
         self.ranges.append((start_ms, end_ms))
         count = (end_ms - start_ms) // MIN - (1 if self.short else 0)
-        return {symbol: synthetic_candles(start_ms, count) for symbol in symbols}
+        candles = synthetic_candles(start_ms, count + (1 if self.ahead else 0))
+        if self.hole:
+            del candles[len(candles) // 2]
+        return {symbol: list(candles) for symbol in symbols}
 
 
 class _DecideSpy(BaseStreamer):
@@ -531,6 +535,21 @@ async def check_warmup():
     except ValueError:
         raised = True
     check("warmup: 캔들이 모자라면 기동 실패", raised)
+
+    # 구멍이 있거나 구간 끝 뒤의 봉(진행 중인 봉)이 섞이면 기동 실패 — 백필과 같은 기준. 진행
+    # 중인 봉을 먹으면 미마감 값이 지표에 들어가고 진짜 마감은 중복으로 버려진다. 개수 검사가
+    # 우연히 잡는 것과 구분하려고 사유 문구까지 본다 (구멍은 window가 더 작은 심볼이면 개수
+    # 검사를 통과한다; 진행 중인 봉은 개수를 오히려 늘린다).
+    for label, history, reason in (("구멍", SyntheticHistory(hole=True), "이어지지"),
+                                   ("구간 밖 봉", SyntheticHistory(ahead=True), "구간 밖")):
+        _, _, engine, _ = assemble(history)
+        try:
+            await engine.warmup(end=ms_timestamp_to_datetime(T0 + window * MIN))
+            error = ""
+        except ValueError as e:
+            error = str(e)
+        check(f"warmup: {label} → 기동 실패", reason in error and not engine._last_start,
+              f"error={error!r} anchor={engine._last_start}")
 
     # 과거 캔들 조회가 없으면(백테스트 조립) 워밍업 자체가 성립하지 않는다.
     _, _, engine, _ = assemble(None)

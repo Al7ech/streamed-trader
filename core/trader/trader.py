@@ -18,6 +18,8 @@
 import asyncio
 import copy
 import logging
+import time
+from datetime import datetime
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from binance import AsyncClient, BinanceSocketManager
@@ -33,10 +35,13 @@ from core.executor.live import LiveExecutor, resolve_margin_asset
 from core.recorder.live import DEFAULT_SHARD_FLUSH_EVERY, LiveRecorder, default_run_id
 from core.producer.reliable_websocket import ReliableWebsocket
 from core.streamer.base_streamer import BaseStreamer
-from core.utils import interval_to_minutes
+from core.utils import interval_to_minutes, ms_timestamp_to_datetime
 
 #: 드라이런의 합성 초기 증거금. 실제 지갑이 없으므로 고정값에서 시작한다.
 DRY_RUN_MARGIN = 1e6
+
+#: 로컬 시계와 거래소 서버 시각의 어긋남이 이보다 크면 기동 시 경고한다.
+CLOCK_SKEW_WARN_MS = 1000
 
 
 class BinanceTrader:
@@ -184,8 +189,9 @@ class BinanceTrader:
 
             # 4. 지표 워밍업. 소켓을 열기 **전에** 한다 — 수십 초가 걸릴 수 있는데 그동안
             #    유저 데이터 스트림을 읽지 않으면 python-binance의 큐가 넘쳐 죽는다.
-            #    얼마만큼의 과거가 필요한지(지표 window × 인터벌)는 엔진이 안다.
-            await self.engine.warmup()
+            #    얼마만큼의 과거가 필요한지(지표 window × 인터벌)는 엔진이 안다. 구간의 끝만
+            #    거래소 시각으로 준다 (:meth:`_server_now`).
+            await self.engine.warmup(end=await self._server_now())
 
             # 5. 리스너 태스크 생성 전에 플래그를 세운다. 리스너 루프가 `while self.is_running`
             #    으로 시작하므로, 나중에 세우면 첫 await에서 태스크가 곧바로 빠져나간다.
@@ -257,6 +263,21 @@ class BinanceTrader:
 
         except Exception as e:
             self.logger.error(f"Error during shutdown: {e}")
+
+    async def _server_now(self) -> datetime:
+        """거래소 서버 시각 — 워밍업 구간의 끝을 정하는 기준.
+
+        로컬 시계를 쓰면, 시계가 거래소보다 몇 초만 앞서 있어도 경계 직후 기동에서 아직 진행
+        중인 봉이 워밍업 구간에 들어와 마감봉처럼 지표에 먹히고, 그 봉의 진짜 마감 메시지는
+        중복으로 버려진다 (WSL2처럼 절전 뒤 시계가 밀리는 환경에서 실제로 난다). 어긋남이
+        크면 경고로 남긴다 — 왕복 지연의 절반이 섞이므로 작은 값은 의미가 없다.
+        """
+        server_ms = int((await self.client.futures_time())["serverTime"])
+        skew_ms = round(time.time() * 1000) - server_ms
+        if abs(skew_ms) > CLOCK_SKEW_WARN_MS:
+            self.logger.warning("로컬 시계가 거래소 서버와 %+dms 어긋나 있다 — 워밍업 구간은 "
+                                "서버 시각 기준으로 정한다", skew_ms)
+        return ms_timestamp_to_datetime(server_ms)
 
     def _spawn(self, coro) -> asyncio.Task:
         """리스너 태스크를 만들고 강한 참조를 유지한다 (GC 방지)."""
