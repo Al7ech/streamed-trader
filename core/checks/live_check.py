@@ -221,11 +221,14 @@ def compare_reports(label, ref_report, fast_report) -> bool:
 # ============================================================ 1. 캔들 공급자
 
 
-def kline_msg(start_ms, closed=True, symbol=SYM, close=100.0):
+def kline_msg(start_ms, closed=True, symbol=SYM, close=100.0, flow=True):
+    """``flow``면 taker 매수량(V)·체결 수(n)도 싣는다 — 실제 kline 페이로드처럼."""
+    k = {"t": start_ms, "o": "100", "h": "101", "l": "99", "c": str(close), "v": "10",
+         "x": closed}
+    if flow:
+        k.update({"V": "4", "n": 7})
     return {"stream": f"{symbol.lower()}_perpetual@continuousKline_1m",
-            "data": {"ps": symbol, "k": {"t": start_ms, "o": "100", "h": "101",
-                                         "l": "99", "c": str(close), "v": "10",
-                                         "x": closed}}}
+            "data": {"ps": symbol, "k": k}}
 
 
 class FakeKlineSocket:
@@ -407,6 +410,15 @@ async def check_candle_producer():
     # 라이브 캔들의 타임스탬프가 1ms 어긋나고 백테스트 시계열과도 짝이 맞지 않는다.
     check("producer: end_time 인터벌 경계 정규화",
           c.start_time == T0 and c.end_time == T0 + MIN)
+    # REST/Vision 캔들이 채우는 필드를 실시간 캔들만 빠뜨리면, 그 필드를 읽는 지표가 워밍업
+    # 뒤 실시간 봉이 창에 들어오는 순간부터 영원히 None이 된다 (백테스트와 조용히 갈라진다).
+    check("producer: taker 매수량·체결 수를 채운다",
+          c.taker_buy_volume == 4.0 and c.trade_count == 7,
+          f"V={c.taker_buy_volume} n={c.trade_count}")
+    p, _ = make_producer([kline_msg(T0, flow=False)])
+    c = [ev async for ev in p][0].candles[SYM]
+    check("producer: 필드가 없으면 None (지표는 워밍업 취급)",
+          c.taker_buy_volume is None and c.trade_count is None)
 
     p, errs = make_producer([{"e": "error", "m": "boom"}, kline_msg(T0)])
     evs = await collect(p)

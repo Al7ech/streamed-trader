@@ -903,7 +903,11 @@ straight to `executor.on_user_data(...)`.
   `status` is exchange truth and the pre-trade `pre_position`/`pre_margin` are read before the order is sent.
   - **The producer does no continuity check.** It parses the multiplex envelope, ignores unknown
     symbols and unclosed klines, normalizes `end_time` to the interval boundary (a websocket
-    kline's `T` is `start + interval - 1` while the fetcher's `end_time` is exclusive), and yields
+    kline's `T` is `start + interval - 1` while the fetcher's `end_time` is exclusive), fills
+    `taker_buy_volume` (`V`) and `trade_count` (`n`) exactly as the REST/Vision fetchers do (a
+    live candle missing a field its warm-up/backfill neighbours carry would turn any indicator
+    that reads it — `TakerImbalanceIndicator` — permanently `None` once live candles enter its
+    window), and yields
     one `Event(end_time, {symbol: candle})` per closed candle. Nothing else. Duplicate/gap
     detection is the engine's — it compares `start_time + interval_ms` against its own per-symbol
     `_last_start` anchor (see "Indicator warm-up" under "The trading engine"), backfills a gap

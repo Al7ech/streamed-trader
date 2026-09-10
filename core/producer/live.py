@@ -153,6 +153,9 @@ class LiveCandleProducer(CandleProducer):
         # 마감 시각은 **인터벌 경계**로 정규화한다. 웹소켓의 T(closeTime)는 경계 - 1ms 인데
         # BinanceCandleFetcher는 경계(k[6] + 1)를 쓴다. 그대로 두면 백필한 캔들과 라이브 캔들의
         # 타임스탬프가 1ms 어긋나고, 백테스트 시계열과도 짝이 맞지 않는다.
+        # taker_buy_volume(V)·trade_count(n)도 채운다 — REST/Vision 캔들은 채우므로, 빠뜨리면
+        # 워밍업·백필 봉에는 값이 있고 실시간 봉에만 None이라 그 필드를 읽는 지표가
+        # (TakerImbalanceIndicator) 실시간 봉이 창에 들어오는 순간부터 영원히 None이 된다.
         candle = Candle(
             open=float(kline["o"]),
             high=float(kline["h"]),
@@ -161,6 +164,8 @@ class LiveCandleProducer(CandleProducer):
             volume=float(kline["v"]),
             start_time=start_time,
             end_time=start_time + self.interval_ms,
+            taker_buy_volume=float(kline["V"]) if "V" in kline else None,
+            trade_count=int(kline["n"]) if "n" in kline else None,
         )
         self._last_close_at[symbol] = time.monotonic()
         yield Event(candle.end_time, {symbol: candle})
