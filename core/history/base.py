@@ -13,10 +13,10 @@
 워밍업과 백필이 서로 다른 경로로 캔들을 구하면 조용히 갈라질 수 있는데, 그 둘은 "지금이 아닌
 과거 구간을 받아온다"는 한 가지 일이다.
 
-백테스트의 캔들 소스(:class:`~core.producer.historical.BinanceHistoricalCandleProducer`)도
-결국 이 포트 위에 있다 — 구간이 미리 정해져 있을 뿐 같은 조회이므로, 그쪽은 이 결과를 이벤트
-타임라인으로 흘려보내는 얇은 겹이다. 그래서 "거래소에서 과거 캔들을 가져온다"는 코드는 저장소에
-한 벌만 있다.
+백테스트의 캔들도 결국 이 포트에서 나온다 — 진입점(``core/examples/backtest.py``)이
+:meth:`CandleHistory.fetch`를 직접 부르고 그 결과를
+:class:`~core.engine.backtest.BacktestEngine`에 그대로 넘긴다. 구간이 미리 정해져 있을 뿐 같은
+조회다. 그래서 "거래소에서 과거 캔들을 가져온다"는 코드는 저장소에 한 벌만 있다.
 
 의존 방향은 **엔진 → CandleHistory 한 방향**이다. 조회는 실행기도, 레코더도, 전략도 모른다.
 """
@@ -36,9 +36,9 @@ class CandleHistory(ABC):
                     end: datetime) -> Dict[str, List[Candle]]:
         """``[start, end)`` 구간의 심볼별 캔들 (각자 ``end_time`` 오름차순).
 
-        돌려주는 모양이 :class:`~core.producer.in_memory.InMemoryCandleProducer`가 받는 모양과
-        같다 — 이벤트로 흘려보내고 싶은 쪽은 그대로 넘기면 되고, 지표에 먹이거나 개수를
-        검증하는 쪽(워밍업/백필)은 이벤트로 감쌌다 다시 벗길 필요가 없다.
+        돌려주는 모양이 :class:`~core.engine.backtest.BacktestEngine`이 받는 모양과 같다 —
+        백테스트를 돌리고 싶은 쪽은 그대로 넘기면 되고, 지표에 먹이거나 개수를 검증하는
+        쪽(워밍업/백필)은 이벤트로 감쌌다 다시 벗길 필요가 없다.
 
         캔들이 하나도 없는 심볼은 빈 리스트로 온다 — 요청 구간에 데이터가 없는 것은 오류가
         아니다(상장 전 구간 등). "충분한가"의 판정은 부르는 쪽 몫이다.

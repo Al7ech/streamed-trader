@@ -1,16 +1,23 @@
-"""매매 순서 규약. 이 저장소에 **한 벌만** 존재하는 이벤트 처리 루프다.
+"""라이브/드라이런의 매매 순서 규약 — 스트림을 소비하는 이벤트 처리 루프다.
 
-백테스트, 드라이런, 라이브가 전부 :meth:`TradingEngine.process_event`를 지나간다. 셋의 차이는
-꽂히는 부품뿐이다:
+드라이런과 라이브가 :meth:`TradingEngine.process_event`를 지나간다. 둘의 차이는 꽂히는
+부품뿐이다:
 
-===========  ==============================  ==================  ================
-             CandleProducer                  Executor            Recorder
-===========  ==============================  ==================  ================
-백테스트     BinanceHistoricalCandleProducer SimulatedExecutor   BacktestRecorder
-             / InMemoryCandleProducer
-드라이런     LiveCandleProducer              SimulatedExecutor   LiveRecorder
-라이브       LiveCandleProducer              LiveExecutor        LiveRecorder
-===========  ==============================  ==================  ================
+===========  ==================  ==================  ================
+             CandleProducer      Executor            Recorder
+===========  ==================  ==================  ================
+드라이런     LiveCandleProducer  SimulatedExecutor   LiveRecorder
+라이브       LiveCandleProducer  LiveExecutor        LiveRecorder
+===========  ==================  ==================  ================
+
+**백테스트는 형제 모듈 :mod:`core.engine.backtest`가 갖는다.** 여기 있는 것들 — 연속성 앵커,
+구멍 백필, 결정 기한, 지표 워밍업, async 순회 — 은 전부 "스트림은 끊기고 시계는 흐른다"는
+전제 위에 있고, 메모리에 다 들고 있는 과거 구간에는 그 전제가 없다. 대신 그쪽에는 여기서 할 수
+없는 것이 있다: 전 구간을 미리 알고 있으니 지표를 통째로 계산해 두는 것.
+
+그래서 아래 단계 순서는 이 저장소에 **두 벌** 있다. 둘이 갈라지지 않는다는 보장은 문서가 아니라
+검사다 — ``core/checks/live_check.py`` 3절이 같은 캔들에서 두 엔진이 같은 체결을 내는지 다섯
+전략으로 확인한다. :meth:`process_event`의 순서를 바꾸면 그 검사가 깨진다.
 
 **부품을 엮는 것도 엔진의 일이다.** 호출자는 네 부품(스트리머·공급자·실행기·레코더)을
 생성자에 넘기기만 하고, 체결 싱크 연결(``executor.on_trade``), 레코더 기본값, 루프,

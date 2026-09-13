@@ -3,23 +3,24 @@
 엔진에 흘려보낼 **이벤트**(같은 시각에 마감한 심볼별 캔들 묶음)를 시간순으로 내준다.
 
 모든 구현체가 **비동기 iterator**(``__aiter__``)로 이벤트를 내주고,
-:meth:`~core.engine.engine.TradingEngine.run_async`가 그것을 소비한다. 백테스트/드라이런/
-라이브가 같은 소비 경로를 지나가고, 이벤트 루프가 없는 호출자(백테스트)만 그 코루틴을
-``asyncio.run``으로 감싼 :meth:`~core.engine.engine.TradingEngine.run`을 쓴다:
+:meth:`~core.engine.engine.TradingEngine.run_async`가 그것을 소비한다:
 
-- :class:`~core.producer.in_memory.InMemoryCandleProducer` — 이미 메모리에
-  로딩된 캔들을 병합해 내준다 (내부에서 아무것도 ``await``하지 않는 async generator).
-- :class:`~core.producer.historical.BinanceHistoricalCandleProducer` — 위를
-  상속해, 구간을 바이낸스에서 스스로 fetch한 뒤 병합한다. 백테스트의 캔들 소스다.
 - ``LiveCandleProducer`` (:mod:`core.producer.live`) — 웹소켓에서 캔들이 마감할
   때마다 내준다. 연속성 판정(중복·구멍)은 하지 않는다 — 엔진 몫이다.
+- :class:`~core.producer.in_memory.InMemoryCandleProducer` — 이미 메모리에
+  로딩된 캔들을 병합해 내준다 (내부에서 아무것도 ``await``하지 않는 async generator).
+  메모리 캔들을 **라이브 엔진에** 흘려보내야 하는 쪽이 쓴다.
+
+**백테스트는 이 포트를 쓰지 않는다.** :class:`~core.engine.backtest.BacktestEngine`이
+``Dict[str, List[Candle]]``를 직접 받아 공급자 없이 돈다 — 스트림으로 한 번 흘려보내는 모양이
+"전 구간을 미리 알고 있으니 지표를 통째로 계산한다"와 맞지 않기 때문이다. 그래서 이 패키지는
+사실상 라이브 경로의 것이다.
 
 :class:`CandleProducer`는 "어디서부터 어디까지"가 **생성 시점에 굳은** 시간순 스트림이다.
 구간이 런타임에 정해지는 두 요구 —— 기동한 순간에야 알 수 있는 **지표 워밍업** 구간과, 구멍이
 난 순간에야 알 수 있는 **백필** 구간 —— 은 이 포트로 표현하지 못하므로, 구간을 인자로 받는
 별개의 조회 포트 :class:`~core.history.base.CandleHistory`가 담당한다
-(:meth:`~core.engine.engine.TradingEngine.warmup` 참고). 위 백테스트 공급자도 결국 그 조회
-위에 서 있다 — 구간이 미리 정해져 있을 뿐 같은 조회다.
+(:meth:`~core.engine.engine.TradingEngine.warmup` 참고).
 
 의존 방향은 **엔진 → Producer 한 방향**이다. Producer는 실행기도, 레코더도, 액션도 모른다.
 """
@@ -54,12 +55,12 @@ class CandleProducer(ABC):
     구현체는 **``__aiter__``(비동기 iterator)** 를 제공하고,
     :meth:`~core.engine.engine.TradingEngine.run_async`가 그것을 소비한다. 동기 소스라도
     아무것도 ``await``하지 않는 async generator로 감싸면 되고
-    (:class:`~core.producer.in_memory.InMemoryCandleProducer` 참고), 그러면
-    백테스트·드라이런·라이브가 단 하나의 소비 경로를 공유한다.
+    (:class:`~core.producer.in_memory.InMemoryCandleProducer` 참고), 그러면 드라이런과 라이브가
+    하나의 소비 경로를 공유한다.
 
     :param interval_ms: 캔들 간격(ms). 서브클래스는 반드시 ``super().__init__(interval_ms)``로
-        값을 정해야 한다 — 샤드 메타와 Sharpe 리샘플링 주기가 여기서 나온다. 출처는 소스마다
-        다르다: 백테스트/Replay는 캔들 데이터에서 측정하고, 라이브는 config에서 온다. ``0``은
+        값을 정해야 한다 — 엔진의 연속성/백필 판정이 여기서 나온다. 출처는 소스마다 다르다:
+        메모리/Replay 소스는 캔들 데이터에서 측정하고, 라이브는 config에서 온다. ``0``은
         "미상/degenerate"(빈 구간 등)을 뜻한다.
     """
 

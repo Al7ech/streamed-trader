@@ -15,15 +15,14 @@ import numpy as np
 from dotenv import load_dotenv
 
 from core.executor.simulated import DEFAULT_INIT_MARGIN
-from core.producer.in_memory import InMemoryCandleProducer
 from core.recorder.backtest import BacktestRecorder
 from core.executor.simulated import SimulatedExecutor
-from core.engine.engine import TradingEngine
+from core.engine.backtest import BacktestEngine
 from core.fetcher.stock import nyse_session
 from core.fetcher.stock.massive_fetcher import MassiveStockFetcher
 from core.logging_config import setup_logging
 from core.streamer.strategies.keltner_streamer import KeltnerStreamer
-from core.utils import ms_timestamp_to_datetime
+from core.utils import interval_to_minutes, ms_timestamp_to_datetime
 
 ET = timezone(timedelta(hours=-4))  # 미국 동부 서머타임 (출력용)
 
@@ -119,11 +118,13 @@ def main():
     streamer = KeltnerStreamer(symbols=[symbol], window=120, m_entry=2.0, m_exit=0.0,
                                max_loss=0.08)
     init_margin = DEFAULT_INIT_MARGIN
-    # 이미 손에 든 캔들을 그대로 흘려보낸다 — 심볼별 dict가 공급자의 입력이다.
-    producer = InMemoryCandleProducer({symbol: candles})
+    # 이미 손에 든 캔들을 그대로 넘긴다 — 심볼별 dict가 백테스트 엔진의 입력이다.
+    # 봉 간격은 캔들에서 재지 않고 interval 문자열에서 온다. 주식 캔들은 장 시간 그리드
+    # 위에 있어서 (야간/주말 건너뜀) 앞의 두 캔들 간격을 재는 방식이 맞지 않는다.
     executor = SimulatedExecutor(init_margin, 0.0005)
-    recorder = BacktestRecorder(streamer, executor.status, interval_ms=producer.interval_ms)
-    report = TradingEngine(streamer, producer, executor, recorder).run()
+    recorder = BacktestRecorder(streamer, executor.status,
+                                interval_ms=interval_to_minutes(interval) * 60_000)
+    report = BacktestEngine(streamer, {symbol: candles}, executor, recorder).run()
     # Trade.pre_margin은 거래 전 값이므로 최종 상태를 쓴다 (마지막 거래 손익/수수료 포함)
     final = report.status.total_margin()
     print(f"[6] 백테스트 파이프라인 OK — {len(report.trades)} trades, "

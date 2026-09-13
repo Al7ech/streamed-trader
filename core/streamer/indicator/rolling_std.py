@@ -2,11 +2,11 @@ from collections import deque
 from typing import Optional
 
 import numpy as np
-import pandas as pd
 
 from core.candle.candle import Candle
 from core.account.status import Status
 from core.streamer.indicator.base_indicator import NumericIndicator
+from core.streamer.indicator.vector_ops import rolling_std_exact
 
 
 class RollingStd(NumericIndicator):
@@ -36,5 +36,5 @@ class RollingStd(NumericIndicator):
 
     def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
                           close: np.ndarray, volume: np.ndarray) -> np.ndarray:
-        # pandas rolling std defaults to ddof=1, matching the loop path
-        return pd.Series(close).rolling(self.window).std().to_numpy()
+        # 위 update()와 같은 창 단위 np.std(ddof=1) — 비트 단위로 같다 (vector_ops 참고).
+        return rolling_std_exact(close, self.window)

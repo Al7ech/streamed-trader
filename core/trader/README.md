@@ -8,12 +8,15 @@ repository `README.md` for the end-to-end setup and `CLAUDE.md` for the architec
 
 ## How it fits together
 
-The trading order-of-operations lives **once**, in `core/engine/` (`TradingEngine.process_event`).
-This package supplies the live implementations of the three pluggable pieces around it:
+The trading order-of-operations lives in `core/engine/`. The live/dry-run half is
+`TradingEngine.process_event`; a backtest runs the same steps in `BacktestEngine._loop`, a separate
+engine because a range already in memory needs none of the stream machinery (continuity anchor,
+gap backfill, decision deadline) and *can* precompute its indicators. This package supplies the
+live implementations of the pluggable pieces around it:
 
-| | CandleProducer | Executor | Recorder |
+| | candles | Executor | Recorder |
 |---|---|---|---|
-| backtest | `BinanceHistoricalCandleProducer` / `InMemoryCandleProducer` | `SimulatedExecutor` | `BacktestRecorder` |
+| backtest | `Dict[str, List[Candle]]` given to `BacktestEngine` | `SimulatedExecutor` | `BacktestRecorder` |
 | dry run | `LiveCandleProducer` | **`SimulatedExecutor`** | `LiveRecorder` |
 | live | `LiveCandleProducer` | `LiveExecutor` | `LiveRecorder` |
 
@@ -21,7 +24,8 @@ Dry run and backtest use **literally the same executor class** — this package 
 `SimulatedExecutor` out of `core/executor/simulated.py`. Dry run exists to be compared against a backtest, so
 the fill rules, accounting and resting-order book must be one copy, not two that happen to agree.
 `core/checks/live_check.py` asserts that a dry run and a backtest of the same candles produce
-identical trades.
+identical trades — which, now that the step order exists in two engines, is also what proves those
+two have not drifted apart.
 
 ## Components
 

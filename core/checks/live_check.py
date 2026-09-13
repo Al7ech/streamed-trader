@@ -11,7 +11,10 @@
    (가짜 주문 클라이언트 + 손으로 만든 유저 데이터 메시지)
 3. **드라이런 == 백테스트** — 같은 캔들을 라이브의 이벤트 모양(심볼별 단일 키, 비동기)으로
    흘려보내고 백테스트 결과와 체결을 대조한다. 드라이런이 존재하는 이유가 이 대조이고,
-   이제 둘은 같은 엔진과 같은 ``SimulatedExecutor``를 쓰므로 **완전히** 같아야 한다.
+   **엔진은 서로 다르되**(:class:`~core.engine.engine.TradingEngine` vs
+   :class:`~core.engine.backtest.BacktestEngine`) ``SimulatedExecutor``는 같은 클래스이므로
+   결과가 **완전히** 같아야 한다. 순서 규약이 두 파일에 나뉘어 있는 지금, 이 대조가 둘이
+   갈라지지 않았다는 유일한 증거다 — 어느 한쪽의 단계 순서를 바꾸면 여기서 걸린다.
 
 단일 심볼로 대조하는 이유: 백테스트는 같은 시각에 마감한 심볼들을 하나의 이벤트로 병합하지만
 라이브는 심볼별로 따로 처리한다. 심볼이 하나면 두 이벤트 스트림이 동일해지므로, 그 차이를
@@ -21,14 +24,14 @@
     uv run python core/checks/live_check.py --offline  # 캔들 캐시가 필요 없는 1, 2 만
 """
 import asyncio
-import math
 import sys
 import time
 from concurrent.futures import Future
 from datetime import datetime, timezone
 from typing import Dict, List
 
-from core.producer.in_memory import InMemoryCandleProducer
+from core.checks.compare import compare_reports
+from core.engine.backtest import BacktestEngine
 from core.recorder.backtest import BacktestRecorder
 from core.recorder.base import NullRecorder
 from core.executor.simulated import SimulatedExecutor
@@ -145,80 +148,6 @@ class StopLadderStreamer(LimitLadderStreamer):
         return [Action(symbol, -position * 3, order_type=ActionType.STOP_MARKET,
                        trigger_price=avg * (1 - self.spread), trigger_above=False,
                        reduce_only=True, client_id="stop")]
-
-
-def compare_reports(label, ref_report, fast_report) -> bool:
-    """두 Report(백테스트 vs 드라이런)가 체결·자본곡선·벤치마크까지 같은지 확인한다."""
-    ok = True
-    ref_final = ref_report.status.total_margin()
-    fast_final = fast_report.status.total_margin()
-    if len(ref_report.trades) != len(fast_report.trades):
-        print(f"  [{label}] FAIL: trade count {len(ref_report.trades)} != {len(fast_report.trades)}")
-        return False
-    for i, (a, b) in enumerate(zip(ref_report.trades, fast_report.trades)):
-        # 실현손익은 quantity * (체결가 - 평단)이라 **거의 같은 두 수의 차**다. 체결가가
-        # 지표값인 조건부 주문에서는 지표 반올림(1e-14 상대)이 그 뺄셈에서 세 자릿수쯤
-        # 증폭되므로, wnl의 허용오차는 wnl 자신이 아니라 **명목가치**에 비례해야 한다.
-        # 구조적으로 틀린 손익은 명목가치의 유의미한 비율만큼 어긋나므로 이걸로도 충분히 걸린다.
-        notional_tol = max(1e-9, 1e-11 * abs(a.quantity * a.price))
-        if not (a.timestamp == b.timestamp and a.symbol == b.symbol and a.quantity == b.quantity
-                and a.order_type == b.order_type and a.submitted_at == b.submitted_at
-                and a.pre_position == b.pre_position
-                and math.isclose(a.price, b.price, rel_tol=1e-12, abs_tol=1e-9)
-                and math.isclose(a.wnl, b.wnl, rel_tol=1e-12, abs_tol=notional_tol)
-                and math.isclose(a.fee, b.fee, rel_tol=1e-12, abs_tol=1e-9)
-                and math.isclose(a.pre_margin, b.pre_margin, rel_tol=1e-12, abs_tol=1e-6)
-                and math.isclose(a.leverage, b.leverage, rel_tol=1e-12, abs_tol=1e-9)):
-            print(f"  [{label}] FAIL: trade #{i} differs:\n    ref : {a}\n    fast: {b}")
-            ok = False
-            break
-    if not math.isclose(ref_report.max_leverage, fast_report.max_leverage, rel_tol=1e-12, abs_tol=1e-9):
-        print(f"  [{label}] FAIL: max_leverage {ref_report.max_leverage} != {fast_report.max_leverage}")
-        ok = False
-    if not math.isclose(ref_final, fast_final, rel_tol=1e-12, abs_tol=1e-6):
-        print(f"  [{label}] FAIL: final margin {ref_final} != {fast_final}")
-        ok = False
-    if len(ref_report.equity_curve) != len(fast_report.equity_curve):
-        print(f"  [{label}] FAIL: equity curve length "
-              f"{len(ref_report.equity_curve)} != {len(fast_report.equity_curve)}")
-        ok = False
-    else:
-        # 허용오차는 **상대**가 본질이다. 지표 반올림 차이가 체결가와 avg_price를 통해 자본에
-        # 누적되므로, 오차는 계좌 크기에 비례해서 커진다. 고정 1e-6 절대값만 쓰면 100배로
-        # 불어난 계좌에서 순수 반올림이 실패로 잡힌다 — 구조적 어긋남은 자본의 유의미한
-        # 비율만큼 벌어지므로 rel_tol 1e-11로도 충분히 걸린다.
-        worst = (0.0, 0.0, 0)  # (abs, rel, index)
-        for i, ((ts_a, eq_a), (ts_b, eq_b)) in enumerate(
-                zip(ref_report.equity_curve, fast_report.equity_curve)):
-            if ts_a != ts_b:
-                print(f"  [{label}] FAIL: equity curve timestamps diverge at {ts_a} vs {ts_b}")
-                ok = False
-                break
-            diff = abs(eq_a - eq_b)
-            if diff > worst[0]:
-                worst = (diff, diff / abs(eq_a) if eq_a else 0.0, i)
-            if not math.isclose(eq_a, eq_b, rel_tol=1e-11, abs_tol=1e-6):
-                print(f"  [{label}] FAIL: equity curve diverges at index {i} ({ts_a}): "
-                      f"{eq_a} vs {eq_b}")
-                ok = False
-                break
-        else:
-            if worst[0] > 1e-6:
-                print(f"  [{label}] note: equity curve max abs diff {worst[0]:.3e} "
-                      f"(relative {worst[1]:.3e}) — 지표 반올림 누적")
-    # buy & hold 기준선은 종가에서만 유도되므로 사실상 회귀 가드 — 두 경로가 같은 이벤트 구간을
-    # 잘라냈는지까지 확인한다.
-    if len(ref_report.benchmark_curve) != len(fast_report.benchmark_curve):
-        print(f"  [{label}] FAIL: benchmark curve length "
-              f"{len(ref_report.benchmark_curve)} != {len(fast_report.benchmark_curve)}")
-        ok = False
-    else:
-        for (ts_a, eq_a), (ts_b, eq_b) in zip(ref_report.benchmark_curve, fast_report.benchmark_curve):
-            if ts_a != ts_b or not math.isclose(eq_a, eq_b, rel_tol=1e-12, abs_tol=1e-6):
-                print(f"  [{label}] FAIL: benchmark curve differs at {ts_a}: {eq_a} vs {eq_b}")
-                ok = False
-                break
-    return ok
 
 
 # ============================================================ 1. 캔들 공급자
@@ -992,27 +921,32 @@ class ReplayProducer(CandleProducer):
             yield Event(end_time, {symbol: candle})
 
 
-def _assemble(streamer, producer, slippage_ratio, log_label=""):
-    """부품을 조립해 엔진을 만든다. 백테스트와 드라이런의 **차이는 공급자뿐**이다.
+def _parts(streamer, slippage_ratio, interval_ms, log_label=""):
+    """백테스트와 드라이런이 공유하는 부품. 이제 **차이는 엔진뿐**이다.
 
-    ``on_trade``는 엔진 생성자가 레코더로 이어 준다.
+    ``on_trade``는 엔진 생성자가 레코더로 이어 준다 — 양쪽 엔진 모두.
     """
     executor = SimulatedExecutor(
         INIT_MARGIN, slippage_ratio=(slippage_ratio or 0.0), log_label=log_label)
-    recorder = BacktestRecorder(streamer, executor.status, interval_ms=producer.interval_ms)
-    return TradingEngine(streamer, producer, executor, recorder)
+    recorder = BacktestRecorder(streamer, executor.status, interval_ms=interval_ms)
+    return executor, recorder
 
 
 async def run_dry(streamer, candles_by_symbol, interval_ms, slippage_ratio=None):
-    """``BinanceTrader``의 드라이런과 **같은 부품 구성**으로 돌린다."""
+    """``BinanceTrader``의 드라이런과 **같은 부품 구성**으로 돌린다 (라이브 엔진)."""
+    executor, recorder = _parts(streamer, slippage_ratio, interval_ms, "dry-run")
     producer = ReplayProducer(candles_by_symbol, interval_ms)
-    return await _assemble(streamer, producer, slippage_ratio, "dry-run").run_async()
+    return await TradingEngine(streamer, producer, executor, recorder).run_async()
 
 
-async def run_bt(streamer, candles_by_symbol, slippage_ratio=None):
-    """드라이런과 같은 조립, 공급자만 백테스트의 병합 타임라인이다."""
-    producer = InMemoryCandleProducer(candles_by_symbol, progress=False)
-    return await _assemble(streamer, producer, slippage_ratio).run_async()
+def run_bt(streamer, candles_by_symbol, slippage_ratio=None):
+    """같은 부품을 백테스트 엔진에 꽂는다 (지표는 기본값대로 미리 계산된다).
+
+    ``BacktestEngine.run()``은 완전히 동기라 이벤트 루프 안에서 그냥 불러도 된다.
+    """
+    executor, recorder = _parts(streamer, slippage_ratio, MIN)
+    return BacktestEngine(streamer, candles_by_symbol, executor, recorder,
+                          progress=False).run()
 
 
 async def check_dry_run_parity():
@@ -1038,7 +972,7 @@ async def check_dry_run_parity():
     ]
 
     for label, make_streamer, slippage in cases:
-        bt = await run_bt(make_streamer(), by_symbol, slippage)
+        bt = run_bt(make_streamer(), by_symbol, slippage)
         dry = await run_dry(make_streamer(), by_symbol, MIN, slippage)
         check(label, compare_reports(label, bt, dry),
               f"trades={len(bt.trades)} final={bt.status.total_margin():.2f}")

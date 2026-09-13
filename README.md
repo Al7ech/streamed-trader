@@ -113,12 +113,20 @@ Point `core/examples/backtest.py` at your class and run it.
 and `get_index()`. That is all you need for correctness everywhere.
 
 An indicator can additionally implement `precompute_series(open, high, low, close, volume)`,
-returning the whole series as a numpy array (element *i* = `get_latest()` after *i+1* updates, NaN
-during warm-up). A vectorized backtest path detects the method by attribute presence
+returning the whole series as a float64 numpy array (element *i* = `get_latest()` after *i+1*
+updates, NaN during warm-up). `BacktestEngine` detects the method by attribute presence
 (`getattr(indicator, "precompute_series", None)`) and computes those in one shot instead of
-looping. That path is currently removed pending reintroduction on the new candle-producer
-structure, but the method is kept — and `update()` must still work regardless, since the live
-trader has no future to precompute.
+looping, replaying the values into the indicator's own output buffer via its pair
+`NumericIndicator.precomputed_sink()`. `update()` must still work regardless — the live trader has
+no future to precompute.
+
+**The precomputed values must be bit-identical to what `update()` would produce**, not merely
+close. A fast rolling helper that sums in a different order diverges by ~1e-14 relative, which over
+millions of candles flips threshold comparisons and — for a stop whose trigger *is* an indicator
+value — lands in the fill price. `core/streamer/indicator/vector_ops.py` has helpers that unfold
+each loop recurrence exactly (`np.cumsum` is a strict sequential fold, so it rounds like a Python
+loop), and `core/checks/backtest_check.py` asserts the equality per indicator. Add
+`precompute_series` to a new indicator and add it to that check too.
 
 An indicator that reads `status` **cannot** be precomputed this way: account state depends on the
 trades the strategy makes, which is a feedback loop. Keep those as plain `BaseIndicator` without
@@ -162,21 +170,23 @@ the resulting numbers as a smoke test, not as evidence.
 
 ## Backtesting
 
-A backtest is the four engine parts assembled and handed to `TradingEngine`:
+A backtest is the four parts assembled and handed to `BacktestEngine`:
 
 ```python
-from core.executor.simulated import DEFAULT_INIT_MARGIN
-from core.producer.historical import BinanceHistoricalCandleProducer
+import asyncio
+from core.engine.backtest import BacktestEngine
+from core.executor.simulated import DEFAULT_INIT_MARGIN, SimulatedExecutor
+from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
+from core.history.fetcher import FetcherCandleHistory
 from core.recorder.backtest import BacktestRecorder
-from core.executor.simulated import SimulatedExecutor
-from core.engine.engine import TradingEngine
 
-producer = BinanceHistoricalCandleProducer(
-    start_time=start, end_time=end, symbols=["ETHUSDT"], interval="1m")
+history = FetcherCandleHistory(BinanceVisionFetcher(compress=False), "1m", use_cache=True)
+candles_by_symbol = asyncio.run(history.fetch(["ETHUSDT"], start, end))
+
 executor = SimulatedExecutor(DEFAULT_INIT_MARGIN, fee_ratio=0.0004)
-recorder = BacktestRecorder(streamer, executor.status, interval_ms=producer.interval_ms,
+recorder = BacktestRecorder(streamer, executor.status, interval_ms=60_000,
                             metadata={...}, save_series=True)
-report = TradingEngine(streamer, producer, executor, recorder).run()
+report = BacktestEngine(streamer, candles_by_symbol, executor, recorder).run()
 ```
 
 The executor writes `fee_ratio` into the `Status` it builds, so the fee accounting
@@ -184,12 +194,13 @@ The executor writes `fee_ratio` into the `Status` it builds, so the fee accounti
 position sizing (`status.fee_ratio`) always read one value. `slippage_ratio` is a `SimulatedExecutor` argument only — it is a simulation modelling knob,
 not account state, and no strategy sizes with it.
 
-The candle source is either `BinanceHistoricalCandleProducer` (fetches the `[start, end)` range
-itself via `BinanceVisionFetcher` and merges) or `InMemoryCandleProducer(candles_by_symbol)` — a
-`Dict[str, List[Candle]]` you built yourself (used by the check scripts and non-Binance sources).
-Everything else — wiring the fill sink, driving the loop, finishing the recorder — is the
-engine's; `run()` returns the `Report`. A backtest does not warm indicators up separately: its
-first `window` events are the warm-up, and indicators read NaN through them.
+The candle source is a plain `Dict[str, List[Candle]]` — one ragged list per symbol, which the
+engine merges into a single chronological event stream. The shipped entry point gets it from the
+`CandleHistory` port, the same query the live trader's warm-up and gap backfill use; a check script
+or a non-Binance source just passes candles it already has. Everything else — precomputing the
+vectorizable indicators, wiring the fill sink, driving the loop, finishing the recorder — is the
+engine's; `run()` returns the `Report` and opens no event loop. A backtest does not warm indicators
+up separately: its first `window` events are the warm-up, and indicators read NaN through them.
 
 `Report` gives you `trades`, `max_leverage`, the final `Status` and the equity curve. Giving the
 recorder `metadata` writes `asset/backtest/<run_id>.json` (summary, Sharpe, max drawdown, trade
@@ -198,22 +209,26 @@ with per-candle OHLC and indicator values, which the frontend loads lazily per v
 
 ```bash
 uv run python core/checks/live_check.py            # live path + dry-run == backtest
+uv run python core/checks/backtest_check.py        # vectorized indicators == loop
 ```
 
-The engine also force-liquidates every position when mark-to-market equity falls to zero or below,
-so blown-up strategies show up as blow-ups rather than as impossible recoveries.
+The executor also force-liquidates every position when mark-to-market equity falls to zero or
+below, so blown-up strategies show up as blow-ups rather than as impossible recoveries.
 
-Backtesting and live trading are the same code path: both assemble `core/engine/`'s `TradingEngine`
-and differ only in which candle source, executor and recorder are plugged into it. A dry run uses
-the *backtest's* executor, so it produces exactly the trades a backtest of the same candles would.
+Backtesting and live trading share one order-of-operations, held by two engines in `core/engine/`:
+`TradingEngine` drives dry run and live off a candle stream, `BacktestEngine` drives a backtest off
+candles already in memory — which is what lets it precompute indicators instead of updating them
+bar by bar. Both use the same `SimulatedExecutor` in a dry run / backtest, and `live_check.py`
+asserts the two produce exactly the same trades on the same candles. That check is the contract
+that keeps them from drifting.
 
 ## Data sources
 
 - **`BinanceVisionFetcher`** (default) — bulk-downloads monthly/daily zips from
   data.binance.vision. Fast for long histories.
 - **`BinanceCandleFetcher`** — the REST klines API in ≤1500-candle pages. Used by the live trader
-  to prefeed indicators (through a `BinanceHistoricalCandleProducer` with `use_cache=False`, so the
-  warm-up asks for exactly the bars it needs instead of the whole month chunk).
+  to prefeed indicators (through a `FetcherCandleHistory` with `use_cache=False`, so the warm-up
+  asks for exactly the bars it needs instead of the whole month chunk).
 - **`MassiveStockFetcher`** — US equity minute bars from Massive (formerly Polygon.io), needs
   `MASSIVE_API_KEY`. Session-aware: `nyse_session` builds the NYSE trading-hours grid so a
   1200-candle window means the same wall-clock span on every symbol instead of silently spanning

@@ -2,11 +2,11 @@ from collections import deque
 from typing import Optional
 
 import numpy as np
-import pandas as pd
 
 from core.candle.candle import Candle
 from core.account.status import Status
 from core.streamer.indicator.base_indicator import NumericIndicator
+from core.streamer.indicator.vector_ops import rolling_mean_exact, true_range
 
 
 class ATRIndicator(NumericIndicator):
@@ -48,16 +48,6 @@ class ATRIndicator(NumericIndicator):
 
     def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
                           close: np.ndarray, volume: np.ndarray) -> np.ndarray:
-        # pandas' rolling mean sums in a different order than the incremental `_sum` above,
-        # so values can differ from the loop path by ~1e-13 relative (rounding only).
-        if len(close) == 0:
-            # 빈 슬라이스에서 아래 [0] 인덱싱이 IndexError를 낸다. reference는 빈 Report를
-            # 정상 반환하므로 여기서도 조용히 비워서 동작을 맞춘다.
-            return np.empty(0, dtype=np.float64)
-        prev_close = np.empty_like(close)
-        prev_close[0] = np.nan
-        prev_close[1:] = close[:-1]
-        tr = np.maximum(high - low,
-                        np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
-        tr[0] = high[0] - low[0]  # first candle has no previous close
-        return pd.Series(tr).rolling(self.window).mean().to_numpy()
+        # TR 계산도 위 update()와 같은 식이고, 그 위의 롤링 평균도 같은 증분 합산을 펼친
+        # 것이라 전 구간이 비트 단위로 같다 (vector_ops 참고).
+        return rolling_mean_exact(true_range(high, low, close), self.window)

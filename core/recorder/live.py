@@ -149,12 +149,7 @@ class LiveRecorder(Recorder):
         for s in self.symbols:
             self._closes_by_symbol[s].append(self._latest_close.get(s))
 
-        symbol_data = {
-            symbol: (candle, {name: ind.get_latest() for name, ind
-                              in self._streamer.indicators.get(symbol, {}).items()})
-            for symbol, candle in candles.items()
-        }
-        self._shard_writer.add(event_time, equity, symbol_data)
+        self._shard_writer.add(event_time, equity, candles)
         self._candles_since_shard_flush += 1
 
     def record_trade(self, trade: Trade) -> None:
@@ -221,8 +216,8 @@ class LiveRecorder(Recorder):
     # ------------------------------------------------------------------ 내부
 
     def _new_shard_writer(self) -> ShardWriter:
-        return ShardWriter(self.dir_path, self.run_id, self.symbols, self._indicator_names,
-                           self._has_ohlc, self._interval_ms)
+        return ShardWriter(self.dir_path, self.run_id, self.symbols, self._streamer.indicators,
+                           self._indicator_names, self._has_ohlc, self._interval_ms)
 
     def _run_json_path(self, run_id: str) -> str:
         return os.path.join(self.dir_path, f"{run_id}.json")
@@ -294,6 +289,7 @@ class LiveRecorder(Recorder):
         shards = series.get("shards") or []
         self._restore_curves(shards)
         self._shard_writer = ShardWriter.resume(self.dir_path, self.run_id, self.symbols,
+                                                self._streamer.indicators,
                                                 self._indicator_names, self._has_ohlc,
                                                 self._interval_ms, shards)
 

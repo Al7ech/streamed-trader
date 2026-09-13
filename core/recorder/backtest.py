@@ -69,7 +69,8 @@ class BacktestRecorder(Recorder):
         self._shard_writer: Optional[ShardWriter] = None
         if metadata is not None and save_series:
             self._shard_writer = ShardWriter(self._dir, self.run_id, self.symbols,
-                                             self._indicator_names, has_ohlc, interval_ms)
+                                             streamer.indicators, self._indicator_names,
+                                             has_ohlc, interval_ms)
         self._report: Optional[Report] = None
         self._closed = False
 
@@ -84,12 +85,7 @@ class BacktestRecorder(Recorder):
         self.event_count += 1
 
         if self._shard_writer is not None:
-            symbol_data = {
-                symbol: (candle, {name: ind.get_latest() for name, ind
-                                  in self._streamer.indicators.get(symbol, {}).items()})
-                for symbol, candle in candles.items()
-            }
-            self._shard_writer.add(event_time, equity, symbol_data)
+            self._shard_writer.add(event_time, equity, candles)
 
     def record_trade(self, trade: Trade) -> None:
         self.trades.append(trade)

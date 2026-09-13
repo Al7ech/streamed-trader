@@ -1,28 +1,34 @@
+import asyncio
 import sys
 from datetime import datetime, timezone
 
-from core.executor.simulated import DEFAULT_INIT_MARGIN
-from core.producer.historical import BinanceHistoricalCandleProducer
-from core.recorder.backtest import BacktestRecorder
-from core.executor.simulated import SimulatedExecutor
-from core.engine.engine import TradingEngine
+from core.engine.backtest import BacktestEngine
+from core.executor.simulated import DEFAULT_INIT_MARGIN, SimulatedExecutor
+from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
+from core.history.fetcher import FetcherCandleHistory
 from core.logging_config import setup_logging
+from core.recorder.backtest import BacktestRecorder
 from core.streamer.strategies.keltner_streamer import KeltnerStreamer
+from core.utils import interval_to_minutes
 
 if __name__ == "__main__":
     # 0. 로깅 설정. 이게 없으면 페처/백테스터의 경고가 lastResort 핸들러로 빠져
     #    레벨명 없는 맨 줄로 tqdm 진행바 사이에 섞인다 (월 청크 데이터 구멍 경고 등).
     setup_logging()
 
-    # 1. 캔들 공급자 생성. producer가 내부에서 data.binance.vision에서 구간을 받아
-    #    asset/candle/ 에 캐시하고 병합까지 한다 (없는 달만 새로 받는다).
     symbol = "ETHUSDT"
     start_date = datetime(2026, 1, 1, tzinfo=timezone.utc)
     end_date = datetime(2026, 7, 10, tzinfo=timezone.utc)
     interval = "1m"
+    # 캔들에서 재지 않고 interval 문자열에서 확정한다 — 캔들이 0~1개인 짧은 구간에서도
+    # 샤드 메타와 Sharpe 리샘플링 주기가 올바르다.
+    interval_ms = interval_to_minutes(interval) * 60_000
 
-    producer = BinanceHistoricalCandleProducer(
-        start_time=start_date, end_time=end_date, symbols=[symbol], interval=interval)
+    # 1. 캔들을 메모리에 올린다. 워밍업/구멍 백필이 쓰는 **바로 그 조회 포트**다 —
+    #    data.binance.vision 벌크 덤프를 asset/candle/ 에 월 청크로 캐시한다 (없는 달만 새로
+    #    받는다). 백테스트 엔진은 완전히 동기라, 이벤트 루프는 이 한 줄에서만 열린다.
+    history = FetcherCandleHistory(BinanceVisionFetcher(compress=False), interval, use_cache=True)
+    candles_by_symbol = asyncio.run(history.fetch([symbol], start_date, end_date))
 
     # 2. 전략 생성 — 다른 전략을 돌리려면 여기만 바꾸면 된다 (streamer/strategies/ 참고)
     #    max_loss는 스탑 거리에서의 손실 한도이자 사실상 레버리지 손잡이다. 0.08처럼 크게
@@ -32,8 +38,8 @@ if __name__ == "__main__":
     params = dict(window=72 * 60, m_entry=4.0, m_exit=3.0, max_loss=0.005)
     streamer = KeltnerStreamer(symbols=[symbol], **params)
 
-    # 3. 나머지 부품 조립 후 실행. 엔진에 넘기는 것은 스트리머/공급자/실행기/레코더 넷뿐이고,
-    #    순서 규약과 실행·마무리는 전부 엔진이 갖는다.
+    # 3. 나머지 부품 조립 후 실행. 엔진에 넘기는 것은 스트리머/캔들/실행기/레코더 넷뿐이고,
+    #    지표 선계산과 순서 규약, 마무리는 전부 엔진이 갖는다.
     init_margin = DEFAULT_INIT_MARGIN
     metadata = {
         "symbols": [symbol],
@@ -52,9 +58,11 @@ if __name__ == "__main__":
     executor = SimulatedExecutor(init_margin)
     metadata["fee_ratio"] = executor.status.fee_ratio
     # metadata를 주면 런 JSON을, save_series까지 주면 시계열 샤드도 asset/backtest/ 에 쓴다.
-    recorder = BacktestRecorder(streamer, executor.status, interval_ms=producer.interval_ms,
+    recorder = BacktestRecorder(streamer, executor.status, interval_ms=interval_ms,
                                 metadata=metadata, save_series=True)
-    report = TradingEngine(streamer, producer, executor, recorder).run()
+    # vectorize=False를 주면 지표를 캔들마다 update()로 돌린다 (결과는 비트 단위로 같다 —
+    # core/checks/backtest_check.py 참고). 새 지표의 precompute_series를 의심할 때 쓴다.
+    report = BacktestEngine(streamer, candles_by_symbol, executor, recorder).run()
 
     # 4. 결과 출력
     print(f"Max Leverage: {report.max_leverage}")

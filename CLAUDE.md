@@ -7,19 +7,22 @@ repository.
 
 An algorithmic trading system for Binance USD-M Futures with two independent halves:
 
-- `core/` — Python engine. Backtesting and live trading are **one domain**: a single trading
-  engine (`core/engine/`) holds the order-of-operations, and backtest / dry run / live differ only
-  in which candle source, executor and recorder are plugged into it (see "The trading engine"
-  below). Around that: historical candle fetching, a pluggable, cross-symbol-aware
-  streamer/indicator strategy framework with market, limit and conditional (stop/take-profit)
-  orders, and an asyncio live trader (see "Live trading").
+- `core/` — Python engine. Backtesting and live trading are **one domain with one
+  order-of-operations**, but two engines hold it (`core/engine/`): `engine.py`'s `TradingEngine`
+  drives dry run and live off a candle *stream*, and `backtest.py`'s `BacktestEngine` drives a
+  backtest off candles already in memory — which is what lets it precompute vectorizable
+  indicators instead of updating them candle by candle (see "The trading engine" below). That the
+  two agree is asserted, not assumed: `live_check.py`'s dry-run parity is the executable contract.
+  Around that: historical candle fetching, a pluggable, cross-symbol-aware streamer/indicator
+  strategy framework with market, limit and conditional (stop/take-profit) orders, and an asyncio
+  live trader (see "Live trading").
 - `visualise/` — a Create React App frontend that reads the JSON files the backtester writes and
   renders them with `lightweight-charts`. It has no backend of its own; the user picks the `asset/`
   directory with the File System Access API and everything is parsed client-side. **Does not yet
   render multi-symbol runs** — see "Backtest output format" below.
 
 There is no automated test suite (no `pytest`/`unittest` files in `core/`, only the default CRA
-`react-scripts test` in `visualise/`). The de-facto correctness check is:
+`react-scripts test` in `visualise/`). The de-facto correctness checks are two scripts:
 
 - `core/checks/live_check.py` — covers the live path (it needs a socket and an exchange, so it fakes
   both) and asserts the engine's continuity/backfill rules over a faked live producer (duplicate
@@ -32,9 +35,16 @@ There is no automated test suite (no `pytest`/`unittest` files in `core/`, only 
   live executor's
   account/fill handling, and that **a dry run produces exactly the trades a backtest of the same
   candles does** (over Keltner, a stateful mean-reversion strategy, and toy limit/stop-ladder
-  fixtures). The vectorized backtest path and its `backtest_fast_check.py` parity harness were
-  removed pending reintroduction on the current producer structure — the backtest now has a
-  single reference path.
+  fixtures). Since the backtest now runs on its own engine, that last section is what proves the
+  two copies of the order-of-operations have not drifted — change a step in either
+  `TradingEngine.process_event` or `BacktestEngine._loop` and it fails.
+- `core/checks/backtest_check.py` — covers the backtest engine's own claim: that precomputing an
+  indicator gives **bit-identical** values to looping `update()`. Section 1 asserts that per
+  indicator across window/length edge cases and then replays the values through
+  `precomputed_sink()`, comparing `read(idx)` at every negative index; sections 2-3 compare whole
+  `Report`s from `vectorize=True` vs `False` over real candles (including a ragged two-symbol run,
+  the only multi-symbol backtest coverage in the repo); section 4 covers degenerate inputs.
+  Run it offline (`--offline`) to skip the sections that need the candle cache.
 
 ## Commands
 
@@ -51,6 +61,7 @@ uv sync
 uv run python core/examples/backtest.py              # backtest over a hardcoded date range/symbol/strategy
 uv run python core/examples/backtest.py "label"       # optional one-line experiment label stored in the run JSON
 uv run python core/checks/live_check.py                      # live path: producer, executor, dry-run == backtest
+uv run python core/checks/backtest_check.py                  # backtest engine: vectorized indicators == loop
 uv run python core/checks/fetch_stock_check.py               # US equity fetcher smoke test (needs MASSIVE_API_KEY)
 uv run streamed-trader                                # live/dry-run trader using .env configuration
 ```
@@ -110,22 +121,23 @@ launched with cwd = `core/`.
 
 ### Package layout — the dependency direction is the point
 
-Packages are organised **by object/concept**: each of the three engine ports (candle supply,
-execution, recording) is a package holding its ABC (`base.py`) *and* both implementations
-(backtest + live) side by side, because backtest / dry run / live are one domain that differs only
-in which part is plugged in. `history/` is the same shape but not a part of a run: it is a query the
-engine calls (see "Warm-up and gap backfill are one query" below).
+Packages are organised **by object/concept**: `executor/` and `recorder/` each hold their ABC
+(`base.py`) *and* both implementations (backtest + live) side by side, because backtest / dry run /
+live are one domain that differs only in which part is plugged in. `producer/` has the same shape
+but is now effectively live-only — the backtest engine takes `Dict[str, List[Candle]]` directly and
+never goes through a producer. `history/` is a port too but not a part of a run: it is a query the
+engine (and the backtest entry point) calls — see "Warm-up and gap backfill are one query" below.
 
 ```
 core/
-  candle/     Candle                                     (candle.py)
+  candle/     Candle (candle.py) + merge.py (merge_by_end_time — the event timeline)
   order/      Action/ActionType (action.py) + order_book.py (resting book + fill rules)
   account/    Status/PositionState (status.py), Trade (trade.py), Report (report.py)
-  streamer/   BaseStreamer + indicator/ + strategies/ (the example strategies)
+  streamer/   BaseStreamer + indicator/ (+ vector_ops.py) + strategies/ (the example strategies)
   fetcher/    BaseCandleFetcher + pickle cache; binance/ and stock/ under it
-  engine/     TradingEngine only (engine.py) — the order-of-operations, nothing else
-  producer/   base.py = CandleProducer ABC + Event; in_memory.py, historical.py, live.py,
-              reliable_websocket.py
+  engine/     the order-of-operations, nothing else: engine.py (TradingEngine — dry run/live),
+              backtest.py (BacktestEngine — backtest)
+  producer/   base.py = CandleProducer ABC + Event; live.py, reliable_websocket.py, in_memory.py
   history/    base.py = CandleHistory ABC (past-range query port); fetcher.py
               (adapts any BaseCandleFetcher — no exchange-specific code here)
   executor/   base.py = Executor ABC; simulated.py (+ DEFAULT_INIT_MARGIN, apply_fill), live.py,
@@ -134,7 +146,8 @@ core/
   result/     writer.py (run JSON + shards), metrics.py, indicator_columns.py
   trader/     BinanceTrader (trader.py) — live/dry-run assembly + lifecycle; ServerClock
               (server_clock.py) — exchange time for warm-up end + decision deadline; README.md here
-  checks/     live_check.py, fetch_stock_check.py
+  checks/     live_check.py, backtest_check.py, compare.py (shared Report comparator),
+              fetch_stock_check.py
   examples/   backtest.py, trader.py
   utils/      timestamp/rounding helpers, logging_config.py alongside
 ```
@@ -143,7 +156,7 @@ core/
 utils ← candle ← order ← account
               ← producer/base, executor/base, recorder/base, history/base  (the port ABCs)
               ← streamer ← result
-      engine ← {producer,executor,recorder,history}/base, account, order, streamer
+      engine ← {producer,executor,recorder,history}/base, candle/merge, account, order, streamer
       {producer,executor,recorder,history} impls ← their own base, account, order, candle,
                                                     fetcher, result
       trader ← engine, producer, executor, recorder, history, account, fetcher, streamer
@@ -160,12 +173,13 @@ Rules that hold this together — a change that breaks one is a design change, n
   `order/order_book.py` uses `core.account.status.Status` at runtime and `account/status.py`
   type-hints `OpenOrder` under `TYPE_CHECKING` only — both always reference the **submodule path**,
   never the package attribute, or the partially-initialised-package cycle resurfaces.
-- **`engine/` holds only `TradingEngine`.** The port ABCs live in
+- **`engine/` holds only engines** — the order-of-operations, now in two loops (`engine.py` for
+  dry run/live, `backtest.py` for backtest). The port ABCs live in
   `producer/base.py` / `executor/base.py` / `recorder/base.py` / `history/base.py` next to their
-  implementations;
-  `engine/engine.py` imports those `base` modules and no implementation. `TradingEngine` wires the
-  parts and runs them but never *constructs* them — the caller does (`core/examples/backtest.py`,
-  `core/trader/trader.py`) — which is what keeps `engine → port` one-directional.
+  implementations; both engines import those `base` modules (plus `candle/merge`, which is pure
+  vocabulary) and **no implementation**. They wire the parts and run them but never *construct*
+  them — the caller does (`core/examples/backtest.py`, `core/trader/trader.py`) — which is what
+  keeps `engine → port` one-directional.
 - **`trader/` importing both `executor.simulated` and `executor.live` is the point of the split.**
   Dry run uses `SimulatedExecutor` — the backtest's own class, not a copy — so the two live in one
   `executor/` package and the old "`live/` imports `backtest/` backwards" edge is gone.
@@ -225,18 +239,26 @@ imports it (the engine, recorders and `indicator_columns` reach indicators only 
    range, so a 200-candle warm-up started late in a month would pull the whole month to date
    (~40k 1m candles) before the trader could open a socket.
 
-3. **Backtest.** There is no `run_backtest` function any more — a backtest *is* the four engine
-   parts assembled by the caller (`core/examples/backtest.py` is the reference; see "The trading
-   engine" below):
+3. **Backtest.** There is no `run_backtest` function any more — a backtest *is* the four parts
+   assembled by the caller and handed to `BacktestEngine` (`core/examples/backtest.py` is the
+   reference; see "The backtest engine" below):
 
    ```python
+   # 캔들은 워밍업/백필과 같은 조회 포트에서 온다. 엔진은 완전히 동기라 여기서만 루프를 연다.
+   history = FetcherCandleHistory(BinanceVisionFetcher(compress=False), interval, use_cache=True)
+   candles_by_symbol = asyncio.run(history.fetch([symbol], start_date, end_date))
+
    # DEFAULT_INIT_MARGIN lives in core.executor.simulated; the executor builds and owns the Status.
    # fee_ratio omitted → Status stamps DEFAULT_FEE_RATIO; pass a float to override.
    executor = SimulatedExecutor(DEFAULT_INIT_MARGIN)
-   recorder = BacktestRecorder(streamer, executor.status, interval_ms=producer.interval_ms,
+   recorder = BacktestRecorder(streamer, executor.status, interval_ms=interval_ms,
                                metadata=metadata, save_series=True)
-   report   = TradingEngine(streamer, producer, executor, recorder).run()
+   report   = BacktestEngine(streamer, candles_by_symbol, executor, recorder).run()
    ```
+
+   `interval_ms` comes from the interval string (`interval_to_minutes(interval) * 60_000`), not
+   from measuring the data — that stays correct for a symbol with 0 or 1 candles, where measuring
+   would yield `0` and silently degrade the Sharpe resample stride and the shard metadata.
 
    `fee_ratio` lives in exactly one place at runtime — `executor.status.fee_ratio` — and the sole
    default literal is `DEFAULT_FEE_RATIO` in `core/account/status.py`. `SimulatedExecutor.__init__`
@@ -251,61 +273,65 @@ imports it (the engine, recorders and `indicator_columns` reach indicators only 
    back off the Status, never a separate literal). `slippage_ratio` stays a `SimulatedExecutor`
    argument only (a simulation modelling knob, not account state; no strategy sizes with it).
 
-   It is multi-symbol. The candle source is one of:
-   - `InMemoryCandleProducer(candles_by_symbol)` (`producer/in_memory.py`) —
-     `Dict[str, List[Candle]]`, one ragged list per symbol (symbols don't need to start/end at the
-     same time), merged by its own `merge_by_end_time` (same module — same `end_time` is one
-     event) into one chronological stream of **events**. Used by the check scripts and
-     non-Binance sources.
-   - `BinanceHistoricalCandleProducer` (`producer/historical.py`) for a `[start, end)` range —
-     what `core/examples/backtest.py` uses. It fetches nothing itself: it wraps a `CandleHistory`
-     (`core/history/`, see "Warm-up and gap backfill are one query" below), asks it for the range
-     on **first iteration**, and hands the result to an `InMemoryCandleProducer` for the merge, so
-     it is a thin seam between the two. Defaults are backtest-shaped — `BinanceVisionFetcher`
-     (injectable) and the month-chunk pkl cache on (`use_cache=False` bypasses it). Its range is
-     fixed at construction, which is exactly what a backtest wants and exactly what warm-up and gap
-     backfill can't use — those ranges are only known at runtime, so they call the same
-     `CandleHistory` directly. Fetching on first iteration rather than in `__init__` is what lets
-     both paths share one (async) query: `interval_ms` comes from the interval string, so it is
-     still readable before the run starts.
+   It is multi-symbol. The candle source is a plain `Dict[str, List[Candle]]` — one ragged list per
+   symbol (symbols don't need to start or end at the same time), which `BacktestEngine` merges with
+   `merge_by_end_time` (`core/candle/merge.py` — same `end_time` is one event) into one
+   chronological stream of **events**. There is no producer in the backtest path any more: a
+   `CandleProducer` is a stream you consume once, and streaming is exactly what prevents
+   precomputing indicators. Where the dict comes from is the caller's business — the shipped entry
+   point asks the `CandleHistory` port (`core/history/`, see "Warm-up and gap backfill are one
+   query" below) for the range, so "fetch Binance candles for a range" still exists exactly once
+   in the repo and warm-up, gap backfill and the backtest all go through it. A check script or a
+   non-Binance source just passes candles it already has.
 
    `BacktestRecorder` owns the output as well as the in-memory `Report`: give it `metadata` and it
    writes the run JSON on `close()` (which the engine calls at the end of the run), plus the
    time-series shards when `save_series=True`. Without `metadata` it is a pure in-memory run. The
-   `Report` comes back from `TradingEngine.run()` (it is `recorder.report`).
+   `Report` comes back from `BacktestEngine.run()` (it is `recorder.report`).
 
    An event bundles every symbol whose candle closes at that exact timestamp; the per-event
-   ordering is `TradingEngine.process_event`'s (see "The trading engine" below). Indicators are
-   loop-updated and equity is recorded per event — the single reference path. (A vectorized path
-   that precomputed `precompute_series` indicators with numpy and rebuilt equity in one shot was
-   removed pending reintroduction on this producer structure.)
+   ordering is `BacktestEngine._loop`'s, which mirrors `TradingEngine.process_event` (see "The
+   trading engine" below). Indicators that define `precompute_series` are computed for the whole
+   range up front and replayed; the rest are loop-updated. Equity is recorded per event.
 
 4. **Visualise.** `visualise/` reads the run JSON and shards client-side — it does not talk to
    Binance or the Python code at all.
 
 ### The trading engine (`core/engine/`)
 
-Backtest, dry run and live are **one domain**. The order-of-operations exists exactly once, in
-`engine/engine.py`; the three modes differ only in which parts are plugged in:
+Backtest, dry run and live are **one domain with one order-of-operations**, but that order lives in
+two loops — `TradingEngine._`s `process_event` (`engine/engine.py`, dry run + live) and
+`BacktestEngine._loop` (`engine/backtest.py`). What is plugged in:
 
-| | CandleProducer | Executor | Recorder |
+| | candles | Executor | Recorder |
 |---|---|---|---|
-| backtest | `producer.historical.BinanceHistoricalCandleProducer` / `producer.in_memory.InMemoryCandleProducer` | `executor.simulated.SimulatedExecutor` | `recorder.backtest.BacktestRecorder` |
+| backtest | `Dict[str, List[Candle]]` given to `BacktestEngine` directly | `executor.simulated.SimulatedExecutor` | `recorder.backtest.BacktestRecorder` |
 | dry run | `producer.live.LiveCandleProducer` | **`executor.simulated.SimulatedExecutor`** | `recorder.live.LiveRecorder` |
 | live | `producer.live.LiveCandleProducer` | `executor.live.LiveExecutor` | `recorder.live.LiveRecorder` |
 
-`core/engine/` holds only `TradingEngine`; each port's ABC and both implementations live together
-in `core/producer/`, `core/executor/`, `core/recorder/` (`base.py` = the ABC), and the engine
-imports only the `base` modules.
+`core/engine/` holds only engines; each port's ABC and both implementations live together
+in `core/producer/`, `core/executor/`, `core/recorder/` (`base.py` = the ABC), and the engines
+import only the `base` modules (plus `candle/merge`).
 
-**Assembling and running is the engine's job too.** The caller builds the four parts and hands them
-over — `TradingEngine(streamer, producer, executor, recorder, on_error=...)` — and the engine does
+**Assembling and running is the engine's job too.** The caller builds the parts and hands them
+over — `TradingEngine(streamer, producer, executor, recorder, on_error=...)` or
+`BacktestEngine(streamer, candles_by_symbol, executor, recorder)` — and the engine does
 the wiring (`executor.on_trade = recorder.record_trade`, `NullRecorder` when no recorder is given),
 the event loop, and the finish (`recorder.close()`), returning
-`recorder.report`. (Indicator warm-up is the engine's too, but as a separate call — see below.) That wiring used to be hand-repeated at each of the three entry points; the
+`recorder.report`. (Indicator warm-up is `TradingEngine`'s too, but as a separate call — see below.) That wiring used to be hand-repeated at each of the three entry points; the
 `on_trade` line alone existed in three places. Only *constructing* the parts stays with the caller,
 because those implementations live in the port packages — which is what keeps the engine from
 importing anything but the port `base` ABCs.
+
+**Why the backtest engine is separate — and what keeps the two honest.** Everything
+`TradingEngine` carries beyond the bare event steps (the `_last_start` continuity anchor, gap
+backfill, the decision deadline, `warmup()`, `on_error`, async iteration) rests on "the stream can
+drop and the clock keeps moving". A range already in memory has none of that. Dropping it buys the
+one thing a backtest can do and a live run cannot: compute each indicator's whole series up front.
+The cost is that the step order now exists twice, so `live_check.py` section 3 — dry run through
+`TradingEngine` vs the same candles through `BacktestEngine`, asserted equal trade-for-trade over
+five fixtures — stops being a nice-to-have and becomes the contract. Change a step in either loop
+and it fails.
 
 Dry run and backtest share the executor **class**, not merely equivalent code — which is why
 `core/trader/trader.py` imports `SimulatedExecutor` from `core/executor/simulated.py`. Dry run exists to be
@@ -313,17 +339,14 @@ compared against a backtest, so the fill rules, accounting and resting-order boo
 copy — before this, `_fill` and `_submit_book_action` were hand-copied into the live trader and
 kept in sync by attention alone.
 
-**The engine is fully synchronous.** `process_event` is a plain method — it hands each action to
-the executor and moves on, never waiting for a result. All three modes go through the single
-driver `run_async`, which iterates the producer with `async for` and routes any exception
-`process_event` raises to `on_error` (so one transient strategy bug can't kill a weeks-long
-process). `TradingEngine.run()` is the sync wrapper around it (`asyncio.run(...)`) for callers with
-no event loop, which is how a backtest stays a synchronous call — inside one, use `run_async`
-directly (that is what `live_check.py`'s parity harness does, and it no longer needs the
-`asyncio.to_thread` hop it used to). `InMemoryCandleProducer.__aiter__` (which the Binance
-subclass inherits) is an async generator that never `await`s anything, so no event loop scheduling
-actually happens on that path — only `async for`'s protocol cost (~100ns/event, measured <2% of
-`process_event`).
+**Both engines are fully synchronous in the step loop.** `process_event` is a plain method — it
+hands each action to the executor and moves on, never waiting for a result. Dry run and live go
+through the single driver `run_async`, which iterates the producer with `async for` and routes any
+exception `process_event` raises to `on_error` (so one transient strategy bug can't kill a
+weeks-long process). `TradingEngine.run()` is the sync wrapper around it (`asyncio.run(...)`) for
+callers with no event loop. `BacktestEngine.run()` opens no loop at all — there is nothing to await
+once the candles are in memory — so it can be called from inside an async function directly, which
+is what `live_check.py`'s parity harness does.
 Live order submission is fire-and-forget inside `LiveExecutor`: the old "confirm order N before
 sending N+1" guarantee is deliberately gone — live `status` is exchange truth (the user-data
 stream updates it out of band), so a dropped order self-heals on the next candle. The flip side is
@@ -333,7 +356,9 @@ implements `__aiter__` and nothing else is required of it — nothing else in th
 know sync from async. (`request_stop()` and a `fatal_reason` field are on the ABC too — the engine
 sets them to end a run on an unrecoverable gap; see "Indicator warm-up" below.)
 
-`process_event(event, *, decide=True, late=False)` — the contract every mode goes through. An `Event` is just
+`process_event(event, *, decide=True, late=False)` — the contract dry run and live go through
+(`BacktestEngine._loop` runs the same steps inline with neither parameter: a backtest is never late
+and never replays a bar that already went by). An `Event` is just
 `(time, candles)` and does **not** know whether it is a fresh bar or an already-past one — the
 engine judges that itself from a per-symbol continuity anchor (`_last_start`) and passes `decide`.
 `decide=False` means **this bar already went by** (a gap candle the engine backfilled — see
@@ -385,7 +410,10 @@ in a multi-symbol event where two symbols both fill resting orders the first fil
 The equity
 point comes from `record_event` reading `status.total_margin()` after `begin_event` and before
 MARKET submits (step 7), which is why a MARKET fill's state applies from the *next* event while a
-resting fill's applies from this one.
+resting fill's applies from this one. A symbol with no open orders at the start of the candle skips
+the `match_symbol`/`tick_expiry` calls entirely rather than calling into functions that would just
+no-op on an empty book — cheap on its own, but it runs once per symbol per event over a whole
+backtest, and most candles carry no resting order (see `docs/2609-backtest-profiling.md`).
 
 **Warm-up and gap backfill are one query: `CandleHistory` (`core/history/`).** A `CandleProducer`
 is a stream you consume once, and its range is fixed at construction. The two ranges the live path
@@ -393,12 +421,13 @@ actually needs are decided at runtime instead — how far back to warm up is kno
 starts, which candles are missing is known when a gap appears — so they are not a stream at all,
 they are a **query**. That is the fourth port: one method,
 `async fetch(symbols, start, end) -> Dict[str, List[Candle]]`. Notice what it returns: exactly what
-`InMemoryCandleProducer` takes, so a caller that wants events wraps it and a caller that only feeds
-indicators or counts candles (warm-up, backfill) does not have to wrap and then unwrap an `Event`.
-The engine holds exactly one (`TradingEngine(..., history=...)`) and both warm-up and backfill go
-through it, so the two can't silently diverge on where their candles come from — and so does the
-backtest producer, one layer up, which is why fetching Binance candles for a range exists once in
-the repo. `fetch` is async because the fetchers are blocking: `FetcherCandleHistory`
+`BacktestEngine` takes, so a caller that wants a whole run hands it straight over and a caller that
+only feeds indicators or counts candles (warm-up, backfill) does not have to wrap and then unwrap
+an `Event`.
+`TradingEngine` holds exactly one (`TradingEngine(..., history=...)`) and both warm-up and backfill
+go through it, so the two can't silently diverge on where their candles come from — and the
+backtest entry point calls the same `fetch` directly, which is why fetching Binance candles for a
+range exists once in the repo. `fetch` is async because the fetchers are blocking: `FetcherCandleHistory`
 (`history/fetcher.py`) wraps them in `asyncio.to_thread` itself rather than leaving every caller to
 remember (forgetting it in live blocks the loop and overflows the user-data queue). It also retries
 a symbol whose fetch raised (`retries=2`, backoff from `retry_delay_s=1.0`, doubling) before letting
@@ -410,7 +439,7 @@ the only implementation and holds **no exchange-specific code** — it takes any
 and binds the two things the engine has no business deciding: the interval, and whether to use the
 month-chunk cache. Live passes the REST fetcher with `use_cache=False` (Vision dumps lag a day, and
 the cache fetches on month boundaries, so a month-end start would pull ~40k candles before
-trading); the backtest producer passes Vision + cache. A stock fetcher plugs in unchanged.
+trading); the backtest entry point passes Vision + cache. A stock fetcher plugs in unchanged.
 
 **Indicator warm-up is a separate call.** `TradingEngine.warmup(end=None)` derives the range itself
 — `max(streamer.warmup_windows().values())` candles of `producer.interval_ms`, ending at `end` (or
@@ -450,16 +479,14 @@ double-feed indicators and re-run `decide_action` (**a second order**); a bar th
 sockets were connecting would leave every rolling-window indicator permanently diverged from the
 backtest. A misaligned boundary, a gap over `max_backfill_candles` (default 60), or a failed/short
 backfill fetch is fatal — the engine sets `producer.fatal_reason`, calls `producer.request_stop()`,
-and ends the run so a restart rebuilds the indicators. A backtest passes no `history`, so a
-jump in a ragged `InMemoryCandleProducer` series (staggered listing dates) is just data, not a gap
-(and `warmup()` raises rather than pretending it warmed up).
+and ends the run so a restart rebuilds the indicators. None of this exists in `BacktestEngine`:
+a jump in a ragged series (staggered listing dates, a hole in the data) is just data, not a gap.
 
 Only live calls `warmup()`, and it calls it *before opening any socket* (a long backfill would
 overflow python-binance's user-data queue), which is why it is not inside `run_async`. A backtest
 does not warm up at all: its first `window` events are the warm-up, indicators read NaN through
-them, and that NaN prefix is visible in the recorded series. Nothing stops a backtest from passing
-a `history` port and calling `warmup()` to start warm instead — the capability is free now — but
-no entry point does that today.
+them, and that NaN prefix is visible in the recorded series — on the vectorized path it is
+literally `precompute_series`' leading NaN run.
 
 **Fills flow through a sink, not a return value** (`executor.on_trade`). The simulated executor
 calls it synchronously right after `apply_fill`; the live executor calls it when
@@ -467,10 +494,71 @@ calls it synchronously right after `apply_fill`; the live executor calls it when
 of "when does a fill happen" is erased, and it is why the engine never sees a `Trade` at all.
 
 **Recorders read indicator values themselves** (off `streamer.indicators`) rather than receiving
-them, so a run that does not save series never pays for walking every indicator each event.
+them, so a run that does not save series never pays for walking every indicator each event. The
+read happens inside `ShardWriter`: it is handed `streamer.indicators` at construction and
+pre-binds `(indicator.get_latest, column.append)` pairs per symbol, rebinding whenever its buffer
+lists are recreated (month rollover, `resume`), so `add(time, balance, candles)` builds no
+per-event dict. Together with `NumericIndicator.get_latest`'s one-frame fast path and a cached
+month range in place of a per-event `strftime`, that cut a 1m 6.5-year ETH backtest with series
+from ~59.5s to ~45.5s (see `docs/2609-backtest-profiling.md`).
 
 Live never merges symbols — `LiveCandleProducer` yields one `{symbol: candle}` event per closed
 candle, and the `streamer.symbols` loop filters the rest out naturally.
+
+### The backtest engine (`core/engine/backtest.py`)
+
+`BacktestEngine(streamer, candles_by_symbol, executor, recorder, *, vectorize=True, progress=True)`.
+`run()` is three phases: check the symbols agree on a candle interval, precompute, loop, then
+`recorder.close()` (after the loop, not in a `finally` — a run that ended in an exception leaves no
+half-written artifacts) and return `recorder.report`.
+
+**Precompute.** Per symbol it builds O/H/L/C/V `np.ndarray`s once and splits that symbol's
+indicators in two: those defining **both** `precompute_series` and `precomputed_sink` get their
+whole series computed now, the rest stay loop-updated. Each precomputed indicator is stored as a
+pre-bound `(sink, values_iterator)` pair, so the loop pays one `next()` + one `deque.append` per
+indicator per event and no attribute lookup. It logs one INFO line per symbol naming how many went
+each way — a typo'd `precompute_series` that silently costs ten seconds should be visible in the
+run log. A series whose length differs from the candle count, or whose dtype is not `float64`,
+is a hard error: the first would silently slide every subsequent value onto the wrong bar.
+
+**The indicator objects are never swapped.** The precomputed values go into the indicator's own
+output deque through `NumericIndicator.precomputed_sink()`. An earlier (since removed) vectorized
+path replaced `streamer.indicators` with array-backed shims; that cannot work now, because
+`ShardWriter` pre-binds `indicator.get_latest` bound methods and holds the original dict at
+construction — the recorder is built before the engine, so a swap would silently record the
+un-advanced originals. Feeding in place also keeps `read`/`get_latest` a single implementation and
+leaves strategy-held references and extra APIs (`SupertrendIndicator.read_both()`) working.
+One value goes in per candle, warm-up NaN included; the loop path either appends nothing there
+(`MovingAverage`) or appends `None` (Donchian), so the deques can differ in length, but every
+`read(idx)` agrees because they are end-aligned and NaN, an absent slot and a past-retention read
+all surface the same way.
+
+**The loop** mirrors `TradingEngine.process_event` step for step (`begin_event` → indicators →
+`decide_action` → `record_event` → `submit` → `end_event`) minus what a backtest cannot have: no
+`decide`/`late` flags, no per-event DEBUG line (an `isEnabledFor` call 3.45M times for a log
+nobody reads), and indicator iteration follows the merge batch rather than `streamer.symbols`
+(indicators never read each other, and `status` is the same pre-trade snapshot either way). There
+is no separate per-symbol cursor: `merge_by_end_time` visits each symbol's candles in its own list
+order exactly once, so advancing that symbol's iterator *is* the cursor — which is what makes
+ragged and holed series safe.
+
+**Vectorized values are bit-identical to loop values, by construction.** That is not a tolerance
+claim. `precompute_series` implementations do not use a fast rolling helper that happens to be
+close; they unfold the exact recurrence their own `update()` runs
+(`core/streamer/indicator/vector_ops.py`), relying on `np.cumsum` being a strict sequential fold so
+it rounds like a Python loop. `rolling_mean_exact` interleaves `(-old, +new)` into a length-`2n`
+array whose cumsum reproduces `s = (s - old) + new` step for step; `rolling_std_exact` redoes the
+same whole-window `np.std(..., ddof=1)` the loop does, on a chunked sliding-window view; Donchian's
+rolling min/max were already exact because selecting an element involves no arithmetic. Before
+this, pandas' rolling mean disagreed with the incremental sum on ~95% of candles by up to ~5.6e-15
+relative, which over millions of candles flips threshold comparisons and — for a stop whose trigger
+*is* an indicator value — lands in `Trade.price`. Now `live_check`'s dry-run parity passes with no
+slack at all. `backtest_check.py` section 1 is what holds this: add `precompute_series` to a new
+indicator and add it there too.
+
+`vectorize=False` exists only as a debug switch (suspect a new `precompute_series`? run both and
+compare); it is not needed for correctness, and `backtest_check.py` section 2 asserts the two agree
+over real candles.
 
 ### Backtest output format (`core/result/writer.py`)
 
@@ -672,7 +760,7 @@ those check scripts default to WARNING.
   symbol's required warm-up length (its indicators' largest `window`) off that dict — the engine
   uses it to verify a warm-up actually warmed everything, the live trader to size the range it
   fetches. It exposes the abstract
-  `decide_action(candles, status) -> List[Action]`, called by all three engines **once per event**,
+  `decide_action(candles, status) -> List[Action]`, called by all three modes **once per event**,
   after every traded symbol's indicators are updated. `candles: Dict[str, Candle]` holds each
   symbol whose candle just closed this event mapped to that candle — live always has exactly one
   entry, a merged backtest event has one or more. `self.indicators` holds every traded symbol's
@@ -693,22 +781,27 @@ those check scripts default to WARNING.
   directly rather than only through `decide_action`).
   An indicator can additionally define
   `precompute_series(open, high, low, close, volume) -> np.ndarray` (element i = `get_latest()`
-  after i+1 updates, NaN during warm-up); a vectorized backtest path detects it by attribute
+  after i+1 updates, NaN during warm-up, dtype `float64`); `BacktestEngine` detects it by attribute
   presence (`getattr(indicator, "precompute_series", None)`, no separate class involved) and uses
-  it to compute each symbol's whole series at once (against that symbol's **own** OHLCV arrays).
-  That path is currently removed pending reintroduction on the new producer structure, but the
-  method is kept (and `update()` must still work for the live trader regardless). `MovingAverage`,
+  it to compute each symbol's whole series at once (against that symbol's **own** OHLCV arrays),
+  replaying the values through its pair `NumericIndicator.precomputed_sink()`. Both are needed to
+  vectorize, and `update()` must still work regardless — the live trader only has that.
+  **The contract is bit-identity, not closeness**: element i must be the exact float
+  `update()` would have produced, which is why these implementations unfold their own recurrence
+  through `core/streamer/indicator/vector_ops.py` instead of reaching for a fast rolling helper
+  (see "The backtest engine" above). `MovingAverage`,
   `MinDonchianIndicator`/`MaxDonchianIndicator` (monotonic-deque min/max over a window),
-  `ATRIndicator`, `RollingStd` and the `volume_stats` indicators define it; `ADXIndicator`,
-  `SupertrendIndicator`, `PivotTrendlineIndicator`, `TakerImbalanceIndicator` and
-  `PositionAgeIndicator` are path-dependent or status-aware and stay plain `BaseIndicator`s
-  without it (correct everywhere, just on the loop path). Both kinds mix freely within one
-  strategy.
+  `ATRIndicator`, `RollingStd` and the `volume_stats` indicators define it; `ADXIndicator`
+  (Wilder recursion), `SupertrendIndicator` (band ratchet), `PivotTrendlineIndicator` (delayed
+  pivot confirmation), `TakerImbalanceIndicator` (needs `taker_buy_volume`, which is not in the
+  o/h/l/c/v signature) and `PositionAgeIndicator` (reads `status`) stay plain `BaseIndicator`s
+  without it — correct everywhere, just on the loop path. Both kinds mix freely within one
+  strategy, and `backtest_check.py` section 2 covers a mixed set.
 - Each indicator's `scale_group` (default `"price"`) tells the frontend which chart pane to plot
   it on; indicators sharing a group share a pane and price scale (this grouping is keyed by
   indicator **name** only, shared across symbols).
-- **Ordering matters**: `TradingEngine.process_event` — the single loop backtest, dry run and live
-  all go through — updates **every** indicator for **every** symbol in the event with its closed
+- **Ordering matters**: `TradingEngine.process_event` (dry run, live) and `BacktestEngine._loop`
+  both advance **every** indicator for **every** symbol in the event with its closed
   candle *before* calling `streamer.decide_action(candles, status)` once for the event, so
   `get_latest()` includes the candle being decided on and `read(-2)` is the previous one, and
   a cross-symbol strategy sees every symbol's indicators already advanced to this event —
@@ -748,7 +841,7 @@ those check scripts default to WARNING.
   `reduce_only`, `client_id` and `expire_after_candles`. See "Resting orders" below.
 
   `Action.cancel(symbol, client_id=None)` is the cancel form (a `CANCEL`-typed action with
-  `quantity=0`; `client_id=None` cancels every resting order on that symbol). All three engines
+  `quantity=0`; `client_id=None` cancels every resting order on that symbol). All three modes
   dispatch on `order_type` **before** the `quantity == 0` skip, since a cancel carries no quantity.
   `client_id` is validated against Binance's `newClientOrderId` charset in `Action.__init__`, so an
   id that works in a backtest is guaranteed to work live.
@@ -833,11 +926,13 @@ Assumptions that a candle cannot verify, all deliberate:
   no such check.
 
 **Where matching sits in the event** is inside `SimulatedExecutor.begin_event`, at the top of
-`TradingEngine.process_event` (see "The trading engine" above) — ahead of `decide_action`, because
-on a real exchange a resting order fills before the bar closes. A consequence worth keeping in mind
-for any future vectorized equity rebuild: a MARKET fill happens *after* the equity point is
-recorded so its state applies from the next event index, while a resting fill happens *before* it
-so its state applies from this one.
+`TradingEngine.process_event` / `BacktestEngine._loop` (see "The trading engine" above) — ahead of
+`decide_action`, because on a real exchange a resting order fills before the bar closes.
+`BacktestEngine` vectorizes indicators but deliberately still records equity **per event**, because
+a MARKET fill happens *after* the equity point is recorded so its state applies from the next event
+index, while a resting fill happens *before* it so its state applies from this one. Any future
+attempt to rebuild the curve segment-wise after the loop has to reproduce that off-by-one-event
+behaviour exactly, and would fork `BacktestRecorder` in two to do it.
 
 Live never simulates any of this: `LiveExecutor.begin_event` only drops stale market decisions and
 never matches resting orders, and the exchange owns the book, hydrated at startup from

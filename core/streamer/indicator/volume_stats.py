@@ -2,11 +2,11 @@ from collections import deque
 from typing import Optional
 
 import numpy as np
-import pandas as pd
 
 from core.candle.candle import Candle
 from core.account.status import Status
 from core.streamer.indicator.base_indicator import NumericIndicator
+from core.streamer.indicator.vector_ops import rolling_mean_exact, rolling_std_exact
 
 
 class VolumeMovingAverage(NumericIndicator):
@@ -35,7 +35,8 @@ class VolumeMovingAverage(NumericIndicator):
 
     def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
                           close: np.ndarray, volume: np.ndarray) -> np.ndarray:
-        return pd.Series(volume).rolling(self.window).mean().to_numpy()
+        # 위 update()의 증분 합산을 그대로 펼친다 — 비트 단위로 같다 (vector_ops 참고).
+        return rolling_mean_exact(volume, self.window)
 
 
 class VolumeRollingStd(NumericIndicator):
@@ -64,4 +65,5 @@ class VolumeRollingStd(NumericIndicator):
 
     def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
                           close: np.ndarray, volume: np.ndarray) -> np.ndarray:
-        return pd.Series(volume).rolling(self.window).std().to_numpy()
+        # 위 update()와 같은 창 단위 np.std(ddof=1) — 비트 단위로 같다 (vector_ops 참고).
+        return rolling_std_exact(volume, self.window)

@@ -24,7 +24,9 @@ import numpy as np
 from boltons.fileutils import atomic_save
 
 from core.account.report import Report
+from core.candle.candle import Candle
 from core.result.metrics import compute_max_drawdown, compute_sharpe
+from core.streamer.indicator.base_indicator import BaseIndicator
 
 # 2: added the top-level "benchmark" block (buy & hold curve) + summary.benchmark_profit_pct.
 # 3: added trades[].position (거래 **전** 포지션). 라이브 런은 재기동 시 자기 run JSON을 다시
@@ -50,8 +52,13 @@ _OHLC_KEYS = ("open", "high", "low", "close")
 _logger = logging.getLogger(__name__)
 
 
-def _month_key(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m")
+def _month_range(ms: int) -> Tuple[str, int, int]:
+    """``ms``가 속한 UTC 달의 ``(키, 시작 ms, 끝 ms)`` — 구간은 ``[시작, 끝)``."""
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    start = datetime(dt.year, dt.month, 1, tzinfo=timezone.utc)
+    end = (datetime(dt.year + 1, 1, 1, tzinfo=timezone.utc) if dt.month == 12
+           else datetime(dt.year, dt.month + 1, 1, tzinfo=timezone.utc))
+    return start.strftime("%Y-%m"), int(start.timestamp()) * 1000, int(end.timestamp()) * 1000
 
 
 def _write_json(path: str, doc: Dict) -> None:
@@ -85,6 +92,11 @@ def read_shard(dir_path: str, file_name: str) -> Optional[Dict]:
         return None
 
 
+def _no_value() -> None:
+    """그 심볼에 없는 지표 컬럼의 getter — 컬럼 이름은 전 심볼 합집합이다."""
+    return None
+
+
 def _empty_symbol_buffer(indicator_names: List[str]) -> Dict:
     return {
         "ohlc": {k: [] for k in _OHLC_KEYS},
@@ -96,7 +108,7 @@ class ShardWriter:
     """Streams per-event OHLC + indicator values into month-bucketed columnar JSON shards.
 
     한 "이벤트"는 하나 이상의 심볼이 같은 시각에 마감한 캔들들의 묶음이다 (멀티심볼 병합
-    타임라인의 단위, :func:`core.producer.in_memory.merge_by_end_time` 참고).
+    타임라인의 단위, :func:`core.candle.merge.merge_by_end_time` 참고).
     이번 이벤트에 캔들이 없는 심볼은 그 행에서 OHLC/지표가 전부 null이 된다.
 
     Only the current month's columns are held in memory; a shard file is flushed whenever the
@@ -110,19 +122,37 @@ class ShardWriter:
     """
 
     def __init__(self, dir_path: str, run_id: str, symbols: List[str],
+                 indicators: Dict[str, Dict[str, BaseIndicator]],
                  indicator_names: List[str], has_ohlc: bool, interval_ms: int):
+        """
+        :param indicators: ``streamer.indicators`` 그 자체 (``{symbol: {name: indicator}}``).
+            :meth:`add`가 캔들이 마감한 심볼의 지표 값을 여기서 직접 읽는다.
+        :param indicator_names: 샤드 컬럼 = 전 심볼 지표 이름의 합집합
+            (:func:`~core.result.indicator_columns.collect_indicator_columns`). 어떤 심볼에
+            없는 이름은 그 심볼 컬럼에서 늘 null이다.
+        """
         self.dir_path = dir_path
         self.run_id = run_id
         self.symbols = symbols
+        self._indicators = indicators
         self.indicator_names = indicator_names
         self.has_ohlc = has_ohlc
         self.interval_ms = interval_ms
         self.shards: List[Dict] = []
         self._month: Optional[str] = None
+        #: 현재 달의 ``[시작, 끝)`` ms. :meth:`add`는 시각이 이 안이면 달 키를 다시 만들지
+        #: 않는다 — 이벤트마다 datetime 생성 + strftime을 하면 1m 6.5년 백테스트에서만 ~6초가
+        #: 들었다. 빈 구간(0, 0)이라 첫 :meth:`add`는 반드시 달을 새로 잡는다.
+        self._month_start = 0
+        self._month_end = 0
         self._reset_buffers()
 
+    def _set_month(self, time_ms: int) -> None:
+        self._month, self._month_start, self._month_end = _month_range(time_ms)
+
     @classmethod
-    def resume(cls, dir_path: str, run_id: str, symbols: List[str], indicator_names: List[str],
+    def resume(cls, dir_path: str, run_id: str, symbols: List[str],
+               indicators: Dict[str, Dict[str, BaseIndicator]], indicator_names: List[str],
                has_ohlc: bool, interval_ms: int, shards: List[Dict]) -> "ShardWriter":
         """이전 실행이 남긴 샤드 인덱스로 writer를 복원한다 (라이브 런 재개 전용).
 
@@ -130,7 +160,8 @@ class ShardWriter:
         달이 바뀌면 원본 그대로 flush한 뒤 새 달로 넘어간다. 마지막 샤드가 유실/손상이면
         그 달의 꼬리를 포기하고 (차트에 구멍이 남는다) 빈 버퍼로 이어간다.
         """
-        writer = cls(dir_path, run_id, symbols, indicator_names, has_ohlc, interval_ms)
+        writer = cls(dir_path, run_id, symbols, indicators, indicator_names, has_ohlc,
+                     interval_ms)
         if not shards:
             return writer
         writer.shards = list(shards[:-1])
@@ -142,7 +173,7 @@ class ShardWriter:
             return writer
         writer._time = list(shard["time"])
         n = len(writer._time)
-        writer._month = _month_key(writer._time[0])
+        writer._set_month(writer._time[0])
         writer._balance = list(shard.get("balance") or [None] * n)
         saved_symbols = shard.get("symbols") or {}
         for sym in symbols:
@@ -156,6 +187,7 @@ class ShardWriter:
             saved_ind = saved.get("indicators") or {}
             writer._symbols[sym]["indicators"] = {name: list(saved_ind.get(name) or [None] * n)
                                                   for name in indicator_names}
+        writer._bind_columns()  # 버퍼 리스트를 통째로 갈아끼웠으므로 다시 묶는다
         return writer
 
     def _reset_buffers(self) -> None:
@@ -163,35 +195,54 @@ class ShardWriter:
         self._balance: List[Optional[float]] = []
         self._symbols: Dict[str, Dict] = {sym: _empty_symbol_buffer(self.indicator_names)
                                           for sym in self.symbols}
+        self._bind_columns()
 
-    def add(self, time_ms: int, balance: float,
-            symbol_data: Dict[str, Tuple[object, Dict[str, Optional[float]]]]) -> None:
-        """이벤트 하나를 적재한다.
+    def _bind_columns(self) -> None:
+        """심볼별로 ``(OHLC (속성, append) 목록, (지표 get_latest, 컬럼 append) 목록)``을 묶는다.
+
+        :meth:`add`는 이벤트마다 심볼마다 지표마다 불리므로, 값을 dict에 모았다가 이름으로 다시
+        찾는 대신 읽을 곳과 쓸 곳을 미리 짝지어 둔다 (1m 6.5년 백테스트에서 ~2초). 묶는 대상이
+        버퍼 **리스트 객체**이므로 버퍼를 새로 만들 때마다(:meth:`_reset_buffers`,
+        :meth:`resume`) 다시 불러야 한다.
+        """
+        self._bound: Dict[str, Tuple[List, List]] = {}
+        for sym in self.symbols:
+            buf = self._symbols[sym]
+            inds = self._indicators.get(sym, {})
+            ohlc = ([(k, buf["ohlc"][k].append) for k in _OHLC_KEYS] if self.has_ohlc else [])
+            columns = [(inds[name].get_latest if name in inds else _no_value,
+                        buf["indicators"][name].append)
+                       for name in self.indicator_names]
+            self._bound[sym] = (ohlc, columns)
+
+    def add(self, time_ms: int, balance: float, candles: Dict[str, Candle]) -> None:
+        """이벤트 하나를 적재한다. 지표 값은 생성자가 받은 ``indicators``에서 직접 읽는다.
 
         :param time_ms: 이벤트 시각 (병합 타임라인의 end_time).
         :param balance: 이 이벤트 시점의 계좌 전체 시가평가 자본 (margin + Σ unrealised_pnl).
-        :param symbol_data: 이번 이벤트에 캔들이 마감한 심볼만 담는다 — ``{symbol: (candle,
-            indicator_values)}``. 나머지 심볼은 이 행에서 OHLC/지표가 전부 null이 된다.
+        :param candles: 이번 이벤트에 캔들이 마감한 심볼 → 그 캔들. 나머지 심볼은 이 행에서
+            OHLC/지표가 전부 null이 된다.
         """
-        key = _month_key(time_ms)
-        if self._month is None:
-            self._month = key
-        elif key != self._month:
-            self._flush()
-            self._month = key
+        if not self._month_start <= time_ms < self._month_end:
+            if self._month is not None:
+                self._flush()
+            self._set_month(time_ms)
 
         self._time.append(time_ms)
         self._balance.append(_clean_value(balance))
         for sym in self.symbols:
-            buf = self._symbols[sym]
-            data = symbol_data.get(sym)
-            candle = data[0] if data else None
-            values = data[1] if data else {}
-            if self.has_ohlc:
-                for k in _OHLC_KEYS:
-                    buf["ohlc"][k].append(getattr(candle, k) if candle is not None else None)
-            for name in self.indicator_names:
-                buf["indicators"][name].append(_clean_value(values.get(name)))
+            ohlc, columns = self._bound[sym]
+            candle = candles.get(sym)
+            if candle is None:
+                for _, append in ohlc:
+                    append(None)
+                for _, append in columns:
+                    append(None)
+                continue
+            for k, append in ohlc:
+                append(getattr(candle, k))
+            for get_latest, append in columns:
+                append(_clean_value(get_latest()))
 
     def _write_current(self) -> Optional[Dict]:
         """현재 월 버퍼를 파일로 쓰고 인덱스 엔트리를 돌려준다 (버퍼는 유지). 비었으면 None."""
