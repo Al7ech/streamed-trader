@@ -132,7 +132,10 @@ class SimulatedExecutor(Executor):
         심볼의 미체결 주문을 이 캔들로 매칭한다. ``match_symbol``이 제너레이터라 체결은 한
         건씩 즉시 반영되고, 같은 봉의 뒤쪽 주문은 갱신된 포지션을 본다 (``reduce_only`` clamp가
         올바르려면 필요하다). 만료 처리는 매칭 **뒤에** 온다 — ``expire_after_candles=N``인
-        주문이 N번째 캔들에서도 체결 기회를 갖도록.
+        주문이 N번째 캔들에서도 체결 기회를 갖도록. 미체결 주문이 없는 심볼(대부분의 캔들)은
+        ``match_symbol``/``tick_expiry`` 호출 자체를 건너뛴다 — 두 함수 다 빈 장부에서는
+        바로 반환하므로(그 자체를 부르는 비용, 특히 제너레이터 객체 생성이 이벤트·심볼마다
+        쌓인다) 출력은 그대로다.
 
         **둘째 루프** — 열린 포지션 **전부**(이번 이벤트에 캔들이 없는 심볼 포함)를 최근
         종가로 (재)시가평가한다. 이것이 자본곡선 값이 된다 — 레코더는 단계 6에서
@@ -155,12 +158,13 @@ class SimulatedExecutor(Executor):
         st = self.status
         for symbol, candle in candles.items():
             self.last_close[symbol] = candle.close
-            for order, price, quantity in order_book.match_symbol(
-                    st, symbol, candle, self.slippage_ratio):
-                self._fill(symbol, quantity, price, event_time,
-                           order.order_type.value, order.created_at)
-            for order in order_book.tick_expiry(st, symbol):
-                self.logger.info("%s미체결 주문 만료: %s", self._prefix, order)
+            if st.open_orders.get(symbol):
+                for order, price, quantity in order_book.match_symbol(
+                        st, symbol, candle, self.slippage_ratio):
+                    self._fill(symbol, quantity, price, event_time,
+                               order.order_type.value, order.created_at)
+                for order in order_book.tick_expiry(st, symbol):
+                    self.logger.info("%s미체결 주문 만료: %s", self._prefix, order)
         for symbol, pos_state in st.positions.items():
             if pos_state.position != 0.0:
                 price = self.last_close.get(symbol)
