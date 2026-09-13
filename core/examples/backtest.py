@@ -48,9 +48,14 @@ if __name__ == "__main__":
         "end": end_date.isoformat(),
         "params": params,
     }
-    # 실험 목적 한 줄 라벨: uv run python core/examples/backtest.py "ATR 채널폭 2.0 검증"
-    if len(sys.argv) > 1:
-        metadata["label"] = sys.argv[1]
+    # 실험 목적 한 줄 라벨 + --no-series 플래그:
+    #   uv run python core/examples/backtest.py "ATR 채널폭 2.0 검증"
+    #   uv run python core/examples/backtest.py --no-series   (시계열 샤드 없이 런 JSON만)
+    cli_args = sys.argv[1:]
+    save_series = "--no-series" not in cli_args
+    labels = [a for a in cli_args if not a.startswith("--")]
+    if labels:
+        metadata["label"] = labels[0]
 
     # 계좌 상태는 실행기가 만들어 소유한다 — 레코더에는 그 참조(executor.status)를 넘긴다.
     # fee_ratio를 안 넘기면 Status가 DEFAULT_FEE_RATIO를 박는다. 회계와 전략 사이징이 같은
@@ -58,8 +63,11 @@ if __name__ == "__main__":
     executor = SimulatedExecutor(init_margin)
     metadata["fee_ratio"] = executor.status.fee_ratio
     # metadata를 주면 런 JSON을, save_series까지 주면 시계열 샤드도 asset/backtest/ 에 쓴다.
+    # 샤드 기록은 멀티심볼·긴 구간일수록 엔진 루프의 절반 이상을 먹는다(docs/2609-backtest-
+    # profiling.md) — 승률/수익만 빠르게 볼 때는 --no-series로 끈다 (시각화 도구에는 가격
+    # 차트·지표 패널이 안 나온다).
     recorder = BacktestRecorder(streamer, executor.status, interval_ms=interval_ms,
-                                metadata=metadata, save_series=True)
+                                metadata=metadata, save_series=save_series)
     # vectorize=False를 주면 지표를 캔들마다 update()로 돌린다 (결과는 비트 단위로 같다 —
     # core/checks/backtest_check.py 참고). 새 지표의 precompute_series를 의심할 때 쓴다.
     report = BacktestEngine(streamer, candles_by_symbol, executor, recorder).run()

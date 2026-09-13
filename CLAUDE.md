@@ -60,6 +60,7 @@ uv sync
 ```bash
 uv run python core/examples/backtest.py              # backtest over a hardcoded date range/symbol/strategy
 uv run python core/examples/backtest.py "label"       # optional one-line experiment label stored in the run JSON
+uv run python core/examples/backtest.py --no-series   # run JSON only, skips the time-series shards (faster)
 uv run python core/checks/live_check.py                      # live path: producer, executor, dry-run == backtest
 uv run python core/checks/backtest_check.py                  # backtest engine: vectorized indicators == loop
 uv run python core/checks/fetch_stock_check.py               # US equity fetcher smoke test (needs MASSIVE_API_KEY)
