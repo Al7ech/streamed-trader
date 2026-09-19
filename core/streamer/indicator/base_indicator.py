@@ -56,9 +56,10 @@ class BaseIndicator(ABC):
 
     # An indicator may additionally opt into the backtest engine's vectorized path by inheriting
     # `VectorizableNumericIndicator` (below `NumericIndicator` in this file) instead of plain
-    # `NumericIndicator`. `core/engine/backtest.py` detects that by `isinstance` — see that
-    # class's docstring for the contract (`compute`/`sink`, bit-identity requirement, why an
-    # indicator that reads `status` can't vectorize).
+    # `NumericIndicator`. `core/engine/backtest.py` detects that by `isinstance(indicator,
+    # VectorizableIndicator)` — see `VectorizableIndicator`'s docstring for the `compute`
+    # contract (bit-identity requirement, why an indicator that reads `status` can't vectorize)
+    # and `VectorizableNumericIndicator`'s for `sink`.
 
 
 class NumericIndicator(BaseIndicator):
@@ -143,40 +144,63 @@ class NumericIndicator(BaseIndicator):
         return None if v is not None and v != v else v
 
 
-class VectorizableNumericIndicator(NumericIndicator):
-    """벡터화 백테스트 경로에 참여하는 ``NumericIndicator`` — 이 클래스와만 결합해서 쓴다.
+class VectorizableIndicator(ABC):
+    """"이 지표는 전 구간을 한 번에 계산할 수 있다"는 것만 표시하는 얇은 능력 마커.
 
-    루프 경로(``update``/``read``/``get_latest``)는 전부 ``NumericIndicator``에서 그대로
-    상속받는다. 이 클래스가 추가하는 건 두 개뿐이다.
+    ``NumericIndicator``와는 독립적이다 — 저장 방식(deque든 다른 무엇이든)에 대해 아무 것도
+    가정하지 않는다. ``BacktestEngine``이 벡터화 대상을 판정할 때 ``isinstance(indicator,
+    VectorizableIndicator)`` 하나로 체크하는 게 이 클래스가 존재하는 이유다 — "무엇으로
+    만들어졌는가"가 아니라 "전 구간을 미리 계산해 낼 수 있는가"를 직접 묻는다.
 
-    - ``compute(open, high, low, close, volume) -> np.ndarray`` (abstract): 심볼의 OHLCV
-      전 구간에서 이 지표의 전체 시계열을 한 번에 계산한다. 엘리먼트 i는 캔들 [0..i]까지로
-      ``update()``를 부른 뒤의 ``get_latest()``와 **비트 단위로 같아야 한다** — 워밍업 구간은
-      NaN, dtype은 ``float64``. 단순히 근접해서는 안 된다: `update()`가 도는 증분 합산과
-      다른 순서로 더하는 롤링 헬퍼는 ~1e-14 상대오차로 갈리는데, 수백만 캔들에 걸쳐 이게
-      임계값 비교를 뒤집고 — 트리거가 지표값 자체인 조건부 주문에서는 곧바로 ``Trade.price``로
-      번진다. ``core/streamer/indicator/vector_ops.py``가 각 루프 재귀식을 그대로 펼치는
-      헬퍼를 갖고 있고(``np.cumsum``이 엄격한 순차 폴드라 파이썬 루프와 반올림까지 같다),
-      ``core/checks/backtest_check.py``가 지표마다 이 동등성을 검사한다.
+    실제로 쓰는 지표는 이 클래스 단독이 아니라 ``VectorizableNumericIndicator``(아래, 이
+    클래스와 ``NumericIndicator``를 다중상속)를 통해 결합된다 — 값을 계산하는 것
+    (``compute``)과 그 값을 어디에 꽂는지(``sink``)는 서로 다른 관심사라 나눴다: 계산은
+    저장 방식과 무관하지만, 주입은 저장 방식(``NumericIndicator``의 ``self._deque``)을
+    알아야 한다.
+    """
 
-      ``compute()``는 ``status``를 받지 않는다 — 계좌 상태는 전략 자신의 거래에 좌우되는
-      피드백 루프라 미리 계산할 수 없다. ``status``를 읽는 지표는 이 클래스를 상속하지 않고
-      루프 전용(``NumericIndicator``만)으로 남아야 한다.
+    @abstractmethod
+    def compute(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
+                close: np.ndarray, volume: np.ndarray) -> np.ndarray:
+        """심볼의 OHLCV 전 구간에서 이 지표의 전체 시계열을 한 번에 계산한다.
 
-    - ``sink() -> Callable[[Optional[float]], None]`` (concrete): 미리 계산한 값을
-      ``update()`` 대신 얹을 자리. ``self._deque.append``를 그대로 리턴한다 — 별도 저장소를
-      두지 않고 루프 경로와 **같은 deque**를 공유하는 게 핵심이다. 이벤트마다 지표마다 불리는
-      자리라(1m 6.5년 백테스트에서 지표당 345만 번) 매번 새 콜러블을 만드는 대신 **한 번만
-      묶어 두고 재사용**하도록 백테스트 엔진이 호출한다 — 파이썬 프레임 하나를 아낀다.
-      출력 deque에 그대로 얹으므로 ``read``/``get_latest``의 규약(음수 인덱스, 보관 이력
-      ``IndexError``, NaN→None)이 루프 경로와 **같은 코드**로 유지된다. 지표 객체를 다른
-      것으로 갈아끼우지 않는 것도 요점이다: 샤드 라이터가 생성 시점에 묶어 둔
-      ``get_latest``와 전략이 들고 있는 참조가 그대로 이 객체를 가리켜야 한다.
+        엘리먼트 i는 캔들 [0..i]까지로 ``update()``를 부른 뒤의 ``get_latest()``와 **비트
+        단위로 같아야 한다** — 워밍업 구간은 NaN, dtype은 ``float64``. 단순히 근접해서는
+        안 된다: ``update()``가 도는 증분 합산과 다른 순서로 더하는 롤링 헬퍼는 ~1e-14
+        상대오차로 갈리는데, 수백만 캔들에 걸쳐 이게 임계값 비교를 뒤집고 — 트리거가
+        지표값 자체인 조건부 주문에서는 곧바로 ``Trade.price``로 번진다.
+        ``core/streamer/indicator/vector_ops.py``가 각 루프 재귀식을 그대로 펼치는 헬퍼를
+        갖고 있고(``np.cumsum``이 엄격한 순차 폴드라 파이썬 루프와 반올림까지 같다),
+        ``core/checks/backtest_check.py``가 지표마다 이 동등성을 검사한다.
 
-      배열+커서로 값을 따로 들고 ``read()``가 그걸 직접 인덱싱하게 만드는 대안도 검토했지만
-      기각했다: numpy 스칼라를 읽을 때마다 박싱 비용이 붙어(실측 deque 대비 +14~150%,
-      재사용 경로에 따라) ``sink``가 아끼려는 것보다 더 크게 손해를 본다 — deque 하나 공유가
-      실측으로도 더 빠르다.
+        ``status``를 받지 않는다 — 계좌 상태는 전략 자신의 거래에 좌우되는 피드백 루프라
+        미리 계산할 수 없다. ``status``를 읽는 지표는 이 클래스를 상속하지 않고 루프
+        전용으로 남아야 한다.
+        """
+        pass
+
+
+class VectorizableNumericIndicator(NumericIndicator, VectorizableIndicator):
+    """``NumericIndicator``(저장) + ``VectorizableIndicator``(계산 가능 표시)를 잇는 결합체.
+
+    루프 경로(``update``/``read``/``get_latest``)는 ``NumericIndicator``에서, "전 구간을
+    미리 계산할 수 있다"는 계약(``compute``)은 ``VectorizableIndicator``에서 상속받는다.
+    이 클래스가 추가하는 건 그 둘을 실제로 잇는 ``sink()`` 하나뿐이다.
+
+    ``sink() -> Callable[[Optional[float]], None]``: 미리 계산한 값을 ``update()`` 대신
+    얹을 자리. ``self._deque.append``를 그대로 리턴한다 — 별도 저장소를 두지 않고 루프
+    경로와 **같은 deque**를 공유하는 게 핵심이다. 이벤트마다 지표마다 불리는 자리라(1m
+    6.5년 백테스트에서 지표당 345만 번) 매번 새 콜러블을 만드는 대신 **한 번만 묶어 두고
+    재사용**하도록 백테스트 엔진이 호출한다 — 파이썬 프레임 하나를 아낀다. 출력 deque에
+    그대로 얹으므로 ``read``/``get_latest``의 규약(음수 인덱스, 보관 이력 ``IndexError``,
+    NaN→None)이 루프 경로와 **같은 코드**로 유지된다. 지표 객체를 다른 것으로 갈아끼우지
+    않는 것도 요점이다: 샤드 라이터가 생성 시점에 묶어 둔 ``get_latest``와 전략이 들고
+    있는 참조가 그대로 이 객체를 가리켜야 한다.
+
+    배열+커서로 값을 따로 들고 ``read()``가 그걸 직접 인덱싱하게 만드는 대안도 검토했지만
+    기각했다: numpy 스칼라를 읽을 때마다 박싱 비용이 붙어(실측 deque 대비 +14~150%, 재사용
+    경로에 따라) ``sink``가 아끼려는 것보다 더 크게 손해를 본다 — deque 하나 공유가
+    실측으로도 더 빠르다.
 
     캔들 하나에 값 하나를 얹는다 — 워밍업 구간의 NaN도 포함이다. 루프 경로는 그 구간에
     아무것도 얹지 않거나(``MovingAverage``) ``None``을 얹어(돈치안) deque 길이가 다를 수
@@ -187,11 +211,6 @@ class VectorizableNumericIndicator(NumericIndicator):
     여기로도 값이 두 번 들어온다 — 루프 경로에서 ``update``가 두 번 불리는 것과 같은 기존
     제약이다.
     """
-
-    @abstractmethod
-    def compute(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
-                close: np.ndarray, volume: np.ndarray) -> np.ndarray:
-        pass
 
     def sink(self) -> Callable[[Optional[float]], None]:
         return self._deque.append

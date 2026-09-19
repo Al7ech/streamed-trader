@@ -32,7 +32,7 @@ from core.candle.merge import merge_by_end_time
 from core.executor.base import Executor
 from core.recorder.base import NullRecorder, Recorder
 from core.streamer import BaseStreamer
-from core.streamer.indicator.base_indicator import BaseIndicator, VectorizableNumericIndicator
+from core.streamer.indicator.base_indicator import BaseIndicator, VectorizableIndicator
 
 #: 미리 계산한 배열을 파이썬 float으로 바꿀 때 한 번에 처리할 개수. :func:`_iter_floats` 참고.
 _TOLIST_CHUNK = 1 << 16
@@ -52,7 +52,7 @@ class BacktestEngine:
     :param recorder: None이면 :class:`~core.recorder.base.NullRecorder`.
     :param vectorize: False면 선계산을 통째로 끄고 전 지표를 ``update()``로 돌린다. 결과는
         같아야 하므로(위 모듈 docstring) 정확성을 위한 스위치가 아니라, 새로 쓴
-        ``VectorizableNumericIndicator.compute()``를 의심할 때 쓰는 대조 수단이다.
+        ``VectorizableIndicator.compute()``를 의심할 때 쓰는 대조 수단이다.
     :param progress: 이벤트 진행바 표시 여부.
 
     **생성자가 ``executor.on_trade``를 레코더로 덮어쓴다** — :class:`TradingEngine`과 같은
@@ -96,10 +96,13 @@ class BacktestEngine:
     def _precompute(self) -> Dict[str, Playback]:
         """심볼마다 "미리 계산된 것"과 "루프로 돌릴 것"을 갈라 미리 묶어 둔다.
 
-        벡터화 대상 판정은 ``isinstance(indicator, VectorizableNumericIndicator)``다. 그
-        ABC는 ``compute``/``sink`` 둘 다 abstractmethod라, 하나만 정의하면 그 지표는 클래스
-        정의 시점에 인스턴스화 자체가 실패한다 — 여기서 조용히 루프로 폴백하는 실패 모드는
-        없다.
+        벡터화 대상 판정은 ``isinstance(indicator, VectorizableIndicator)``다 — "전 구간을
+        미리 계산할 수 있는가"를 저장 방식과 무관하게 직접 묻는다. ``compute``는
+        ``VectorizableIndicator``의 abstractmethod라, 정의를 빼먹은 지표는 클래스 정의
+        시점에 인스턴스화 자체가 실패한다 — 여기서 조용히 루프로 폴백하는 실패 모드는 없다.
+        ``sink()``는 이 판정을 통과한 지표라면 (실무에서는 전부 ``VectorizableIndicator``와
+        ``NumericIndicator``를 함께 상속하는 ``VectorizableNumericIndicator``를 거치므로)
+        항상 있다고 가정하고 바로 부른다.
         """
         playback: Dict[str, Playback] = {}
         for symbol, indicators in self.streamer.indicators.items():
@@ -109,7 +112,7 @@ class BacktestEngine:
             sinks: List[Tuple[Callable[[Optional[float]], None], Iterator[float]]] = []
             loop: List[BaseIndicator] = []
             for name, indicator in indicators.items():
-                if arrays is not None and isinstance(indicator, VectorizableNumericIndicator):
+                if arrays is not None and isinstance(indicator, VectorizableIndicator):
                     series = self._precompute_one(symbol, name, indicator.compute, arrays,
                                                   len(candles))
                     sinks.append((indicator.sink(), _iter_floats(series)))
@@ -141,7 +144,7 @@ class BacktestEngine:
 
     @staticmethod
     def _ohlcv(candles: List[Candle]) -> Tuple[np.ndarray, ...]:
-        """``VectorizableNumericIndicator.compute()``에 넘길 (open, high, low, close, volume) 배열."""
+        """``VectorizableIndicator.compute()``에 넘길 (open, high, low, close, volume) 배열."""
         n = len(candles)
         return tuple(np.fromiter((getattr(c, k) for c in candles), np.float64, n)
                      for k in ("open", "high", "low", "close", "volume"))
