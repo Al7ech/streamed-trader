@@ -5,7 +5,7 @@
 필요로 하는 두 구간이 런타임에야 정해지기 때문이다:
 
 - **지표 워밍업** — 얼마나 과거로 거슬러 갈지는 프로세스가 기동한 순간에 정해진다
-  (:meth:`~core.engine.engine.TradingEngine.warmup`).
+  (:meth:`~core.engine.trading.TradingEngine.warmup`).
 - **구멍 백필** — 어떤 캔들이 빠졌는지는 스트림이 앞으로 건너뛴 순간에 정해진다
   (``TradingEngine._backfill_gap``).
 

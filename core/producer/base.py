@@ -3,7 +3,7 @@
 엔진에 흘려보낼 **이벤트**(같은 시각에 마감한 심볼별 캔들 묶음)를 시간순으로 내준다.
 
 모든 구현체가 **비동기 iterator**(``__aiter__``)로 이벤트를 내주고,
-:meth:`~core.engine.engine.TradingEngine.run_async`가 그것을 소비한다:
+:meth:`~core.engine.trading.TradingEngine.run_async`가 그것을 소비한다:
 
 - ``LiveCandleProducer`` (:mod:`core.producer.live`) — 웹소켓에서 캔들이 마감할
   때마다 내준다. 연속성 판정(중복·구멍)은 하지 않는다 — 엔진 몫이다.
@@ -20,7 +20,7 @@
 구간이 런타임에 정해지는 두 요구 —— 기동한 순간에야 알 수 있는 **지표 워밍업** 구간과, 구멍이
 난 순간에야 알 수 있는 **백필** 구간 —— 은 이 포트로 표현하지 못하므로, 구간을 인자로 받는
 별개의 조회 포트 :class:`~core.history.base.CandleHistory`가 담당한다
-(:meth:`~core.engine.engine.TradingEngine.warmup` 참고).
+(:meth:`~core.engine.trading.TradingEngine.warmup` 참고).
 
 의존 방향은 **엔진 → Producer 한 방향**이다. Producer는 실행기도, 레코더도, 액션도 모른다.
 """
@@ -41,7 +41,7 @@ class Event:
         이벤트는 하나 이상.
 
     이벤트는 "새 결정을 내는 봉"인지 "이미 지나간 봉(백필/프리피드)"인지를 스스로 알지
-    못한다 — 그 판정은 :class:`~core.engine.engine.TradingEngine`이 심볼별 연속성 앵커로
+    못한다 — 그 판정은 :class:`~core.engine.trading.TradingEngine`이 심볼별 연속성 앵커로
     직접 한다 (:meth:`TradingEngine.process_event`의 ``decide`` 파라미터).
     """
 
@@ -53,7 +53,7 @@ class CandleProducer(ABC):
     """이벤트를 시간순으로 내주는 소스.
 
     구현체는 **``__aiter__``(비동기 iterator)** 를 제공하고,
-    :meth:`~core.engine.engine.TradingEngine.run_async`가 그것을 소비한다. 동기 소스라도
+    :meth:`~core.engine.trading.TradingEngine.run_async`가 그것을 소비한다. 동기 소스라도
     아무것도 ``await``하지 않는 async generator로 감싸면 되고
     (:class:`~core.producer.in_memory.InMemoryCandleProducer` 참고), 그러면 드라이런과 라이브가
     하나의 소비 경로를 공유한다.

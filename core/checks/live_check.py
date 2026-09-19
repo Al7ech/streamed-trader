@@ -11,7 +11,7 @@
    (가짜 주문 클라이언트 + 손으로 만든 유저 데이터 메시지)
 3. **드라이런 == 백테스트** — 같은 캔들을 라이브의 이벤트 모양(심볼별 단일 키, 비동기)으로
    흘려보내고 백테스트 결과와 체결을 대조한다. 드라이런이 존재하는 이유가 이 대조이고,
-   **엔진은 서로 다르되**(:class:`~core.engine.engine.TradingEngine` vs
+   **엔진은 서로 다르되**(:class:`~core.engine.trading.TradingEngine` vs
    :class:`~core.engine.backtest.BacktestEngine`) ``SimulatedExecutor``는 같은 클래스이므로
    결과가 **완전히** 같아야 한다. 순서 규약이 두 파일에 나뉘어 있는 지금, 이 대조가 둘이
    갈라지지 않았다는 유일한 증거다 — 어느 한쪽의 단계 순서를 바꾸면 여기서 걸린다.
@@ -42,7 +42,7 @@ from core.history.base import CandleHistory
 from core.history.fetcher import FetcherCandleHistory
 from core.fetcher.base import BaseCandleFetcher
 from core.producer.base import CandleProducer, Event
-from core.engine.engine import TradingEngine
+from core.engine.trading import TradingEngine
 from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
 from core.producer import live as lcp
 from core.executor.binance_order_client import OrderResult

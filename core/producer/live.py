@@ -1,10 +1,10 @@
 """라이브 캔들 공급자.
 
-바이낸스 선물 kline 웹소켓에서 마감 캔들을 받아 :class:`~core.engine.engine.TradingEngine`이
+바이낸스 선물 kline 웹소켓에서 마감 캔들을 받아 :class:`~core.engine.trading.TradingEngine`이
 소비할 이벤트로 내준다. 소켓 연결/수신과 웹소켓 봉투 파싱, 마감 시각 정규화만 한다.
 
 **연속성 판정은 하지 않는다.** 중복 캔들 감지, 구멍 백필, 워밍업↔라이브 이어붙이기는 모두
-엔진 몫이다 (:meth:`~core.engine.engine.TradingEngine` 참고) — 엔진이 심볼별 연속성 앵커를
+엔진 몫이다 (:meth:`~core.engine.trading.TradingEngine` 참고) — 엔진이 심볼별 연속성 앵커를
 들고, 스트림이 앞으로 건너뛰면 그 구간을 ``history`` 조회로 받아 결정 없이 재생한다.
 
 **멈춘 스트림은 여기서 잡는다.** 엔진의 구멍 판정은 다음 캔들이 *도착해야* 일어나므로, 캔들이

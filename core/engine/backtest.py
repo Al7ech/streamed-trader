@@ -1,6 +1,6 @@
 """백테스트 전용 엔진 — 캔들을 메모리에 얹고, 벡터화 가능한 지표를 먼저 계산한 뒤 루프를 돈다.
 
-라이브 경로(:class:`~core.engine.engine.TradingEngine`)와 **순서 규약은 같지만 코드는 따로**다.
+라이브 경로(:class:`~core.engine.trading.TradingEngine`)와 **순서 규약은 같지만 코드는 따로**다.
 라이브 엔진이 갖는 것들 — 연속성 앵커, 구멍 백필, 결정 기한, 지표 워밍업, ``on_error``,
 async 순회 — 은 전부 "스트림은 끊기고 시계는 흐른다"는 전제 위에 있고, 메모리에 다 들고 있는
 과거 구간에는 그 전제가 없다. 그 전제를 걷어내면 이벤트마다 ``Event`` 객체도, async generator
@@ -137,6 +137,7 @@ class BacktestEngine:
                 f"{symbol}.{name}.compute()가 캔들 수와 다른 길이를 돌려줬다: "
                 f"{len(series)} != {n}")
         # float64가 아니면 지표 deque와 샤드 JSON까지 다른 타입이 흘러간다.
+        # TODO: VectorizableIndicator 타입이 float64여야 하는 조건이 있는데, 추후 모든 타입을 지원해야 할듯
         if series.dtype != np.float64:
             raise ValueError(
                 f"{symbol}.{name}.compute()의 dtype이 float64가 아니다: {series.dtype}")

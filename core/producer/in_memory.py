@@ -3,7 +3,7 @@
 심볼별 캔들 리스트를 하나의 이벤트 타임라인으로 병합해
 (:func:`~core.candle.merge.merge_by_end_time`), 아무것도 ``await``하지 않는 async generator로
 내준다 — 그래서 이 경로도 드라이런/라이브와 같은 소비 경로
-(:meth:`~core.engine.engine.TradingEngine.run_async`)를 지나간다.
+(:meth:`~core.engine.trading.TradingEngine.run_async`)를 지나간다.
 
 캔들을 스스로 가져오지 않는다. 이미 만들어진 ``candles_by_symbol``을 받는다 — 메모리에 든
 캔들을 **라이브 엔진에** 흘려보내야 하는 쪽(대조 검사, 재생 등)이 쓴다. 백테스트는 이것을

@@ -29,7 +29,7 @@ class BaseStreamer(ABC):
     def warmup_windows(self) -> Dict[str, int]:
         """심볼별로 워밍업에 필요한 캔들 수 = 그 심볼 지표들의 최대 window.
 
-        :meth:`~core.engine.engine.TradingEngine.warmup`이 받아올 구간 길이를 정할 때
+        :meth:`~core.engine.trading.TradingEngine.warmup`이 받아올 구간 길이를 정할 때
         (전 심볼 공통 ``max(window)``), 그리고 다 먹인 뒤 "충분히 데워졌는가"를 심볼별로
         판정할 때 쓴다.
         """

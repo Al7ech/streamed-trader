@@ -1,6 +1,6 @@
 """매매 순서 규약. 이 패키지가 담는 것은 엔진뿐이다 — 지금은 두 벌.
 
-- :class:`~core.engine.engine.TradingEngine` — 드라이런/라이브. 캔들 공급자를 ``async for``로
+- :class:`~core.engine.trading.TradingEngine` — 드라이런/라이브. 캔들 공급자를 ``async for``로
   소비하며, 연속성 앵커·구멍 백필·결정 기한·지표 워밍업을 갖는다.
 - :class:`~core.engine.backtest.BacktestEngine` — 백테스트. 캔들을 메모리에 다 들고 시작하고,
   ``VectorizableNumericIndicator``를 상속한 지표를 먼저 통째로 계산한 뒤 동기 루프를 돈다.
@@ -32,7 +32,7 @@ import하지 않는다.
 
 포트가 하나 더 있다: :mod:`core.history` (:class:`~core.history.base.CandleHistory`). 위 셋은
 런 하나에 하나씩 꽂히는 부품이지만 이건 **조회**다 — 구간을 인자로 받아 과거 캔들을 돌려준다.
-지표 워밍업(:meth:`core.engine.engine.TradingEngine.warmup`)과 라이브 스트림의 구멍 백필이
+지표 워밍업(:meth:`core.engine.trading.TradingEngine.warmup`)과 라이브 스트림의 구멍 백필이
 필요로 하는 구간은 런타임에야 정해져서 ``CandleProducer``로는 표현되지 않기 때문이다.
 백테스트 엔진은 이것을 들지 않는다 — 진입점이 같은 조회로 캔들을 받아 통째로 넘기고, 첫
 window개 이벤트가 워밍업이며, ragged 시계열의 빈 구간은 구멍이 아니라 데이터 그대로다.

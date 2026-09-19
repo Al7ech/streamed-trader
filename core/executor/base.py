@@ -1,7 +1,7 @@
 """주문 실행과 계좌 상태의 도메인 경계 — **포트(계약)만** 여기 있다.
 
 엔진은 "언제 무엇을 결정하는가"만 알고, "그 결정이 어떻게 체결되는가"는 전부 실행기에 있다.
-그래서 백테스트/드라이런/라이브가 같은 :class:`~core.engine.engine.TradingEngine`을 쓰면서
+그래서 백테스트/드라이런/라이브가 같은 :class:`~core.engine.trading.TradingEngine`을 쓰면서
 Executor만 갈아끼우는 것으로 갈린다. 구현체는 각자의 패키지에 있다:
 
 - :class:`~core.executor.simulated.SimulatedExecutor` — 백테스트와 드라이런. 캔들로

@@ -9,7 +9,7 @@
 라이브       LiveCandleProducer         LiveExecutor        LiveRecorder
 ===========  =========================  ==================  ================
 
-매매 순서 규약은 :class:`~core.engine.engine.TradingEngine`에, 캔들 소스는
+매매 순서 규약은 :class:`~core.engine.trading.TradingEngine`에, 캔들 소스는
 :class:`~core.producer.live.LiveCandleProducer`에, 주문 실행과 계좌 상태는
 실행기에 있다. **드라이런이 백테스트와 문자 그대로 같은 실행기 클래스를 쓴다** —
 드라이런은 백테스트와 대조하기 위해 존재하므로, 체결 규칙이 갈라지면 기능 자체가 무의미해진다.
@@ -27,7 +27,7 @@ from core.fetcher.binance.rest_fetcher import BinanceCandleFetcher
 from core.history.fetcher import FetcherCandleHistory
 from core.executor.simulated import SimulatedExecutor
 from core.account.status import Status
-from core.engine.engine import TradingEngine
+from core.engine.trading import TradingEngine
 from core.executor.base import Executor
 from core.producer.live import LiveCandleProducer
 from core.executor.live import LiveExecutor, resolve_margin_asset
@@ -41,7 +41,7 @@ from core.utils import interval_to_minutes, ms_timestamp_to_datetime
 DRY_RUN_MARGIN = 1e6
 
 #: 라이브 결정 기한의 기본값(초). 봉 경계 뒤 이보다 늦게 처리한 봉에서는 포지션을 늘리는
-#: 시장가를 내지 않는다 (:class:`~core.engine.engine.TradingEngine`의 ``decide_deadline_ms``).
+#: 시장가를 내지 않는다 (:class:`~core.engine.trading.TradingEngine`의 ``decide_deadline_ms``).
 #: 실측한 정상 도착은 경계 뒤 0.2초 안이다 — 3초면 정상 봉은 걸리지 않고, 기록 flush 같은
 #: 이벤트 루프의 짧은 정체도 흡수한다.
 DEFAULT_DECIDE_DEADLINE_S = 3.0
