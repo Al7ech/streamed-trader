@@ -6,10 +6,10 @@ import pandas as pd
 
 from core.candle.candle import Candle
 from core.account.status import Status
-from core.streamer.indicator.base_indicator import NumericIndicator
+from core.streamer.indicator.base_indicator import VectorizableNumericIndicator
 
 
-class MinDonchianIndicator(NumericIndicator):
+class MinDonchianIndicator(VectorizableNumericIndicator):
     def __init__(self, window: int):
         super().__init__()
         self.window = window
@@ -34,12 +34,12 @@ class MinDonchianIndicator(NumericIndicator):
         v, _ = self.min_deque[0]
         self._deque.append(v if self.window <= idx else None)
 
-    def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
-                          close: np.ndarray, volume: np.ndarray) -> np.ndarray:
+    def compute(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
+                close: np.ndarray, volume: np.ndarray) -> np.ndarray:
         return pd.Series(low).rolling(self.window).min().to_numpy()
 
 
-class MaxDonchianIndicator(NumericIndicator):
+class MaxDonchianIndicator(VectorizableNumericIndicator):
     def __init__(self, window: int):
         super().__init__()
         self.window = window
@@ -64,6 +64,6 @@ class MaxDonchianIndicator(NumericIndicator):
         v, _ = self.max_deque[0]
         self._deque.append(v if self.window <= idx else None)
 
-    def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
-                          close: np.ndarray, volume: np.ndarray) -> np.ndarray:
+    def compute(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
+                close: np.ndarray, volume: np.ndarray) -> np.ndarray:
         return pd.Series(high).rolling(self.window).max().to_numpy()

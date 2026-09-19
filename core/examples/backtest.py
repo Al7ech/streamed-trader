@@ -69,7 +69,8 @@ if __name__ == "__main__":
     recorder = BacktestRecorder(streamer, executor.status, interval_ms=interval_ms,
                                 metadata=metadata, save_series=save_series)
     # vectorize=False를 주면 지표를 캔들마다 update()로 돌린다 (결과는 비트 단위로 같다 —
-    # core/checks/backtest_check.py 참고). 새 지표의 precompute_series를 의심할 때 쓴다.
+    # core/checks/backtest_check.py 참고). 새 지표의 VectorizableNumericIndicator.compute()를
+    # 의심할 때 쓴다.
     report = BacktestEngine(streamer, candles_by_symbol, executor, recorder).run()
 
     # 4. 결과 출력

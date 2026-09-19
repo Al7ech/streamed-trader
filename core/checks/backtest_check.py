@@ -5,9 +5,9 @@
 성능이 아니라 신뢰다: 백테스트가 라이브와 같은 값을 본다는 보장이 여기서 나오고, 그 보장이
 있어야 ``core/checks/live_check.py`` 3절(드라이런 == 백테스트)이 허용오차 없이 성립한다.
 
-1. **지표 단위 정확성** — ``precompute_series``를 정의한 모든 지표에 대해, 미리 계산한 수열이
-   ``update()`` 루프의 ``get_latest()`` 수열과 **비트 단위로** 같은지. 이어서 그 값을
-   ``precomputed_sink()``로 재생했을 때 ``read(idx)``가 전 인덱스에서 루프와 같은지.
+1. **지표 단위 정확성** — ``VectorizableNumericIndicator``를 상속한 모든 지표에 대해, 미리
+   계산한 수열이 ``update()`` 루프의 ``get_latest()`` 수열과 **비트 단위로** 같은지. 이어서
+   그 값을 ``sink()``로 재생했을 때 ``read(idx)``가 전 인덱스에서 루프와 같은지.
    가장 싸고 가장 정확히 원인을 짚는 검사라 맨 앞에 둔다 — 여기가 깨지면 아래는 볼 필요가 없다.
 2. **전략 단위 대조** — 실제 캔들 위에서 ``vectorize=True``와 ``False``의 ``Report``가 같은지.
    1절이 지표 하나를 보는 반면 여기는 지표가 전략·실행기·레코더를 거쳐 나온 결과를 본다.
@@ -72,8 +72,8 @@ def synthetic_candles(n: int, seed: int = 0) -> List[Candle]:
 # ==================================================== 1. 지표 단위 정확성
 
 
-#: (이름, 생성자, window) — ``precompute_series``를 정의한 지표 전부.
-#: 새 지표에 ``precompute_series``를 붙이면 여기 한 줄을 더해야 한다.
+#: (이름, 생성자, window) — ``VectorizableNumericIndicator``를 상속한 지표 전부.
+#: 새 지표를 그렇게 만들면 여기 한 줄을 더해야 한다.
 def _indicator_cases(window: int):
     cases = [
         ("MovingAverage", lambda: MovingAverage(window)),
@@ -119,7 +119,7 @@ def check_indicator_exactness():
         arrays = _ohlcv(candles)
         for name, make in _indicator_cases(window):
             ref = _as_array(_loop_series(make, candles))
-            got = make().precompute_series(*arrays)
+            got = make().compute(*arrays)
             label = f"지표 정확성: {name} (n={n}, window={window})"
             if len(got) != n or got.dtype != np.float64:
                 check(label, False, f"길이/dtype: {len(got)} vs {n}, {got.dtype}")
@@ -143,7 +143,7 @@ def check_indicator_exactness():
 
 
 def check_sink_playback():
-    """``precomputed_sink``로 재생한 지표의 ``read(idx)``가 루프와 전 인덱스에서 같은가.
+    """``sink()``로 재생한 지표의 ``read(idx)``가 루프와 전 인덱스에서 같은가.
 
     ``get_latest()``만 같아서는 부족하다 — 대부분의 전략이 ``read(-2)``로 직전 값을 읽고,
     루프와 재생은 워밍업 구간에서 deque 길이가 다를 수 있기 때문이다 (루프는 아무것도 얹지
@@ -155,8 +155,8 @@ def check_sink_playback():
         arrays = _ohlcv(candles)
         for name, make in _indicator_cases(window):
             loop_ind, play_ind = make(), make()
-            sink = play_ind.precomputed_sink()
-            values = make().precompute_series(*arrays).tolist()
+            sink = play_ind.sink()
+            values = make().compute(*arrays).tolist()
             probes = [-1, -2, -3, -window, -window - 1, -window - 2,
                       -play_ind.history_size, -play_ind.history_size - 1, 0]
             bad = None
@@ -284,18 +284,18 @@ def check_degenerate_inputs():
     except Exception as e:  # noqa: BLE001
         check("퇴화 입력: 전략이 모르는 심볼이 섞여 있다", False, f"{type(e).__name__}: {e}")
 
-    # precompute_series가 캔들 수와 다른 길이를 주면 조용히 밀리지 않고 죽어야 한다.
+    # compute()가 캔들 수와 다른 길이를 주면 조용히 밀리지 않고 죽어야 한다.
     class _BadLength(MovingAverage):
-        def precompute_series(self, open, high, low, close, volume):
-            return super().precompute_series(open, high, low, close, volume)[:-1]
+        def compute(self, open, high, low, close, volume):
+            return super().compute(open, high, low, close, volume)[:-1]
 
     streamer = KeltnerStreamer(symbols=[SYM], **kp)
     streamer.indicators[SYM]["MA"] = _BadLength(20)
     try:
         _run(streamer, {SYM: synthetic_candles(300)}, True)
-        check("precompute_series 길이 불일치는 치명적", False, "예외가 나지 않았다")
+        check("compute() 길이 불일치는 치명적", False, "예외가 나지 않았다")
     except ValueError:
-        check("precompute_series 길이 불일치는 치명적", True)
+        check("compute() 길이 불일치는 치명적", True)
 
 
 # ====================================================

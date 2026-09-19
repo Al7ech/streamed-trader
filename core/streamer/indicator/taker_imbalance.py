@@ -13,7 +13,7 @@ class TakerImbalanceIndicator(NumericIndicator):
     +1 = 전량 공격적 매수, −1 = 전량 공격적 매도. kline의 taker_buy_volume 필드 필요 —
     필드가 없는(구 캐시) 캔들이 윈도우에 섞여 있으면 워밍업 취급(None 반환).
 
-    precompute_series 시그니처(o/h/l/c/v)에 taker 배열이 없어 벡터화 불가 → plain 루프 경로.
+    compute() 시그니처(o/h/l/c/v)에 taker 배열이 없어 벡터화 불가 → plain 루프 경로.
     """
 
     scale_group = "taker_imbalance"

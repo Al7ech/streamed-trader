@@ -2,6 +2,8 @@ from abc import ABC, abstractmethod
 from collections import deque
 from typing import Callable, Optional
 
+import numpy as np
+
 from core.candle.candle import Candle
 from core.account.status import Status
 
@@ -52,30 +54,11 @@ class BaseIndicator(ABC):
         """
         return self.read(-1)
 
-    # An indicator may additionally define `precompute_series(open, high, low, close, volume)
-    # -> np.ndarray` to compute its whole series from candle arrays in one shot. The backtest
-    # engine (`core/engine/backtest.py`) detects it by attribute presence
-    # (`getattr(indicator, "precompute_series", None)`) and uses it instead of looping
-    # `update()`. There is deliberately no default implementation here — only subclasses that
-    # define it opt into vectorization. Element i of the returned array must equal
-    # `get_latest()` after `update()` has been called with candles [0..i] — warm-up positions
-    # are NaN (the loop-based indicators return None there), and the dtype must be float64.
-    #
-    # **It must be bit-identical to the loop**, not merely close. A rolling helper that sums in
-    # a different order than `update()`'s incremental sum diverges by ~1e-14 relative, which over
-    # millions of candles flips threshold comparisons and — for a conditional order whose trigger
-    # *is* an indicator value — lands straight in `Trade.price`. `core/streamer/indicator/
-    # vector_ops.py` holds helpers that unfold each loop recurrence exactly (`np.cumsum` is a
-    # strict sequential fold, so it rounds like a Python loop); `core/checks/backtest_check.py`
-    # asserts the equality per indicator. That is what lets a dry run and a backtest of the same
-    # candles stay bit-identical.
-    #
-    # `precompute_series` receives no `status`: the account state depends on the trades the
-    # strategy makes, which is a feedback loop that can't be precomputed. An indicator that reads
-    # `status` must therefore stay loop-only (no `precompute_series`).
-    #
-    # Its counterpart is `NumericIndicator.precomputed_sink()` below — where the precomputed
-    # values go in place of `update()`. Both are needed for an indicator to be vectorized.
+    # An indicator may additionally opt into the backtest engine's vectorized path by inheriting
+    # `VectorizableNumericIndicator` (below `NumericIndicator` in this file) instead of plain
+    # `NumericIndicator`. `core/engine/backtest.py` detects that by `isinstance` — see that
+    # class's docstring for the contract (`compute`/`sink`, bit-identity requirement, why an
+    # indicator that reads `status` can't vectorize).
 
 
 class NumericIndicator(BaseIndicator):
@@ -130,29 +113,6 @@ class NumericIndicator(BaseIndicator):
         v = d[-1]
         return None if v is not None and v != v else v
 
-    def precomputed_sink(self) -> Callable[[Optional[float]], None]:
-        """미리 계산한 출력값을 ``update()`` 대신 얹을 자리 — 벡터화 백테스트 전용.
-
-        ``precompute_series``의 **짝**이다 (위 규약 참고). 이벤트마다 지표마다 불리는 자리라
-        매번 호출되는 메서드가 아니라 **한 번만 묶어 두고 쓰는** 호출 가능 객체를 돌려준다 —
-        1m 6.5년 백테스트에서 지표당 345만 번이라 파이썬 프레임 하나가 초 단위로 쌓인다.
-
-        출력 deque에 그대로 얹으므로 ``read``/``get_latest``의 규약(음수 인덱스, 보관 이력
-        ``IndexError``, NaN→None)이 루프 경로와 **같은 코드**로 유지된다. 지표 객체를 다른
-        것으로 갈아끼우지 않는 것도 요점이다: 샤드 라이터가 생성 시점에 묶어 둔
-        ``get_latest``와 전략이 들고 있는 참조가 그대로 이 객체를 가리켜야 한다.
-
-        캔들 하나에 값 하나를 얹는다 — 워밍업 구간의 NaN도 포함이다. 루프 경로는 그 구간에
-        아무것도 얹지 않거나(``MovingAverage``) ``None``을 얹어(돈치안) deque 길이가 다를 수
-        있지만, ``read``의 답은 같다: 두 deque가 **끝에서 정렬**돼 있고 NaN도 짧은 deque의
-        빈자리도 똑같이 ``None``으로 읽히며, 보관 이력 경계도 같은 자리에서 걸린다.
-
-        지표 인스턴스는 (심볼, 이름) 쌍마다 하나여야 한다. 두 심볼이 한 인스턴스를 공유하면
-        여기로도 값이 두 번 들어온다 — 루프 경로에서 ``update``가 두 번 불리는 것과 같은
-        기존 제약이다.
-        """
-        return self._deque.append
-
     def _read_series(self, values, idx: int, history_size: int) -> Optional[float]:
         """출력 시계열 조회의 공통 규약. 워밍업은 None, 이력 경계 밖은 IndexError.
 
@@ -161,12 +121,12 @@ class NumericIndicator(BaseIndicator):
         재사용한다 — ``history_size``를 ``self``에서 읽지 않고 인자로 받는 이유다.
 
         인덱스는 **음수만** 받는다. 음수가 아니면 deque 조회는 ``values[0]`` = 가장 오래된
-        보관값을 조용히 돌려줘 "최신"을 뜻하는 ``-1``과 정반대가 된다 (벡터화 백테스트 경로가
-        재도입되면 그쪽 array 조회는 아직 반영되지 않은 캔들 = 룩어헤드를 주므로 더 나쁘다).
+        보관값을 조용히 돌려줘 "최신"을 뜻하는 ``-1``과 정반대가 된다.
 
-        NaN은 ``None``으로 정규화한다. ``precompute_series``를 정의한 지표는 값이 없는 구간을
-        NaN으로 표현하는데, 루프 경로가 raw NaN을 그대로 내보내면 ``x is None`` / ``x <= 0``
-        류의 가드가 NaN을 전부 통과시켜 조용히 전략 로직을 오염시킨다.
+        NaN은 ``None``으로 정규화한다. ``VectorizableNumericIndicator.compute()``를 정의한
+        지표는 값이 없는 구간을 NaN으로 표현하는데, 루프 경로가 raw NaN을 그대로 내보내면
+        ``x is None`` / ``x <= 0`` 류의 가드가 NaN을 전부 통과시켜 조용히 전략 로직을
+        오염시킨다.
         """
         if idx >= 0:
             raise IndexError(
@@ -181,3 +141,57 @@ class NumericIndicator(BaseIndicator):
         except IndexError:
             return None
         return None if v is not None and v != v else v
+
+
+class VectorizableNumericIndicator(NumericIndicator):
+    """벡터화 백테스트 경로에 참여하는 ``NumericIndicator`` — 이 클래스와만 결합해서 쓴다.
+
+    루프 경로(``update``/``read``/``get_latest``)는 전부 ``NumericIndicator``에서 그대로
+    상속받는다. 이 클래스가 추가하는 건 두 개뿐이다.
+
+    - ``compute(open, high, low, close, volume) -> np.ndarray`` (abstract): 심볼의 OHLCV
+      전 구간에서 이 지표의 전체 시계열을 한 번에 계산한다. 엘리먼트 i는 캔들 [0..i]까지로
+      ``update()``를 부른 뒤의 ``get_latest()``와 **비트 단위로 같아야 한다** — 워밍업 구간은
+      NaN, dtype은 ``float64``. 단순히 근접해서는 안 된다: `update()`가 도는 증분 합산과
+      다른 순서로 더하는 롤링 헬퍼는 ~1e-14 상대오차로 갈리는데, 수백만 캔들에 걸쳐 이게
+      임계값 비교를 뒤집고 — 트리거가 지표값 자체인 조건부 주문에서는 곧바로 ``Trade.price``로
+      번진다. ``core/streamer/indicator/vector_ops.py``가 각 루프 재귀식을 그대로 펼치는
+      헬퍼를 갖고 있고(``np.cumsum``이 엄격한 순차 폴드라 파이썬 루프와 반올림까지 같다),
+      ``core/checks/backtest_check.py``가 지표마다 이 동등성을 검사한다.
+
+      ``compute()``는 ``status``를 받지 않는다 — 계좌 상태는 전략 자신의 거래에 좌우되는
+      피드백 루프라 미리 계산할 수 없다. ``status``를 읽는 지표는 이 클래스를 상속하지 않고
+      루프 전용(``NumericIndicator``만)으로 남아야 한다.
+
+    - ``sink() -> Callable[[Optional[float]], None]`` (concrete): 미리 계산한 값을
+      ``update()`` 대신 얹을 자리. ``self._deque.append``를 그대로 리턴한다 — 별도 저장소를
+      두지 않고 루프 경로와 **같은 deque**를 공유하는 게 핵심이다. 이벤트마다 지표마다 불리는
+      자리라(1m 6.5년 백테스트에서 지표당 345만 번) 매번 새 콜러블을 만드는 대신 **한 번만
+      묶어 두고 재사용**하도록 백테스트 엔진이 호출한다 — 파이썬 프레임 하나를 아낀다.
+      출력 deque에 그대로 얹으므로 ``read``/``get_latest``의 규약(음수 인덱스, 보관 이력
+      ``IndexError``, NaN→None)이 루프 경로와 **같은 코드**로 유지된다. 지표 객체를 다른
+      것으로 갈아끼우지 않는 것도 요점이다: 샤드 라이터가 생성 시점에 묶어 둔
+      ``get_latest``와 전략이 들고 있는 참조가 그대로 이 객체를 가리켜야 한다.
+
+      배열+커서로 값을 따로 들고 ``read()``가 그걸 직접 인덱싱하게 만드는 대안도 검토했지만
+      기각했다: numpy 스칼라를 읽을 때마다 박싱 비용이 붙어(실측 deque 대비 +14~150%,
+      재사용 경로에 따라) ``sink``가 아끼려는 것보다 더 크게 손해를 본다 — deque 하나 공유가
+      실측으로도 더 빠르다.
+
+    캔들 하나에 값 하나를 얹는다 — 워밍업 구간의 NaN도 포함이다. 루프 경로는 그 구간에
+    아무것도 얹지 않거나(``MovingAverage``) ``None``을 얹어(돈치안) deque 길이가 다를 수
+    있지만, ``read``의 답은 같다: 두 deque가 **끝에서 정렬**돼 있고 NaN도 짧은 deque의
+    빈자리도 똑같이 ``None``으로 읽히며, 보관 이력 경계도 같은 자리에서 걸린다.
+
+    지표 인스턴스는 (심볼, 이름) 쌍마다 하나여야 한다. 두 심볼이 한 인스턴스를 공유하면
+    여기로도 값이 두 번 들어온다 — 루프 경로에서 ``update``가 두 번 불리는 것과 같은 기존
+    제약이다.
+    """
+
+    @abstractmethod
+    def compute(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
+                close: np.ndarray, volume: np.ndarray) -> np.ndarray:
+        pass
+
+    def sink(self) -> Callable[[Optional[float]], None]:
+        return self._deque.append

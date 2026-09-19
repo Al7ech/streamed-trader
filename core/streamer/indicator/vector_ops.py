@@ -1,4 +1,5 @@
-"""지표의 ``precompute_series``가 쓰는 롤링 축약 — **루프 경로와 비트 단위로 같다**.
+"""지표의 ``VectorizableNumericIndicator.compute()``가 쓰는 롤링 축약 — **루프 경로와 비트
+단위로 같다**.
 
 여기 있는 함수들의 존재 이유는 속도가 아니라 **정확성**이다. pandas의 ``rolling().mean()``은
 빠르지만 루프 지표의 증분 합산과 **더하는 순서가 달라서**, 부동소수점 반올림이 갈린다
@@ -29,7 +30,7 @@ def rolling_mean_exact(x: np.ndarray, window: int) -> np.ndarray:
     ``_sum``이 된다. 워밍업 구간에는 뺄 것이 없으므로 0.0을 놓는다 (``s + 0.0 == s``, 정확).
 
     :param x: 창에 넣을 값 (종가, TR, 거래량 등).
-    :param window: 창 길이. 이보다 짧은 앞부분은 NaN이다 (``precompute_series`` 규약).
+    :param window: 창 길이. 이보다 짧은 앞부분은 NaN이다 (``VectorizableNumericIndicator.compute()`` 규약).
     """
     n = len(x)
     out = np.full(n, np.nan, dtype=np.float64)

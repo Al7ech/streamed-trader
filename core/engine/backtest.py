@@ -6,10 +6,11 @@ async 순회 — 은 전부 "스트림은 끊기고 시계는 흐른다"는 전�
 과거 구간에는 그 전제가 없다. 그 전제를 걷어내면 이벤트마다 ``Event`` 객체도, async generator
 프로토콜도, 심볼별 앵커 조회도 필요 없고, 무엇보다 **지표를 미리 계산해 둘 수 있다**.
 
-그게 이 엔진의 존재 이유다. ``precompute_series``를 정의한 지표는 그 심볼의 OHLCV 배열로 전
-구간을 한 번에 계산해 두고, 루프에서는 값을 지표의 출력 자리에 하나씩 얹기만 한다. 정의하지
-않은 지표(경로 의존적이거나 ``status``를 읽는 것)는 그대로 캔들마다 갱신되므로 둘을 섞어 써도
-된다. 미리 계산된 값은 루프가 냈을 값과 **비트 단위로 같다** — 그 계약과 그것을 지키는 검사는
+그게 이 엔진의 존재 이유다. ``VectorizableNumericIndicator``(``core.streamer.indicator.
+base_indicator``)를 상속한 지표는 그 심볼의 OHLCV 배열로 전 구간을 한 번에 계산해 두고,
+루프에서는 값을 지표의 출력 자리에 하나씩 얹기만 한다. 그렇지 않은 지표(경로 의존적이거나
+``status``를 읽는 것)는 그대로 캔들마다 갱신되므로 둘을 섞어 써도 된다. 미리 계산된 값은
+루프가 냈을 값과 **비트 단위로 같다** — 그 계약과 그것을 지키는 검사는
 :mod:`core.streamer.indicator.vector_ops` 참고.
 
 **두 벌이 된 순서 규약이 갈라지지 않는다는 보장은 문서가 아니라 검사다.**
@@ -31,7 +32,7 @@ from core.candle.merge import merge_by_end_time
 from core.executor.base import Executor
 from core.recorder.base import NullRecorder, Recorder
 from core.streamer import BaseStreamer
-from core.streamer.indicator.base_indicator import BaseIndicator
+from core.streamer.indicator.base_indicator import BaseIndicator, VectorizableNumericIndicator
 
 #: 미리 계산한 배열을 파이썬 float으로 바꿀 때 한 번에 처리할 개수. :func:`_iter_floats` 참고.
 _TOLIST_CHUNK = 1 << 16
@@ -51,7 +52,7 @@ class BacktestEngine:
     :param recorder: None이면 :class:`~core.recorder.base.NullRecorder`.
     :param vectorize: False면 선계산을 통째로 끄고 전 지표를 ``update()``로 돌린다. 결과는
         같아야 하므로(위 모듈 docstring) 정확성을 위한 스위치가 아니라, 새로 쓴
-        ``precompute_series``를 의심할 때 쓰는 대조 수단이다.
+        ``VectorizableNumericIndicator.compute()``를 의심할 때 쓰는 대조 수단이다.
     :param progress: 이벤트 진행바 표시 여부.
 
     **생성자가 ``executor.on_trade``를 레코더로 덮어쓴다** — :class:`TradingEngine`과 같은
@@ -95,8 +96,10 @@ class BacktestEngine:
     def _precompute(self) -> Dict[str, Playback]:
         """심볼마다 "미리 계산된 것"과 "루프로 돌릴 것"을 갈라 미리 묶어 둔다.
 
-        벡터화 대상 판정은 ``precompute_series``와 ``precomputed_sink``가 **둘 다** 있는지다.
-        하나만 있으면 루프로 돌린다 — 계산해 둔 값을 얹을 자리가 없거나, 얹을 값이 없다.
+        벡터화 대상 판정은 ``isinstance(indicator, VectorizableNumericIndicator)``다. 그
+        ABC는 ``compute``/``sink`` 둘 다 abstractmethod라, 하나만 정의하면 그 지표는 클래스
+        정의 시점에 인스턴스화 자체가 실패한다 — 여기서 조용히 루프로 폴백하는 실패 모드는
+        없다.
         """
         playback: Dict[str, Playback] = {}
         for symbol, indicators in self.streamer.indicators.items():
@@ -106,39 +109,39 @@ class BacktestEngine:
             sinks: List[Tuple[Callable[[Optional[float]], None], Iterator[float]]] = []
             loop: List[BaseIndicator] = []
             for name, indicator in indicators.items():
-                precompute = getattr(indicator, "precompute_series", None) if arrays else None
-                make_sink = getattr(indicator, "precomputed_sink", None) if precompute else None
-                if make_sink is None:
+                if arrays is not None and isinstance(indicator, VectorizableNumericIndicator):
+                    series = self._precompute_one(symbol, name, indicator.compute, arrays,
+                                                  len(candles))
+                    sinks.append((indicator.sink(), _iter_floats(series)))
+                else:
                     loop.append(indicator)
-                    continue
-                series = self._precompute_one(symbol, name, precompute, arrays, len(candles))
-                sinks.append((make_sink(), _iter_floats(series)))
             playback[symbol] = (sinks, loop)
 
-            # 심볼당 한 줄. 오타 난 precompute_series 하나가 조용히 10초를 먹는 일이 없게,
-            # 무엇이 미리 계산됐고 무엇이 루프로 도는지 런 로그에 남긴다.
+            # 심볼당 한 줄. VectorizableNumericIndicator를 빼먹어 조용히 루프로 도는 지표가
+            # 있어도 10초를 먹는 일이 없게, 무엇이 미리 계산됐고 무엇이 루프로 도는지 런
+            # 로그에 남긴다.
             self.logger.info("[%s] 캔들 %d개 — 미리 계산한 지표 %d개, 루프로 도는 지표 %d개",
                              symbol, len(candles), len(sinks), len(loop))
         return playback
 
-    def _precompute_one(self, symbol: str, name: str, precompute, arrays, n: int) -> np.ndarray:
+    def _precompute_one(self, symbol: str, name: str, compute, arrays, n: int) -> np.ndarray:
         """지표 하나의 전 구간을 계산하고 재생 가능한 모양인지 확인한다."""
-        series = precompute(*arrays)
+        series = compute(*arrays)
         # 길이가 어긋나면 커서가 조용히 밀려 전략이 다른 봉의 값을 보게 된다 — 결과가 틀린
         # 채로 끝까지 도는 것보다 여기서 죽는 편이 낫다.
         if len(series) != n:
             raise ValueError(
-                f"{symbol}.{name}.precompute_series가 캔들 수와 다른 길이를 돌려줬다: "
+                f"{symbol}.{name}.compute()가 캔들 수와 다른 길이를 돌려줬다: "
                 f"{len(series)} != {n}")
         # float64가 아니면 지표 deque와 샤드 JSON까지 다른 타입이 흘러간다.
         if series.dtype != np.float64:
             raise ValueError(
-                f"{symbol}.{name}.precompute_series의 dtype이 float64가 아니다: {series.dtype}")
+                f"{symbol}.{name}.compute()의 dtype이 float64가 아니다: {series.dtype}")
         return series
 
     @staticmethod
     def _ohlcv(candles: List[Candle]) -> Tuple[np.ndarray, ...]:
-        """``precompute_series``에 넘길 (open, high, low, close, volume) 배열."""
+        """``VectorizableNumericIndicator.compute()``에 넘길 (open, high, low, close, volume) 배열."""
         n = len(candles)
         return tuple(np.fromiter((getattr(c, k) for c in candles), np.float64, n)
                      for k in ("open", "high", "low", "close", "volume"))

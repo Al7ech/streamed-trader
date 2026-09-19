@@ -3,7 +3,7 @@
 - :class:`~core.engine.engine.TradingEngine` — 드라이런/라이브. 캔들 공급자를 ``async for``로
   소비하며, 연속성 앵커·구멍 백필·결정 기한·지표 워밍업을 갖는다.
 - :class:`~core.engine.backtest.BacktestEngine` — 백테스트. 캔들을 메모리에 다 들고 시작하고,
-  ``precompute_series``를 정의한 지표를 먼저 통째로 계산한 뒤 동기 루프를 돈다.
+  ``VectorizableNumericIndicator``를 상속한 지표를 먼저 통째로 계산한 뒤 동기 루프를 돈다.
 
 ===========  ==============================  ==================  ================
              캔들                            Executor            Recorder

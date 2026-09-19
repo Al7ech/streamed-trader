@@ -5,11 +5,11 @@ import numpy as np
 
 from core.candle.candle import Candle
 from core.account.status import Status
-from core.streamer.indicator.base_indicator import NumericIndicator
+from core.streamer.indicator.base_indicator import VectorizableNumericIndicator
 from core.streamer.indicator.vector_ops import rolling_mean_exact, true_range
 
 
-class ATRIndicator(NumericIndicator):
+class ATRIndicator(VectorizableNumericIndicator):
     """
     Simple (non-Wilder) moving average of True Range over `window` candles.
     True Range = max(high-low, |high-prev_close|, |low-prev_close|).
@@ -46,8 +46,8 @@ class ATRIndicator(NumericIndicator):
             return
         self._deque.append(self._sum / self.window)
 
-    def precompute_series(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
-                          close: np.ndarray, volume: np.ndarray) -> np.ndarray:
+    def compute(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
+                close: np.ndarray, volume: np.ndarray) -> np.ndarray:
         # TR 계산도 위 update()와 같은 식이고, 그 위의 롤링 평균도 같은 증분 합산을 펼친
         # 것이라 전 구간이 비트 단위로 같다 (vector_ops 참고).
         return rolling_mean_exact(true_range(high, low, close), self.window)
