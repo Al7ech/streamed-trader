@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 from core.trader.trader import DEFAULT_DECIDE_DEADLINE_S, BinanceTrader
 from core.logging_config import setup_logging
-from core.streamer.strategies.keltner_streamer import KeltnerStreamer
+from core.streamer.strategies.ryul_streamer_edit2 import RyulStreamer_edit2
 
 logger = logging.getLogger(__name__)
 
@@ -54,17 +54,27 @@ async def main():
     # dropped. 0 disables it. Dry run ignores it.
     DECIDE_DEADLINE_S = float(os.getenv("DECIDE_DEADLINE_S", DEFAULT_DECIDE_DEADLINE_S))
 
-    # Initialize the strategy. Swap KeltnerStreamer for any other BaseStreamer here — the
+    # Initialize the strategy. Swap RyulStreamer_edit2 for any other BaseStreamer here — the
     # trader only needs `decide_action` and the `indicators` dict to prefeed.
     # `params` is built once and handed to both the streamer and the run metadata, so the
     # recorded params block has the same shape backtest.py writes.
+    # Defaults are the ETH-optimal "edit2" set (entry_length=4500, win_exit_length=360,
+    # lose_exit_length=180, max_loss=0.08, atr_length=1440, max_channel_pct=6.0,
+    # max_atr_pct=0.11, atr_slope_lookback=1, min_defer_move_pct=3.0) — validated over
+    # ETHUSDT 1m 2020-01-01~2026-07-24: profit 9009.03%, Sharpe 1.9258, MDD 28.21%, 727 fills
+    # (docs/2609-backtest-profiling.md; core/streamer/strategies/ryul_streamer_edit2.py).
     params = dict(
-        window=int(os.getenv("WINDOW", 72 * 60)),
-        m_entry=float(os.getenv("M_ENTRY", 4.0)),
-        m_exit=float(os.getenv("M_EXIT", 3.0)),
-        max_loss=float(os.getenv("MAX_LOSS", 0.005)),
+        entry_length=int(os.getenv("ENTRY_LENGTH", 75 * 60)),
+        win_exit_length=int(os.getenv("WIN_EXIT_LENGTH", 6 * 60)),
+        lose_exit_length=int(os.getenv("LOSE_EXIT_LENGTH", 3 * 60)),
+        max_loss=float(os.getenv("MAX_LOSS", 0.08)),
+        atr_length=int(os.getenv("ATR_LENGTH", 24 * 60)),
+        max_channel_pct=float(os.getenv("MAX_CHANNEL_PCT", 6.0)),
+        max_atr_pct=float(os.getenv("MAX_ATR_PCT", 0.11)),
+        atr_slope_lookback=int(os.getenv("ATR_SLOPE_LOOKBACK", 1)),
+        min_defer_move_pct=float(os.getenv("MIN_DEFER_MOVE_PCT", 3.0)),
     )
-    streamer = KeltnerStreamer(SYMBOLS, **params)
+    streamer = RyulStreamer_edit2(SYMBOLS, **params)
 
     # Create trader and executor. Traded symbols come from streamer.symbols — no separate
     # symbol/symbols argument here.
