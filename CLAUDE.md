@@ -135,6 +135,7 @@ engine (and the backtest entry point) calls — see "Warm-up and gap backfill ar
 ```
 core/
   candle/     Candle (candle.py) + merge.py (merge_by_end_time — the event timeline)
+              + columnar.py (ColumnarCandles — numpy-column Sequence[Candle] for sweeps)
   order/      Action/ActionType (action.py) + order_book.py (resting book + fill rules)
               + symbol_rules.py (SymbolRules) + symbol_rules_data.py (generated, all symbols)
   account/    Status/PositionState (status.py), Trade (trade.py), Report (report.py)
@@ -149,6 +150,8 @@ core/
               binance_order_client.py
   recorder/   base.py = Recorder ABC + NullRecorder; simple.py = SimpleRecorder (trades + equity curve only); full.py = FullRecorder(SimpleRecorder) + B&H baseline + run JSON/shards; live.py
   result/     writer.py (run JSON + shards), metrics.py, indicator_columns.py
+  sweep/      ParameterSweep, SweepJob, load_columnar (runner.py) — backtest-grid assembly
+              over fork workers; builds parts and runs BacktestEngine, owns no loop
   trader/     BinanceTrader (trader.py) — live/dry-run assembly + lifecycle; ServerClock
               (server_clock.py) — exchange time for warm-up end + decision deadline; README.md here
   checks/     live_check.py, backtest_check.py, compare.py (shared Report comparator),
@@ -165,6 +168,7 @@ utils ← candle ← order ← account
       {producer,executor,recorder,history} impls ← their own base, account, order, candle,
                                                     fetcher, result
       trader ← engine, producer, executor, recorder, history, account, fetcher, streamer
+      sweep  ← engine, executor, recorder, history, account, candle, result, streamer
 ```
 
 Rules that hold this together — a change that breaks one is a design change, not a tidy-up:
@@ -517,7 +521,11 @@ candle, and the `streamer.symbols` loop filters the rest out naturally.
 
 ### The backtest engine (`core/engine/backtest.py`)
 
-`BacktestEngine(streamer, candles_by_symbol, executor, recorder, *, vectorize=True, progress=True)`.
+`BacktestEngine(streamer, candles_by_symbol, executor, recorder, *, vectorize=True, progress=True,
+precomputed=None)`. `candles_by_symbol` values may be `List[Candle]` or `ColumnarCandles` (same
+result; the latter hands its arrays to precompute without the `np.fromiter` copy). `precomputed`
+is an optional dict keyed `(symbol, indicator.cache_key())`: hits are reused, misses computed and
+stored; indicators whose `cache_key()` is `None` (the default — opt-in, see below) bypass it.
 `run()` is three phases: check the symbols agree on a candle interval, precompute, loop, then
 `recorder.close()` (after the loop, not in a `finally` — a run that ended in an exception leaves no
 half-written artifacts) and return `recorder.report`.
@@ -569,6 +577,34 @@ indicator and add it there too.
 `vectorize=False` exists only as a debug switch (suspect a new `precompute_series`? run both and
 compare); it is not needed for correctness, and `backtest_check.py` section 2 asserts the two agree
 over real candles.
+
+### Parameter sweeps (`core/sweep/`)
+
+`ParameterSweep(factory, candles_by_symbol, init_margin=..., fee_ratio=...).run(jobs)` runs one
+`BacktestEngine` per `SweepJob(symbols, params, tag)` across fork workers and returns
+`[(job, summary_dict)]` in job order. It is an **assembly layer like `trader/`**, not an engine: it
+constructs `SimulatedExecutor` + `SimpleRecorder`, hands them to `BacktestEngine`, and owns no loop,
+so a sweep cell equals a direct engine run fill for fill (`backtest_check.py` section 6 asserts it,
+sequential and forked).
+
+Why it looks the way it does — memory, not CPU, is the limit. 1m x 6.5y is ~1.8GB per symbol as
+`List[Candle]`, and a forked child that merely iterates the list touches every object's refcount,
+so copy-on-write duplicates it per worker. `ColumnarCandles` holds the same data as ~200MB of
+read-only numpy buffers that fork children share untouched, and builds `Candle`s per 64k block while
+iterating (~1.4s per 3.45M). `load_columnar` fetches one symbol at a time and drops the list so the
+peak is one symbol's worth. Before forking, the parent builds every cell's streamer once and fills
+the precompute cache for keyed indicators (`VectorizableIndicator.cache_key()` via
+`_own_cache_key(owner, *params)`, which returns `None` for a subclass that overrides
+`compute`/`update`, so a changed computation never inherits its parent's key), then
+`gc.freeze()`s. The factory, summariser, candles and cache sit in a module global that workers
+inherit through fork; only job indices go out and only the summary dict comes back (a `Report`
+would pickle a 3.45M-tuple equity curve into the parent). Worker count defaults to
+`min(cpu_count, 0.8 * MemAvailable / worker_mem_gb (0.6), n_jobs)` — all logical CPUs, since
+workers past the physical P-cores slow each cell but still raise throughput (ETH 49 cells: 10
+workers 168s, 14 143s, 20 126s); `workers=1` runs in-process.
+The default summariser is `result.metrics.summarise_report` (profit, log growth, CAGR, MDD, top-5
+drawdown episodes, Sharpe, fills/closes/fees, `trades_digest`); a custom one receives
+`(report, streamer)`.
 
 ### Backtest output format (`core/result/writer.py`)
 

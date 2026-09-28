@@ -38,6 +38,9 @@ class MinDonchianIndicator(VectorizableNumericIndicator):
                 close: np.ndarray, volume: np.ndarray) -> np.ndarray:
         return pd.Series(low).rolling(self.window).min().to_numpy()
 
+    def cache_key(self):
+        return self._own_cache_key(MinDonchianIndicator, self.window)
+
 
 class MaxDonchianIndicator(VectorizableNumericIndicator):
     def __init__(self, window: int):
@@ -67,3 +70,6 @@ class MaxDonchianIndicator(VectorizableNumericIndicator):
     def compute(self, open: np.ndarray, high: np.ndarray, low: np.ndarray,
                 close: np.ndarray, volume: np.ndarray) -> np.ndarray:
         return pd.Series(high).rolling(self.window).max().to_numpy()
+
+    def cache_key(self):
+        return self._own_cache_key(MaxDonchianIndicator, self.window)

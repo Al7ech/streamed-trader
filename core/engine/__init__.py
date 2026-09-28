@@ -10,6 +10,8 @@
 ===========  ==============================  ==================  ================
 백테스트     Dict[str, List[Candle]]         executor.Simulated  recorder.Backtest
              (BacktestEngine이 직접 받는다)   Executor            Recorder
+             또는 candle.ColumnarCandles
+             (파라미터 스윕: core.sweep)
 드라이런     producer.LiveCandleProducer     executor.Simulated  recorder.LiveRecorder
                                              Executor
 라이브       producer.LiveCandleProducer     executor.LiveExec   recorder.LiveRecorder

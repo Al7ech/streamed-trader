@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from collections import deque
-from typing import Callable, Optional
+from typing import Callable, Hashable, Optional
 
 import numpy as np
 
@@ -178,6 +178,32 @@ class VectorizableIndicator(ABC):
         전용으로 남아야 한다.
         """
         pass
+
+    def cache_key(self) -> Optional[Hashable]:
+        """같은 캔들 위에서 ``compute()``가 같은 수열을 낸다는 것을 보증하는 키. 기본은
+        ``None``(캐시 안 함)이다.
+
+        ``BacktestEngine``에 ``precomputed`` 캐시를 넘기면 ``(symbol, cache_key())``가 같은
+        지표끼리 선계산 배열을 공유한다 — 파라미터 스윕(:mod:`core.sweep`)이 격자 전체의
+        지표를 한 번씩만 계산하는 근거다. 키가 틀리면 **다른 지표의 값이 조용히 얹히므로**
+        opt-in이다: 지표는 :meth:`_own_cache_key`로 compute에 영향을 주는 인자를 전부
+        넘겨야 한다. ``history_size``처럼 보관만 바꾸는 인자는 넣지 않는다.
+        """
+        return None
+
+    def _own_cache_key(self, owner: type, *params: Hashable) -> Optional[Hashable]:
+        """``owner``가 정의한 계산 그대로일 때만 ``(owner, *params)``를 키로 준다.
+
+        ``compute``나 ``update``를 오버라이드한 서브클래스는 같은 인자로도 다른 값을 낼 수
+        있는데, 부모의 ``cache_key``를 그대로 물려받으면 부모와 같은 키를 갖게 된다. 그런
+        서브클래스는 여기서 ``None``이 되어 캐시에서 빠진다 — 캐시에 넣고 싶으면 자기
+        ``cache_key``를 정의하면 된다. 오버라이드 없이 상속만 한 서브클래스는 계산이 같으므로
+        부모와 키를 공유한다.
+        """
+        cls = type(self)
+        if cls.compute is not owner.compute or cls.update is not owner.update:
+            return None
+        return (owner,) + params
 
 
 class VectorizableNumericIndicator(NumericIndicator, VectorizableIndicator):

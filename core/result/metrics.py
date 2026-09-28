@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import math
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -125,3 +126,65 @@ def compute_max_drawdown(equity_curve: List[Tuple[int, float]]) -> Dict[str, flo
                     "trough_timestamp": ts, "trough_equity": eq}
 
     return best
+
+
+def top_drawdowns(equity_curve: List[Tuple[int, float]], k: int = 5) -> List[float]:
+    """겹치지 않는 드로다운 에피소드(고점 갱신으로 구분)별 최대 낙폭 상위 k개, %.
+
+    MDD는 max 통계라 1위 에피소드 하나만 깎아도 개선으로 보인다. 위험이 줄었는지 재분배됐는지
+    보려면 상위 몇 개를 같이 봐야 한다.
+    """
+    if not equity_curve:
+        return []
+    eq = np.fromiter((v for _, v in equity_curve), np.float64, len(equity_curve))
+    peak = np.maximum.accumulate(eq)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dd = np.where(peak > 0, 1 - eq / peak, 0.0)
+    new_peak = np.r_[True, peak[1:] > peak[:-1]]
+    ep_max = np.maximum.reduceat(dd, np.flatnonzero(new_peak))
+    return sorted((ep_max * 100).tolist(), reverse=True)[:k]
+
+
+def trades_digest(trades) -> str:
+    """체결 목록의 지문 — ``(timestamp, symbol, quantity, price)``의 sha1. 두 실행이 같은
+    체결을 냈는지 요약 dict 하나로 비교할 때 쓴다 (``Report``를 통째로 옮기지 않고)."""
+    h = hashlib.sha1()
+    for t in trades:
+        h.update(repr((t.timestamp, t.symbol, t.quantity, t.price)).encode())
+    return h.hexdigest()
+
+
+def summarise_report(report, init_margin: float) -> Dict[str, float]:
+    """스윕 한 칸의 표준 요약. ``report``는 :class:`~core.account.report.Report`.
+
+    - ``log_growth``: ln(최종/초기). MDD를 맞춘 프런티어 비교는 이 값으로 보간한다.
+    - ``closes``: 포지션을 줄이는 체결 수 (``pre_position``과 부호가 반대인 체결).
+    - ``fees``: 수수료 합. ``Trade.wnl``은 수수료를 빼지 않은 총액이라 따로 둔다.
+    - ``trades_digest``: :func:`trades_digest`.
+    """
+    eq = report.equity_curve
+    final = eq[-1][1] if eq else init_margin
+    years = (eq[-1][0] - eq[0][0]) / 1000 / 86400 / 365.25 if len(eq) > 1 else 0.0
+    mdd = compute_max_drawdown(eq)["max_drawdown"] * 100
+    if final <= 0:
+        cagr = -100.0
+    elif years > 0:
+        cagr = ((final / init_margin) ** (1 / years) - 1) * 100
+    else:
+        cagr = 0.0
+    top = top_drawdowns(eq)
+    return {
+        "profit_pct": (final / init_margin - 1) * 100,
+        "log_growth": math.log(max(final, 1e-9) / init_margin),
+        "cagr_pct": cagr,
+        "mdd_pct": mdd,
+        "top5_dd_avg": float(np.mean(top)) if top else 0.0,
+        "top5_dd": top,
+        "mar": cagr / mdd if mdd > 0 else float("nan"),
+        "sharpe": compute_sharpe(eq),
+        "fills": len(report.trades),
+        "closes": sum(1 for t in report.trades if t.pre_position * t.quantity < 0),
+        "fees": sum(t.fee for t in report.trades),
+        "max_leverage": report.max_leverage,
+        "trades_digest": trades_digest(report.trades),
+    }

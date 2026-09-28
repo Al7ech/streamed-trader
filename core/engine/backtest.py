@@ -21,7 +21,8 @@ reduce_only+슬리피지). 아래 :meth:`BacktestEngine._loop`의 단계 순서�
 
 import logging
 import sys
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import (Callable, Dict, Hashable, Iterator, List, MutableMapping, Optional,
+                    Sequence, Tuple)
 
 import numpy as np
 from tqdm import tqdm
@@ -46,14 +47,20 @@ class BacktestEngine:
     """메모리에 올린 캔들로 백테스트 한 번을 돌린다.
 
     :param streamer: 전략. ``symbols``와 ``indicators``를 여기서 읽는다.
-    :param candles_by_symbol: 심볼별 캔들 리스트 (각자 ``end_time`` 오름차순). 심볼마다 길이가
+    :param candles_by_symbol: 심볼별 캔들 시퀀스 (각자 ``end_time`` 오름차순). 심볼마다 길이가
         달라도 된다 — 상장일이 다르거나 구간에 구멍이 있는 시계열은 병합이 그대로 처리한다.
         스트리머가 다루지 않는 심볼이 섞여 있어도 된다 (지표가 없을 뿐 실행기·레코더는 본다).
+        ``List[Candle]`` 대신 :class:`~core.candle.columnar.ColumnarCandles`를 넘겨도 된다 —
+        결과는 같고, 선계산이 그 배열을 복사 없이 쓴다.
     :param recorder: None이면 :class:`~core.recorder.base.NullRecorder`.
     :param vectorize: False면 선계산을 통째로 끄고 전 지표를 ``update()``로 돌린다. 결과는
         같아야 하므로(위 모듈 docstring) 정확성을 위한 스위치가 아니라, 새로 쓴
         ``VectorizableIndicator.compute()``를 의심할 때 쓰는 대조 수단이다.
     :param progress: 이벤트 진행바 표시 여부.
+    :param precomputed: 선계산 배열 캐시. ``(symbol, indicator.cache_key())``를 키로 찾아
+        있으면 재사용하고, 없으면 계산해 **넣는다**. ``cache_key()``가 ``None``인 지표는
+        캐시를 거치지 않는다. 같은 캔들로 여러 번 돌리는 호출자(파라미터 스윕)가 런 사이에
+        같은 dict를 넘기라고 있는 것이다 — 캔들이 바뀌면 캐시도 새로 만들어야 한다.
 
     **생성자가 ``executor.on_trade``를 레코더로 덮어쓴다** — :class:`TradingEngine`과 같은
     배선이다. 부품을 만드는 것은 호출자, 엮고 돌리는 것은 엔진이다.
@@ -64,15 +71,17 @@ class BacktestEngine:
     0~1개인 심볼에서도 맞다).
     """
 
-    def __init__(self, streamer: BaseStreamer, candles_by_symbol: Dict[str, List[Candle]],
+    def __init__(self, streamer: BaseStreamer, candles_by_symbol: Dict[str, Sequence[Candle]],
                  executor: Executor, recorder: Optional[Recorder] = None, *,
-                 vectorize: bool = True, progress: bool = True):
+                 vectorize: bool = True, progress: bool = True,
+                 precomputed: Optional[MutableMapping[Hashable, np.ndarray]] = None):
         self.streamer = streamer
         self.candles_by_symbol = candles_by_symbol
         self.executor = executor
         self.recorder = recorder if recorder is not None else NullRecorder()
         self.vectorize = vectorize
         self.progress = progress
+        self.precomputed = precomputed
         self.logger = logging.getLogger(__name__)
 
         self.executor.on_trade = self.recorder.record_trade
@@ -113,8 +122,8 @@ class BacktestEngine:
             loop: List[BaseIndicator] = []
             for name, indicator in indicators.items():
                 if arrays is not None and isinstance(indicator, VectorizableIndicator):
-                    series = self._precompute_one(symbol, name, indicator.compute, arrays,
-                                                  len(candles))
+                    series = self._cached_or_compute(symbol, name, indicator, arrays,
+                                                     len(candles))
                     sinks.append((indicator.sink(), _iter_floats(series)))
                 else:
                     loop.append(indicator)
@@ -127,9 +136,24 @@ class BacktestEngine:
                              symbol, len(candles), len(sinks), len(loop))
         return playback
 
-    def _precompute_one(self, symbol: str, name: str, compute, arrays, n: int) -> np.ndarray:
-        """지표 하나의 전 구간을 계산하고 재생 가능한 모양인지 확인한다."""
-        series = compute(*arrays)
+    def _cached_or_compute(self, symbol: str, name: str, indicator: VectorizableIndicator,
+                           arrays, n: int) -> np.ndarray:
+        """``precomputed`` 캐시에 있으면 그것을, 없으면 계산해 캐시에 넣고 돌려준다.
+
+        캐시에서 꺼낸 배열도 :meth:`_check_series`를 다시 거친다 — 다른 캔들로 채운 캐시를
+        잘못 넘기면 적어도 길이에서 걸린다.
+        """
+        key = indicator.cache_key() if self.precomputed is not None else None
+        if key is None:
+            return self._check_series(symbol, name, indicator.compute(*arrays), n)
+        cache_key = (symbol, key)
+        series = self.precomputed.get(cache_key)
+        if series is None:
+            series = self.precomputed[cache_key] = indicator.compute(*arrays)
+        return self._check_series(symbol, name, series, n)
+
+    def _check_series(self, symbol: str, name: str, series: np.ndarray, n: int) -> np.ndarray:
+        """선계산 수열이 재생 가능한 모양인지 확인한다."""
         # 길이가 어긋나면 커서가 조용히 밀려 전략이 다른 봉의 값을 보게 된다 — 결과가 틀린
         # 채로 끝까지 도는 것보다 여기서 죽는 편이 낫다.
         if len(series) != n:
@@ -144,8 +168,15 @@ class BacktestEngine:
         return series
 
     @staticmethod
-    def _ohlcv(candles: List[Candle]) -> Tuple[np.ndarray, ...]:
-        """``VectorizableIndicator.compute()``에 넘길 (open, high, low, close, volume) 배열."""
+    def _ohlcv(candles: Sequence[Candle]) -> Tuple[np.ndarray, ...]:
+        """``VectorizableIndicator.compute()``에 넘길 (open, high, low, close, volume) 배열.
+
+        열로 든 캔들(:class:`~core.candle.columnar.ColumnarCandles`)은 자기 배열을 그대로
+        내준다 — 1m 6.5년에서 ``np.fromiter`` 다섯 번(~0.7초)을 건너뛴다.
+        """
+        ohlcv = getattr(candles, "ohlcv", None)
+        if ohlcv is not None:
+            return ohlcv()
         n = len(candles)
         return tuple(np.fromiter((getattr(c, k) for c in candles), np.float64, n)
                      for k in ("open", "high", "low", "close", "volume"))

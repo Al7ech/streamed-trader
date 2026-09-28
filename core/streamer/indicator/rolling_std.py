@@ -38,3 +38,6 @@ class RollingStd(VectorizableNumericIndicator):
                 close: np.ndarray, volume: np.ndarray) -> np.ndarray:
         # 위 update()와 같은 창 단위 np.std(ddof=1) — 비트 단위로 같다 (vector_ops 참고).
         return rolling_std_exact(close, self.window)
+
+    def cache_key(self):
+        return self._own_cache_key(RollingStd, self.window)

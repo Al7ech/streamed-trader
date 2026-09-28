@@ -37,3 +37,6 @@ class MovingAverage(VectorizableNumericIndicator):
                 close: np.ndarray, volume: np.ndarray) -> np.ndarray:
         # 위 update()의 증분 합산을 그대로 펼친다 — 비트 단위로 같다 (vector_ops 참고).
         return rolling_mean_exact(close, self.window)
+
+    def cache_key(self):
+        return self._own_cache_key(MovingAverage, self.window)

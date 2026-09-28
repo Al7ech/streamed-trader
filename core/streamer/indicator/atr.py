@@ -51,3 +51,6 @@ class ATRIndicator(VectorizableNumericIndicator):
         # TR 계산도 위 update()와 같은 식이고, 그 위의 롤링 평균도 같은 증분 합산을 펼친
         # 것이라 전 구간이 비트 단위로 같다 (vector_ops 참고).
         return rolling_mean_exact(true_range(high, low, close), self.window)
+
+    def cache_key(self):
+        return self._own_cache_key(ATRIndicator, self.window)

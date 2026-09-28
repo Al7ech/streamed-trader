@@ -16,9 +16,13 @@
 4. **퇴화 입력** — 빈 캔들, 캔들 1개, 지표 없는 심볼 등에서 죽지 않는지.
 5. **심볼 규칙과 체결 회계** — 수량/가격 양자화 도우미, 규칙 위반 주문 거부, 체결 후 포지션
    정규화(부동소수점 잔여가 남지 않는지).
+6. **열 캔들, 선계산 캐시, 스윕** — ``ColumnarCandles``가 원본 캔들을 필드·타입까지 돌려주는지,
+   ``cache_key``가 같으면 계산이 같은지, 리스트 입력 == 열 입력 == 캐시 주입 Report인지,
+   ``ParameterSweep``(순차/fork) 요약이 엔진을 직접 돌린 요약과 같은지. 합성 캔들 부분은
+   오프라인, 실제 캔들 부분은 온라인에서 돈다.
 
     uv run python core/checks/backtest_check.py            # 전부
-    uv run python core/checks/backtest_check.py --offline  # 캔들 캐시가 필요 없는 1, 4, 5 만
+    uv run python core/checks/backtest_check.py --offline  # 캔들 캐시가 필요 없는 1, 4, 5, 6(합성) 만
 """
 import sys
 from datetime import datetime, timezone
@@ -27,6 +31,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from core.candle.candle import Candle
+from core.candle.columnar import ColumnarCandles
 from core.checks.compare import compare_reports
 from core.engine.backtest import BacktestEngine
 from core.executor.simulated import SimulatedExecutor
@@ -35,6 +40,8 @@ from core.order.symbol_rules import DEFAULT_RULES, SymbolRules
 from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
 from core.logging_config import setup_logging
 from core.recorder.full import FullRecorder
+from core.recorder.simple import SimpleRecorder
+from core.result.metrics import summarise_report
 from core.streamer.indicator.atr import ATRIndicator
 from core.streamer.indicator.donchian_channel import MaxDonchianIndicator, MinDonchianIndicator
 from core.streamer.indicator.moving_average import MovingAverage
@@ -45,6 +52,7 @@ from core.streamer.strategies.keltner_streamer import KeltnerStreamer
 from core.streamer.strategies.mean_reversion_zscore import MeanReversionZScoreStreamer
 from core.streamer.strategies.momentum_time_exit import MomentumTimeExitStreamer
 from core.streamer.strategies.supertrend_streamer import SupertrendStreamer
+from core.sweep import ParameterSweep, SweepJob
 
 MIN = 60_000
 SYM, SYM2 = "ETHUSDT", "BTCUSDT"
@@ -370,6 +378,156 @@ def check_symbol_rules():
         check("심볼 규칙: 모르는 심볼은 KeyError", True)
 
 
+# ==================================================== 6. 열 캔들, 선계산 캐시, 스윕
+
+
+_CANDLE_FIELDS = ("open", "high", "low", "close", "volume", "start_time", "end_time",
+                  "taker_buy_volume", "trade_count")
+
+
+def _fields(c: Candle):
+    return tuple(getattr(c, k) for k in _CANDLE_FIELDS)
+
+
+def _pure_python(c: Candle) -> bool:
+    """열에서 나온 캔들의 필드는 numpy 스칼라가 아니라 파이썬 float/int/None이어야 한다 —
+    ``np.float64``가 새면 ``Trade.price``와 샤드 JSON까지 흘러간다 (``_iter_floats`` 참고)."""
+    return all(type(getattr(c, k)) in (float, int, type(None)) for k in _CANDLE_FIELDS)
+
+
+def check_columnar_roundtrip():
+    """``ColumnarCandles``가 원본 캔들을 값 그대로, 파이썬 스칼라로 돌려주는가."""
+    base = synthetic_candles(3 * (1 << 16) + 17, seed=3)  # 블록 경계를 넘는 길이
+    mixed = synthetic_candles(1000, seed=4)
+    for i, c in enumerate(mixed):  # 일부만 있는 선택 필드 — None이 그 자리에 돌아와야 한다
+        c.taker_buy_volume = None if i % 3 == 0 else c.volume * 0.4
+        c.trade_count = None if i % 5 == 0 else i * 7
+    for label, candles in [("합성 (선택 필드 없음)", base), ("선택 필드 일부 None", mixed),
+                           ("빈 시퀀스", [])]:
+        col = ColumnarCandles.from_candles(candles)
+        same = (len(col) == len(candles)
+                and all(_fields(a) == _fields(b) and _pure_python(b)
+                        for a, b in zip(candles, col)))
+        check(f"열 캔들 왕복: {label}", same)
+    col = ColumnarCandles.from_candles(mixed)
+    check("열 캔들 인덱싱: [0], [-1], 슬라이스",
+          _fields(col[0]) == _fields(mixed[0]) and _fields(col[-1]) == _fields(mixed[-1])
+          and [_fields(c) for c in col[10:20]] == [_fields(c) for c in mixed[10:20]])
+    try:
+        col.close[0] = 0.0
+        check("열 캔들은 읽기 전용", False, "배열에 쓰기가 됐다")
+    except ValueError:
+        check("열 캔들은 읽기 전용", True)
+
+
+def check_cache_keys():
+    """``cache_key``가 같으면 ``compute()``가 비트 단위로 같고, 계산을 바꾼 서브클래스는 키가
+    없는가."""
+    arrays = _ohlcv(synthetic_candles(5000, seed=5))
+    for name, make in _indicator_cases(60):
+        a, b = make(), make()
+        ka, kb = a.cache_key(), b.cache_key()
+        check(f"cache_key: {name}", ka is not None and ka == kb
+              and np.array_equal(a.compute(*arrays), b.compute(*arrays), equal_nan=True),
+              f"{ka!r} vs {kb!r}")
+    check("cache_key: 창이 다르면 키가 다르다",
+          MovingAverage(60).cache_key() != MovingAverage(61).cache_key())
+    check("cache_key: 종류가 다르면 키가 다르다",
+          MaxDonchianIndicator(60).cache_key() != MinDonchianIndicator(60).cache_key())
+
+    class _Shifted(MovingAverage):  # compute를 바꾼 서브클래스 — 부모 키를 물려받으면 안 된다
+        def compute(self, open, high, low, close, volume):
+            return super().compute(open, high, low, close, volume) + 1.0
+
+    class _Plain(MovingAverage):  # 계산은 그대로 — 부모와 키를 공유해도 된다
+        pass
+
+    check("cache_key: compute를 오버라이드한 서브클래스는 None", _Shifted(60).cache_key() is None)
+    check("cache_key: 상속만 한 서브클래스는 부모와 같은 키",
+          _Plain(60).cache_key() == MovingAverage(60).cache_key())
+
+
+def _run_simple(streamer, candles_by_symbol, precomputed=None):
+    executor = SimulatedExecutor(INIT_MARGIN)
+    return BacktestEngine(streamer, candles_by_symbol, executor, SimpleRecorder(executor.status),
+                          progress=False, precomputed=precomputed).run()
+
+
+def check_columnar_and_cache_parity(by_symbol: Dict[str, List[Candle]], label: str):
+    """리스트 입력 == 열 입력 == 캐시 주입(빈 캐시 → 채운 캐시) Report."""
+    symbols = list(by_symbol)
+    kp = dict(window=6 * 60, m_entry=2.0, m_exit=0.0, max_loss=0.02)
+    make = lambda: KeltnerStreamer(symbols=symbols, **kp)  # noqa: E731
+    columnar = {s: ColumnarCandles.from_candles(c) for s, c in by_symbol.items()}
+    ref = _run_simple(make(), by_symbol)
+    col = _run_simple(make(), columnar)
+    check(f"리스트 == 열 캔들: {label}", compare_reports(label, ref, col),
+          f"trades={len(ref.trades)} final={ref.status.total_margin():.2f}")
+    cache: Dict = {}
+    first = _run_simple(make(), columnar, cache)
+    filled = len(cache)
+    second = _run_simple(make(), columnar, cache)
+    check(f"캐시 주입 == 미주입: {label}",
+          filled > 0 and len(cache) == filled
+          and compare_reports(label, ref, first) and compare_reports(label, ref, second),
+          f"캐시 {filled}개")
+
+
+def check_sweep_parity(by_symbol: Dict[str, List[Candle]], label: str):
+    """``ParameterSweep``(순차/fork)의 요약 == 엔진을 직접 돌린 요약."""
+    sym = next(iter(by_symbol))
+    candles = {sym: ColumnarCandles.from_candles(by_symbol[sym])}
+    grid = [dict(window=w, m_entry=2.0, m_exit=0.0, max_loss=ml)
+            for w in (3 * 60, 6 * 60) for ml in (0.01, 0.02, 0.04)]
+    factory = lambda syms, p: KeltnerStreamer(symbols=syms, **p)  # noqa: E731
+    jobs = [SweepJob(sym, p) for p in grid]
+
+    def strip(summary):
+        return repr(sorted((k, v) for k, v in summary.items()
+                           if k not in ("elapsed_s", "worker_private_gb")))
+
+    ref = [strip(summarise_report(_run_simple(factory([sym], p), by_symbol), INIT_MARGIN))
+           for p in grid]
+    for workers in (1, 3):
+        rows = ParameterSweep(factory, candles, init_margin=INIT_MARGIN,
+                              workers=workers).run(jobs)
+        got = [strip(summary) for _, summary in rows]
+        order_ok = [job.params for job, _ in rows] == grid
+        bad = [i for i, (a, b) in enumerate(zip(ref, got)) if a != b]
+        check(f"스윕 == 엔진 직접 실행: {label}, workers={workers}", order_ok and not bad,
+              f"불일치 칸 {bad}" if bad else f"{len(grid)}칸")
+
+
+def _pure_synthetic(n: int, seed: int) -> List[Candle]:
+    """필드가 파이썬 float인 합성 캔들. ``synthetic_candles``는 ``np.float64``를 담는데, 그걸로
+    돌린 엔진은 결과에도 numpy 스칼라가 섞이고 수수료 합의 끝자리까지 달라진다 — 실제 캔들
+    (vision/REST)은 파이썬 float이고 열 캔들도 파이썬 float을 내므로, 대조군도 맞춘다."""
+    return [Candle(*(float(getattr(c, k)) for k in ("open", "high", "low", "close", "volume")),
+                   c.start_time, c.end_time) for c in synthetic_candles(n, seed)]
+
+
+def check_columnar_offline():
+    check_columnar_roundtrip()
+    check_cache_keys()
+    eth = _pure_synthetic(20_000, seed=11)
+    btc = _pure_synthetic(20_000, seed=12)[300:]
+    btc = btc[:8000] + btc[9000:]
+    check_columnar_and_cache_parity({SYM: eth}, "합성 단일 심볼")
+    check_columnar_and_cache_parity({SYM: eth, SYM2: btc}, "합성 ragged 2심볼")
+    check_sweep_parity({SYM: eth}, "합성")
+
+
+def check_columnar_real():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    eth = _load(SYM, start, end)
+    btc = _load(SYM2, start, end)[500:]
+    check_columnar_and_cache_parity({SYM: eth}, "실제 캔들")
+    check_columnar_and_cache_parity({SYM: eth, SYM2: btc[:5000] + btc[5800:]},
+                                    "실제 캔들 ragged 2심볼")
+    check_sweep_parity({SYM: eth}, "실제 캔들")
+
+
 # ====================================================
 
 
@@ -379,9 +537,11 @@ def main():
     check_sink_playback()
     check_degenerate_inputs()
     check_symbol_rules()
+    check_columnar_offline()
     if "--offline" not in sys.argv:
         check_strategy_parity()
         check_multi_symbol_ragged()
+        check_columnar_real()
 
     if _failures:
         print(f"BACKTEST CHECK: FAILED ({len(_failures)}건) — {_failures}")
