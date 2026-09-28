@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 from core.executor.simulated import DEFAULT_INIT_MARGIN
 from core.order.symbol_rules import SymbolRules
-from core.recorder.backtest import BacktestRecorder
+from core.recorder.full import FullRecorder
 from core.executor.simulated import SimulatedExecutor
 from core.engine.backtest import BacktestEngine
 from core.fetcher.stock import nyse_session
@@ -126,7 +126,7 @@ def main():
     # 최소 명목가치 없음.
     rules = {symbol: SymbolRules("1", "1", "1", "1", "0", "0.01")}
     executor = SimulatedExecutor(init_margin, 0.0005, symbol_rules=rules)
-    recorder = BacktestRecorder(streamer, executor.status,
+    recorder = FullRecorder(streamer, executor.status,
                                 interval_ms=interval_to_minutes(interval) * 60_000)
     report = BacktestEngine(streamer, {symbol: candles}, executor, recorder).run()
     # Trade.pre_margin은 거래 전 값이므로 최종 상태를 쓴다 (마지막 거래 손익/수수료 포함)

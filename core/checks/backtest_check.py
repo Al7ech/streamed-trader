@@ -34,7 +34,7 @@ from core.order.action import Action, ActionType
 from core.order.symbol_rules import DEFAULT_RULES, SymbolRules
 from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
 from core.logging_config import setup_logging
-from core.recorder.backtest import BacktestRecorder
+from core.recorder.full import FullRecorder
 from core.streamer.indicator.atr import ATRIndicator
 from core.streamer.indicator.donchian_channel import MaxDonchianIndicator, MinDonchianIndicator
 from core.streamer.indicator.moving_average import MovingAverage
@@ -189,7 +189,7 @@ def _read_or_error(indicator, idx):
 
 def _run(streamer, candles_by_symbol, vectorize, slippage_ratio=None):
     executor = SimulatedExecutor(INIT_MARGIN, slippage_ratio=(slippage_ratio or 0.0))
-    recorder = BacktestRecorder(streamer, executor.status, interval_ms=MIN)
+    recorder = FullRecorder(streamer, executor.status, interval_ms=MIN)
     return BacktestEngine(streamer, candles_by_symbol, executor, recorder,
                           vectorize=vectorize, progress=False).run()
 

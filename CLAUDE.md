@@ -119,7 +119,7 @@ The two CLI entry points live in `core/examples/` (`backtest.py`, `trader.py`) s
 everything is the full `core.`-rooted path.
 
 Default paths like `BaseCandleFetcher(save_path="../asset/")` and
-`BacktestRecorder(result_path="../asset/")` are relative to the *current working directory*, not the
+`FullRecorder(result_path="../asset/")` are relative to the *current working directory*, not the
 script location — so they only land in the repo-root `asset/` (gitignored) when the process is
 launched with cwd = `core/`.
 
@@ -147,7 +147,7 @@ core/
               (adapts any BaseCandleFetcher — no exchange-specific code here)
   executor/   base.py = Executor ABC; simulated.py (+ DEFAULT_INIT_MARGIN, apply_fill), live.py,
               binance_order_client.py
-  recorder/   base.py = Recorder ABC + NullRecorder; backtest.py, live.py
+  recorder/   base.py = Recorder ABC + NullRecorder; simple.py = SimpleRecorder (trades + equity curve only); full.py = FullRecorder(SimpleRecorder) + B&H baseline + run JSON/shards; live.py
   result/     writer.py (run JSON + shards), metrics.py, indicator_columns.py
   trader/     BinanceTrader (trader.py) — live/dry-run assembly + lifecycle; ServerClock
               (server_clock.py) — exchange time for warm-up end + decision deadline; README.md here
@@ -261,7 +261,7 @@ imports it (the engine, recorders and `indicator_columns` reach indicators only 
    # DEFAULT_INIT_MARGIN lives in core.executor.simulated; the executor builds and owns the Status.
    # fee_ratio omitted → Status stamps DEFAULT_FEE_RATIO; pass a float to override.
    executor = SimulatedExecutor(DEFAULT_INIT_MARGIN)
-   recorder = BacktestRecorder(streamer, executor.status, interval_ms=interval_ms,
+   recorder = FullRecorder(streamer, executor.status, interval_ms=interval_ms,
                                metadata=metadata, save_series=True)
    report   = BacktestEngine(streamer, candles_by_symbol, executor, recorder).run()
    ```
@@ -294,7 +294,7 @@ imports it (the engine, recorders and `indicator_columns` reach indicators only 
    in the repo and warm-up, gap backfill and the backtest all go through it. A check script or a
    non-Binance source just passes candles it already has.
 
-   `BacktestRecorder` owns the output as well as the in-memory `Report`: give it `metadata` and it
+   `FullRecorder` owns the output as well as the in-memory `Report`: give it `metadata` and it
    writes the run JSON on `close()` (which the engine calls at the end of the run), plus the
    time-series shards when `save_series=True`. Without `metadata` it is a pure in-memory run. The
    `Report` comes back from `BacktestEngine.run()` (it is `recorder.report`).
@@ -315,7 +315,7 @@ two loops — `TradingEngine._`s `process_event` (`engine/engine.py`, dry run + 
 
 | | candles | Executor | Recorder |
 |---|---|---|---|
-| backtest | `Dict[str, List[Candle]]` given to `BacktestEngine` directly | `executor.simulated.SimulatedExecutor` | `recorder.backtest.BacktestRecorder` |
+| backtest | `Dict[str, List[Candle]]` given to `BacktestEngine` directly | `executor.simulated.SimulatedExecutor` | `recorder.full.FullRecorder` |
 | dry run | `producer.live.LiveCandleProducer` | **`executor.simulated.SimulatedExecutor`** | `recorder.live.LiveRecorder` |
 | live | `producer.live.LiveCandleProducer` | `executor.live.LiveExecutor` | `recorder.live.LiveRecorder` |
 
@@ -982,7 +982,7 @@ Assumptions that a candle cannot verify, all deliberate:
 a MARKET fill happens *after* the equity point is recorded so its state applies from the next event
 index, while a resting fill happens *before* it so its state applies from this one. Any future
 attempt to rebuild the curve segment-wise after the loop has to reproduce that off-by-one-event
-behaviour exactly, and would fork `BacktestRecorder` in two to do it.
+behaviour exactly, and would fork `FullRecorder` in two to do it.
 
 Live never simulates any of this: `LiveExecutor.begin_event` only drops stale market decisions and
 never matches resting orders, and the exchange owns the book, hydrated at startup from

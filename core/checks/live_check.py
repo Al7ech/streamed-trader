@@ -32,7 +32,7 @@ from typing import Dict, List
 
 from core.checks.compare import compare_reports
 from core.engine.backtest import BacktestEngine
-from core.recorder.backtest import BacktestRecorder
+from core.recorder.full import FullRecorder
 from core.recorder.base import NullRecorder
 from core.executor.simulated import SimulatedExecutor
 from core.order.action import Action, ActionType
@@ -979,7 +979,7 @@ def _parts(streamer, slippage_ratio, interval_ms, log_label=""):
     """
     executor = SimulatedExecutor(
         INIT_MARGIN, slippage_ratio=(slippage_ratio or 0.0), log_label=log_label)
-    recorder = BacktestRecorder(streamer, executor.status, interval_ms=interval_ms)
+    recorder = FullRecorder(streamer, executor.status, interval_ms=interval_ms)
     return executor, recorder
 
 

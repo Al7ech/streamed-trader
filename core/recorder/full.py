@@ -1,7 +1,8 @@
 """백테스트 한 번의 결과를 모으고, 끝나면 산출물까지 쓰는 레코더.
 
-엔진이 흘려보내는 이벤트/체결을 받아 ``Report``를 만들고, ``metadata``를 받았으면
-``<result_path>/backtest/`` 에 런 JSON과 (선택적으로) 월별 시계열 샤드를 쓴다. 계약은
+:class:`~core.recorder.simple.SimpleRecorder`(체결·자본곡선·최대 레버리지)를 상속해 그 위에
+buy & hold 기준선을 얹고, ``metadata``를 받았으면 ``<result_path>/backtest/`` 에 런 JSON과
+(선택적으로) 월별 시계열 샤드를 쓴다. 계약은
 :class:`core.recorder.base.Recorder`에 있다.
 
 **무엇을 어디에 남길지는 레코더가 전부 갖는다.** 엔진은 실행만 알고, 백테스트 전용 산출물
@@ -11,21 +12,23 @@
 
 import os
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from core.candle.candle import Candle
 from core.account.report import Report
 from core.account.status import Status
-from core.account.trade import Trade
-from core.recorder.base import Recorder
+from core.recorder.simple import SimpleRecorder
 from core.result.indicator_columns import collect_indicator_columns
 from core.result.metrics import build_multi_symbol_buy_and_hold_curve
 from core.result.writer import ShardWriter, write_run_json
 from core.streamer import BaseStreamer
 
 
-class BacktestRecorder(Recorder):
+class FullRecorder(SimpleRecorder):
     """백테스트 한 번의 결과를 메모리에 모으고, :meth:`close`에서 산출물을 쓴다.
+
+    체결·자본곡선·최대 레버리지 수집은 :class:`~core.recorder.simple.SimpleRecorder` 그대로다.
+    여기서 더하는 것은 buy & hold 기준선용 심볼별 종가, 이벤트 수, 런 JSON/샤드 산출물이다.
 
     :param status: 실행기의 ``Status`` **객체 자체**. ``Report.status``가 최종 상태여야 하므로
         참조로 들고 있는다. 진입 시점의 시가평가 자본 (수익률 기준선이자 buy & hold 곡선의
@@ -43,17 +46,14 @@ class BacktestRecorder(Recorder):
                  save_series: bool = False,
                  has_ohlc: bool = True,
                  result_path: str = "asset/"):
+        super().__init__(status)
         self._streamer = streamer
-        self._status = status
         self.symbols: List[str] = list(streamer.symbols)
 
-        self.equity_curve: List[Tuple[int, float]] = []
         #: buy & hold 기준선을 만들기 위한 심볼별 종가 (구멍은 None) — equity_curve와 같은 길이
         self.closes_by_symbol: Dict[str, List[Optional[float]]] = {s: [] for s in self.symbols}
         #: 심볼별 최근 종가 캐리포워드. 캔들이 없는 이벤트에서도 직전 값을 이어 붙인다.
         self._latest_close: Dict[str, float] = {}
-        self.trades: List[Trade] = []
-        self.max_leverage = 0.0
         self.event_count = 0
 
         #: 진입 시점의 시가평가 자본. 실행 **전**의 값이어야 하므로 여기서 잡는다.
@@ -71,13 +71,11 @@ class BacktestRecorder(Recorder):
             self._shard_writer = ShardWriter(self._dir, self.run_id, self.symbols,
                                              streamer.indicators, self._indicator_names,
                                              has_ohlc, interval_ms)
-        self._report: Optional[Report] = None
         self._closed = False
 
     def record_event(self, event_time: int, candles: Dict[str, Candle]) -> None:
         # 자본과 종가는 **항상 같이** 늘어나야 한다. buy & hold 곡선이 인덱스로 짝을 맞춘다.
-        equity = self._status.total_margin()
-        self.equity_curve.append((event_time, equity))
+        super().record_event(event_time, candles)
         for symbol, candle in candles.items():
             self._latest_close[symbol] = candle.close
         for symbol in self.symbols:
@@ -85,23 +83,13 @@ class BacktestRecorder(Recorder):
         self.event_count += 1
 
         if self._shard_writer is not None:
-            self._shard_writer.add(event_time, equity, candles)
-
-    def record_trade(self, trade: Trade) -> None:
-        self.trades.append(trade)
-        if trade.leverage > self.max_leverage:
-            self.max_leverage = trade.leverage
+            self._shard_writer.add(event_time, self.equity_curve[-1][1], candles)
 
     def build_report(self, init_margin: float) -> Report:
         benchmark_curve = build_multi_symbol_buy_and_hold_curve(
             [t for t, _ in self.equity_curve], self.closes_by_symbol, init_margin)
         return Report(self.trades, self.max_leverage, self._status,
                       self.equity_curve, benchmark_curve)
-
-    @property
-    def report(self) -> Optional[Report]:
-        """:meth:`close` 뒤의 결과. 엔진이 실행을 마치고 돌려주는 값이다."""
-        return self._report
 
     def close(self) -> None:
         """결과를 확정하고 산출물을 쓴다. 엔진이 루프를 마친 뒤 부른다 — **멱등**이다."""

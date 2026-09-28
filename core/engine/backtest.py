@@ -83,7 +83,7 @@ class BacktestEngine:
         ``recorder.close()``를 ``finally``가 아니라 루프 **뒤**에 두는 것은 의도적이다:
         실행이 예외로 끝났다면 반쪽짜리 산출물을 남기지 않는다 (라이브 엔진과 같은 규약).
 
-        :return: 레코더가 결과를 들고 있으면 그것 (``BacktestRecorder``의 ``Report``), 아니면 None.
+        :return: 레코더가 결과를 들고 있으면 그것 (``FullRecorder``의 ``Report``), 아니면 None.
         """
         self._check_one_interval()
         playback = self._precompute()

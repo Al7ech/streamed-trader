@@ -178,13 +178,13 @@ from core.engine.backtest import BacktestEngine
 from core.executor.simulated import DEFAULT_INIT_MARGIN, SimulatedExecutor
 from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
 from core.history.fetcher import FetcherCandleHistory
-from core.recorder.backtest import BacktestRecorder
+from core.recorder.full import FullRecorder
 
 history = FetcherCandleHistory(BinanceVisionFetcher(compress=False), "1m", use_cache=True)
 candles_by_symbol = asyncio.run(history.fetch(["ETHUSDT"], start, end))
 
 executor = SimulatedExecutor(DEFAULT_INIT_MARGIN, fee_ratio=0.0004)
-recorder = BacktestRecorder(streamer, executor.status, interval_ms=60_000,
+recorder = FullRecorder(streamer, executor.status, interval_ms=60_000,
                             metadata={...}, save_series=True)
 report = BacktestEngine(streamer, candles_by_symbol, executor, recorder).run()
 ```
@@ -273,7 +273,7 @@ core/
     stock/                Massive US equities + NYSE session calendar
   engine/                 TradingEngine + the three ports (CandleProducer/Executor/Recorder)
   result/                 run JSON + series shards, Sharpe/MDD/benchmark metrics
-  backtest/              SimulatedExecutor, BacktestRecorder, candle producers
+  backtest/              SimulatedExecutor, FullRecorder, candle producers
   live/                   BinanceTrader (asyncio + websockets), LiveExecutor/Recorder/Producer,
                           BinanceOrderClient, ReliableWebsocket
   checks/                 live_check.py (the de-facto test suite), fetch_stock_check.py

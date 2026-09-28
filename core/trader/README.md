@@ -16,7 +16,7 @@ live implementations of the pluggable pieces around it:
 
 | | candles | Executor | Recorder |
 |---|---|---|---|
-| backtest | `Dict[str, List[Candle]]` given to `BacktestEngine` | `SimulatedExecutor` | `BacktestRecorder` |
+| backtest | `Dict[str, List[Candle]]` given to `BacktestEngine` | `SimulatedExecutor` | `FullRecorder` |
 | dry run | `LiveCandleProducer` | **`SimulatedExecutor`** | `LiveRecorder` |
 | live | `LiveCandleProducer` | `LiveExecutor` | `LiveRecorder` |
 

@@ -7,7 +7,7 @@ from core.executor.simulated import DEFAULT_INIT_MARGIN, SimulatedExecutor
 from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
 from core.history.fetcher import FetcherCandleHistory
 from core.logging_config import setup_logging
-from core.recorder.backtest import BacktestRecorder
+from core.recorder.full import FullRecorder
 from core.streamer.strategies.keltner_streamer import KeltnerStreamer
 from core.utils import interval_to_minutes
 
@@ -66,7 +66,7 @@ if __name__ == "__main__":
     # 샤드 기록은 멀티심볼·긴 구간일수록 엔진 루프의 절반 이상을 먹는다(docs/2609-backtest-
     # profiling.md) — 승률/수익만 빠르게 볼 때는 --no-series로 끈다 (시각화 도구에는 가격
     # 차트·지표 패널이 안 나온다).
-    recorder = BacktestRecorder(streamer, executor.status, interval_ms=interval_ms,
+    recorder = FullRecorder(streamer, executor.status, interval_ms=interval_ms,
                                 metadata=metadata, save_series=save_series)
     # vectorize=False를 주면 지표를 캔들마다 update()로 돌린다 (결과는 비트 단위로 같다 —
     # core/checks/backtest_check.py 참고). 새 지표의 VectorizableNumericIndicator.compute()를
