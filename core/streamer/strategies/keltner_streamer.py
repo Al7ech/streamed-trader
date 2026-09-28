@@ -7,7 +7,6 @@ from core.account.status import Status
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.indicator.atr import ATRIndicator
 from core.streamer.indicator.moving_average import MovingAverage
-from core.utils import trunc_by_sign
 
 
 class KeltnerStreamer(BaseStreamer):
@@ -67,10 +66,10 @@ class KeltnerStreamer(BaseStreamer):
             lev = min(6.0, self.max_loss * price / dist)
 
             if upper <= price:
-                qty = trunc_by_sign(status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
+                qty = status.rules_for(symbol).floor_qty(status.total_margin() / (price * (1 / lev + status.fee_ratio)))
                 return [Action(symbol, qty)]
             if price <= lower:
-                qty = trunc_by_sign(-status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
+                qty = status.rules_for(symbol).floor_qty(-status.total_margin() / (price * (1 / lev + status.fee_ratio)))
                 return [Action(symbol, qty)]
 
         if position > 0 and candle.low < ma - self.m_exit * atr:

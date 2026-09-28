@@ -2,10 +2,11 @@
 
 - :class:`~core.order.action.Action` — 주문 요청 (시장가/지정가/조건부/취소)
 - :mod:`core.order.order_book` — 미체결 주문 장부와 봉 내 체결 판정 규칙 (한 벌만 존재한다)
+- :mod:`core.order.symbol_rules` — 심볼별 거래 규칙 (수량/가격 단위, 최소 수량·명목가치)
 
-``order_book``이 :class:`core.account.status.Status`를 런타임에 쓰고 ``Status``는
-``order_book``을 ``TYPE_CHECKING``으로만 되받으므로, 두 모듈은 항상 서브모듈 경로로
-참조한다 (패키지 속성 import 금지 — 부분 초기화 순환을 부른다).
+``account``가 ``order``를 import한다 (``Status``가 ``symbol_rules``를 든다). 그래서
+``order_book``은 ``Status``를 ``TYPE_CHECKING``으로만 참조한다 — 런타임 import는 부분 초기화
+순환을 부른다.
 """
 
 from core.order.action import Action, ActionType

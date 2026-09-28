@@ -14,9 +14,11 @@
 3. **멀티심볼 ragged** — 상장일이 다르고 구멍이 있는 두 심볼. 심볼별 재생 커서가 병합
    타임라인과 어긋나지 않는지 보는 유일한 검사다.
 4. **퇴화 입력** — 빈 캔들, 캔들 1개, 지표 없는 심볼 등에서 죽지 않는지.
+5. **심볼 규칙과 체결 회계** — 수량/가격 양자화 도우미, 규칙 위반 주문 거부, 체결 후 포지션
+   정규화(부동소수점 잔여가 남지 않는지).
 
     uv run python core/checks/backtest_check.py            # 전부
-    uv run python core/checks/backtest_check.py --offline  # 캔들 캐시가 필요 없는 1, 4 만
+    uv run python core/checks/backtest_check.py --offline  # 캔들 캐시가 필요 없는 1, 4, 5 만
 """
 import sys
 from datetime import datetime, timezone
@@ -28,6 +30,8 @@ from core.candle.candle import Candle
 from core.checks.compare import compare_reports
 from core.engine.backtest import BacktestEngine
 from core.executor.simulated import SimulatedExecutor
+from core.order.action import Action, ActionType
+from core.order.symbol_rules import DEFAULT_RULES, SymbolRules
 from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
 from core.logging_config import setup_logging
 from core.recorder.backtest import BacktestRecorder
@@ -298,6 +302,74 @@ def check_degenerate_inputs():
         check("compute() 길이 불일치는 치명적", True)
 
 
+# ==================================================== 5. 심볼 규칙과 체결 회계
+
+
+def check_symbol_rules():
+    eth = DEFAULT_RULES[SYM]  # step 0.001, 최소 명목가치 20, tick 0.01
+
+    # 도우미: 곱셈 오차가 한 단위를 깎지 않는다 (4.35 * 100 == 434.99999999999994).
+    cent = SymbolRules("0.01", "0.01", "0.01", "0.01", "5", "0.01")
+    ten = SymbolRules("10", "10", "10", "10", "5", "10")
+    odd = SymbolRules("0.0005", "0.0005", "0.0005", "0.0005", "5", "0.0005")
+    cases = [
+        ("floor_qty 곱셈 오차", cent.floor_qty(4.35), 4.35),
+        ("floor_qty 음수는 0 방향", eth.floor_qty(-1.23456), -1.234),
+        ("floor_qty 단위 미만은 0", eth.floor_qty(0.0009), 0.0),
+        ("floor_qty 10 단위", ten.floor_qty(129.9), 120.0),
+        ("floor_qty 0.0005 단위", odd.floor_qty(0.0019), 0.0015),
+        ("floor_qty 증감분 뺄셈 잔여", eth.floor_qty(0.3 - 0.1), 0.2),
+        ("round_price", eth.round_price(3123.456789), 3123.46),
+        ("round_price 0.0005 단위", odd.round_price(1.00026), 1.0005),
+    ]
+    for label, got, want in cases:
+        check(f"심볼 규칙: {label}", got == want, f"got {got!r}, want {want!r}")
+
+    # 체결 후 포지션 정규화 — 전부 단위 배수인 수량이어도 float 덧셈은 잔여를 남긴다.
+    def fills(*quantities):
+        ex = SimulatedExecutor(100_000.0)
+        # 가격 1000: 0.1 단위 주문도 최소 명목가치(20)를 넘는다.
+        ex.begin_event(MIN, {SYM: Candle(1000, 1000, 1000, 1000, 1, 0, MIN)})
+        for q in quantities:
+            ex.submit(Action(SYM, q), MIN)
+        return ex.status.position_for(SYM)
+
+    for qs, want in [((0.1, 0.2, -0.3), 0.0), ((0.1, 0.1, -0.3), -0.1),
+                     ((0.7, -0.1, -0.1, -0.1, -0.1, -0.1, -0.1, -0.1), 0.0)]:
+        p = fills(*qs)
+        check(f"정규화: {' + '.join(map(repr, qs))} == {want!r}", p.position == want
+              and (p.avg_price == 0.0) == (want == 0.0), repr(p))
+
+    # 규칙 위반 주문은 체결도 등록도 되지 않는다. 순수 청산과 reduce_only는 명목가치 면제.
+    ex = SimulatedExecutor(100_000.0)
+    ex.begin_event(MIN, {SYM: Candle(3000, 3000, 3000, 3000, 1, 0, MIN)})
+    rejected = [
+        Action(SYM, 0.0015),                                              # step
+        Action(SYM, 0.005),                                               # 명목가치 15 < 20
+        Action(SYM, 1.0, order_type=ActionType.LIMIT, price=2990.005),    # tick
+        Action(SYM, -1.0, order_type=ActionType.STOP_MARKET, trigger_price=2990.001,
+               trigger_above=False),                                      # tick
+    ]
+    for a in rejected:
+        ex.submit(a, MIN)
+    check("심볼 규칙: 위반 주문은 체결·등록되지 않는다",
+          ex.status.position_for(SYM).position == 0.0 and not ex.status.total_open_orders())
+    for q in (0.01, -0.006):          # 진입(명목 30) 후 명목 18짜리 부분 청산
+        ex.submit(Action(SYM, q), MIN)
+    ex.submit(Action(SYM, -0.004, order_type=ActionType.STOP_MARKET, trigger_price=2900.0,
+                     trigger_above=False, reduce_only=True), MIN)
+    check("심볼 규칙: 순수 청산·reduce_only는 명목가치 면제",
+          ex.status.position_for(SYM).position == 0.004 and ex.status.total_open_orders() == 1,
+          repr(ex.status))
+
+    # 모르는 심볼은 조용히 넘어가지 않는다.
+    try:
+        SimulatedExecutor(1.0).status.rules_for("NOSUCHUSDT")
+        check("심볼 규칙: 모르는 심볼은 KeyError", False)
+    except KeyError:
+        check("심볼 규칙: 모르는 심볼은 KeyError", True)
+
+
 # ====================================================
 
 
@@ -306,6 +378,7 @@ def main():
     check_indicator_exactness()
     check_sink_playback()
     check_degenerate_inputs()
+    check_symbol_rules()
     if "--offline" not in sys.argv:
         check_strategy_parity()
         check_multi_symbol_ragged()

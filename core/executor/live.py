@@ -27,6 +27,7 @@
 """
 
 import asyncio
+import copy
 import logging
 import math
 from dataclasses import dataclass
@@ -38,10 +39,12 @@ from core.order import order_book
 from core.order.action import Action, ActionType
 from core.candle.candle import Candle
 from core.order.order_book import OpenOrder
+from core.order.symbol_rules import is_pure_reduction
 from core.account.status import Status
 from core.account.trade import Trade
 from core.executor.base import Executor
 from core.executor.binance_order_client import BinanceOrderClient, OrderResult
+from core.fetcher.binance.exchange_info import diff_rules, parse_exchange_info
 
 #: 선물 정산(마진) 자산 후보. 심볼에서 접미사로 떼어내 잔고 항목을 찾는다.
 #: 긴 것부터 검사해야 USDT/USDC 같은 4자리가 USD류 접두와 헷갈리지 않는다.
@@ -53,7 +56,8 @@ _TERMINAL_ORDER_STATES = ("FILLED", "CANCELED", "EXPIRED", "REJECTED")
 _TRACKED_ORDER_STATES = _TERMINAL_ORDER_STATES + ("PARTIALLY_FILLED",)
 _ACK_ORDER_STATE = "NEW"
 
-#: 결정 수량과 실제 체결 수량의 허용 괴리. 실행기가 step size로 양자화하지 않아 생긴다.
+#: 결정 수량과 실제 체결 수량의 허용 괴리. 주문 수량은 심볼 규칙(step)으로 검증되므로
+#: 넘는다면 부분 체결 후 취소·만료이거나, 체결 시점에 포지션이 달라 reduce_only가 깎은 경우다.
 _QUANTITY_DIVERGENCE_TOLERANCE = 0.01
 
 #: 종결 이벤트를 못 받은 항목이 무한히 쌓이지 않도록 하는 상한. 넘으면 가장 오래된 것부터 버린다.
@@ -259,6 +263,9 @@ class LiveExecutor(Executor):
         self._pending_order_tasks: Set[asyncio.Task] = set()
         self._client_order_seq = 0
         self._warned_fee_asset = False
+        #: 심볼별 최근 종가. 시장가 주문의 최소 명목가치 검사 기준가로만 쓴다 — 계좌 상태가
+        #: 아니다 (시가평가는 거래소 ``ACCOUNT_UPDATE`` 몫).
+        self._last_close: Dict[str, float] = {}
 
     @classmethod
     async def create(cls, symbols: List[str], *, margin_asset: Optional[str] = None,
@@ -278,7 +285,8 @@ class LiveExecutor(Executor):
         스레드풀이라 실행기가 만드는 게 맞다 — 예전에는 드라이런에서도 만들어졌다).
 
         ``futures_account()`` 실패는 치명적이지만 미체결 주문 조회 실패는 아니다
-        (:meth:`_fetch_open_orders` 참고).
+        (:meth:`_fetch_open_orders` 참고). 하드코딩된 심볼 규칙이 거래소 값과 다른 것도
+        치명적이다 (:meth:`_verify_symbol_rules`).
         """
         margin_asset = margin_asset or resolve_margin_asset(symbols)
         owns_order_client = order_client is None
@@ -299,6 +307,7 @@ class LiveExecutor(Executor):
             fee_ratio = await cls._fetch_taker_commission(client, symbols)
             status = build_status(account_info, await cls._fetch_open_orders(client),
                                   symbols, margin_asset, fee_ratio)
+            await cls._verify_symbol_rules(client, status, symbols)
         except Exception:
             # 기동에 실패했으면 **우리가 만든 것만** 되돌린다. 주입받은 것은 호출자 것이다.
             if owns_order_client:
@@ -350,6 +359,22 @@ class LiveExecutor(Executor):
                             rates, symbols[0], chosen)
         return chosen
 
+    @staticmethod
+    async def _verify_symbol_rules(client: AsyncClient, status: Status,
+                                   symbols: List[str]) -> None:
+        """하드코딩된 심볼 규칙이 거래소의 현재 값과 같은지 확인한다. 다르면 **치명적**이다.
+
+        전략은 하드코딩 규칙으로 양자화하고 실행기는 그걸로 검증한다. 거래소가 규칙을
+        바꿨는데 파일이 낡았으면 백테스트는 통과했는데 라이브는 거부되는 주문이 생긴다 —
+        틀린 규칙으로 주문을 내느니 기동을 멈추고 재생성을 요구한다.
+        """
+        fetched = parse_exchange_info(await client.futures_exchange_info())
+        problems = diff_rules(status.symbol_rules, fetched, symbols)
+        if problems:
+            raise RuntimeError(
+                "하드코딩된 심볼 규칙이 거래소와 다르다 — `uv run python -m "
+                "core.fetcher.binance.exchange_info`로 재생성하라: " + "; ".join(problems))
+
     async def close(self) -> None:
         """**자기가 만든** 자원만 정리한다. 주입받은 클라이언트는 만든 쪽이 닫는다."""
         if self._owns_order_client:
@@ -377,6 +402,8 @@ class LiveExecutor(Executor):
         액션은 다른 심볼을 겨냥할 수 있으므로(교차 심볼 전략) pending은 **대상 심볼** 기준으로
         키가 잡혀 있다 — 여기서는 이번 이벤트에 등장한 심볼 몫만 지운다.
         """
+        for symbol, candle in candles.items():
+            self._last_close[symbol] = candle.close
         for key in [k for k, p in self._pending_decision.items()
                     if k[0] in candles and not p.resting]:
             self.logger.warning(
@@ -402,6 +429,29 @@ class LiveExecutor(Executor):
 
         if action.quantity == 0:
             return
+
+        # 가상 실행기와 **같은** 규칙 검사다 — 백테스트·드라이런에서 버려진 주문은 여기서도
+        # 버려지고, 거래소 거부를 기다리지 않는다.
+        position = self.status.position_for(action.symbol).position
+        if action.order_type is ActionType.MARKET:
+            ref_price = self._last_close.get(action.symbol)
+        elif action.order_type is ActionType.LIMIT:
+            ref_price = action.price
+        else:
+            ref_price = action.trigger_price
+        reason = self.status.rules_for(action.symbol).check(action, position, ref_price)
+        if reason is not None:
+            self.logger.warning("심볼 규칙 위반 — 주문을 버린다 (%s): %s", reason, action)
+            return
+
+        # 순수 청산 시장가는 reduce_only로 보낸다. 거래소는 reduce-only가 아닌 주문에는 청산이라도
+        # 최소 명목가치를 요구하므로, 이게 없으면 작은 포지션이 닫히지 않는다 (검증은 순수 청산을
+        # 면제하므로 가상 실행기와 판정이 같다). 포지션 정보가 낡아 이미 flat이었다면 거래소가
+        # 거부할 뿐이라 반대 포지션을 여는 것보다 안전하다. 전략의 Action은 건드리지 않는다.
+        if (action.order_type is ActionType.MARKET and not action.reduce_only
+                and is_pure_reduction(action.quantity, position)):
+            action = copy.copy(action)
+            action.reduce_only = True
 
         # 지정가/조건부는 client_id가 곧 취소 키이므로 전략의 것을 그대로 쓰고, 시장가는 여기서
         # 하나 지어 붙인다 — 체결 이벤트를 이 결정과 정확히 짝짓기 위해서다.

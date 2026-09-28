@@ -47,13 +47,14 @@ from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
 from core.producer import live as lcp
 from core.executor.binance_order_client import OrderResult
 from core.executor.live import LiveExecutor, resolve_margin_asset
+from core.order.symbol_rules import DEFAULT_RULES
 from core.logging_config import setup_logging
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.indicator.base_indicator import BaseIndicator
 from core.streamer.strategies.keltner_stop_streamer import KeltnerStopStreamer
 from core.streamer.strategies.keltner_streamer import KeltnerStreamer
 from core.streamer.strategies.mean_reversion_zscore import MeanReversionZScoreStreamer
-from core.utils import ms_timestamp_to_datetime, trunc_by_sign
+from core.utils import ms_timestamp_to_datetime
 
 MIN = 60_000
 SYM, SYM2 = "ETHUSDT", "BTCUSDT"
@@ -103,6 +104,7 @@ class LimitLadderStreamer(BaseStreamer):
     def _decide_symbol(self, symbol, candle: Candle, status: Status):
         position = status.position_for(symbol).position
         resting = status.open_orders_for(symbol)
+        rules = status.rules_for(symbol)
 
         # 200봉마다 전량 취소 — CANCEL 경로와, 취소 뒤 장부가 실제로 비는지를 태운다.
         if self._bar % 200 == 0 and resting:
@@ -111,16 +113,17 @@ class LimitLadderStreamer(BaseStreamer):
             return []  # 이미 걸어둔 주문이 있으면 그대로 둔다
 
         if position == 0:
-            qty = trunc_by_sign(status.total_margin() / len(self.symbols) / candle.close * 0.5, 3)
+            qty = rules.floor_qty(status.total_margin() / len(self.symbols) / candle.close * 0.5)
             if qty == 0:
                 return []
             return [Action(symbol, qty, order_type=ActionType.LIMIT,
-                           price=candle.close * (1 - self.spread),
+                           price=rules.round_price(candle.close * (1 - self.spread)),
                            client_id="entry", expire_after_candles=self.ttl)]
 
         avg = status.position_for(symbol).avg_price
         return [Action(symbol, -position, order_type=ActionType.LIMIT,
-                       price=avg * (1 + self.spread), reduce_only=True, client_id="exit")]
+                       price=rules.round_price(avg * (1 + self.spread)), reduce_only=True,
+                       client_id="exit")]
 
 
 class StopLadderStreamer(LimitLadderStreamer):
@@ -133,20 +136,22 @@ class StopLadderStreamer(LimitLadderStreamer):
     def _decide_symbol(self, symbol, candle: Candle, status: Status):
         position = status.position_for(symbol).position
         resting = status.open_orders_for(symbol)
+        rules = status.rules_for(symbol)
         if self._bar % 200 == 0 and resting:
             return [Action.cancel(symbol)]
         if resting:
             return []
         if position == 0:
-            qty = trunc_by_sign(status.total_margin() / len(self.symbols) / candle.close * 0.5, 3)
+            qty = rules.floor_qty(status.total_margin() / len(self.symbols) / candle.close * 0.5)
             if qty == 0:
                 return []
             return [Action(symbol, qty)]  # 시장가 진입
         avg = status.position_for(symbol).avg_price
         # 일부러 포지션보다 큰 수량을 건다 — reduce_only clamp가 안 걸리면 반대 포지션이 열린다.
         # 롱만 잡으므로 손절은 항상 진입가 아래 (trigger_above=False).
-        return [Action(symbol, -position * 3, order_type=ActionType.STOP_MARKET,
-                       trigger_price=avg * (1 - self.spread), trigger_above=False,
+        return [Action(symbol, rules.floor_qty(-position * 3, market=False),
+                       order_type=ActionType.STOP_MARKET,
+                       trigger_price=rules.round_price(avg * (1 - self.spread)), trigger_above=False,
                        reduce_only=True, client_id="stop")]
 
 
@@ -694,13 +699,14 @@ class FakeAsyncClient:
     """
 
     def __init__(self, margin=10_000.0, positions=None, open_orders=None, error=None,
-                 orders_boom=False, taker_rate="0.0004"):
+                 orders_boom=False, taker_rate="0.0004", rules_drift=False):
         self.margin = margin
         self.positions = positions or {}
         self.open_orders = open_orders or []
         self.error = error
         self.orders_boom = orders_boom
         self.taker_rate = taker_rate
+        self.rules_drift = rules_drift
 
     async def futures_account(self):
         if self.error:
@@ -721,6 +727,22 @@ class FakeAsyncClient:
     async def futures_commission_rate(self, symbol=None):
         return {"symbol": symbol, "makerCommissionRate": "0.0002",
                 "takerCommissionRate": self.taker_rate}
+
+    async def futures_exchange_info(self):
+        """하드코딩 규칙 그대로 답한다. ``rules_drift``면 SYM의 stepSize만 바꿔 낡은 파일을 흉내 낸다.
+        거래소처럼 끝자리 0을 붙여 문자열이 아니라 값으로 비교되는지도 태운다."""
+        symbols = []
+        for sym in (SYM, SYM2):
+            step, min_qty, m_step, m_min, notional, tick = DEFAULT_RULES[sym].as_tuple()
+            if self.rules_drift and sym == SYM:
+                step = "0.01"
+            symbols.append({"symbol": sym, "filters": [
+                {"filterType": "LOT_SIZE", "stepSize": step + "000", "minQty": min_qty},
+                {"filterType": "MARKET_LOT_SIZE", "stepSize": m_step, "minQty": m_min},
+                {"filterType": "MIN_NOTIONAL", "notional": notional},
+                {"filterType": "PRICE_FILTER", "tickSize": tick},
+            ]})
+        return {"symbols": symbols}
 
 
 async def make_live_executor(margin=10_000.0, client=None):
@@ -794,6 +816,35 @@ async def check_live_executor():
         check("executor: 계좌 조회 실패는 치명적", False)
     except RuntimeError:
         check("executor: 계좌 조회 실패는 치명적", True)
+
+    # 하드코딩 심볼 규칙이 거래소와 다르면 치명적이다 — 백테스트는 통과했는데 라이브는 거부되는
+    # 주문을 내느니 기동을 멈추고 재생성을 요구한다.
+    try:
+        await make_live_executor(client=FakeAsyncClient(rules_drift=True))
+        check("executor: 심볼 규칙 불일치는 치명적", False)
+    except RuntimeError as e:
+        check("executor: 심볼 규칙 불일치는 치명적", SYM in str(e) and SYM2 not in str(e), str(e))
+
+    # 규칙 위반 주문은 거래소로 보내지 않는다 — 가상 실행기와 같은 검사다.
+    ex, _, _, _ = await make_live_executor()
+    ex.begin_event(1, {SYM: Candle(3000, 3000, 3000, 3000, 1, 0, MIN)})
+    ex.submit(Action(SYM, 0.0015), event_time=1)                        # step 위반
+    ex.submit(Action(SYM, 0.005), event_time=1)                         # 명목가치 15 < 20
+    ex.submit(Action(SYM, -1.0, order_type=ActionType.STOP_MARKET, trigger_price=2990.005,
+                     trigger_above=False, reduce_only=True), event_time=1)  # tick 위반
+    check("executor: 심볼 규칙 위반 주문은 보내지 않는다", ex._orders.calls == [],
+          str(ex._orders.calls))
+
+    # 순수 청산 시장가는 reduce_only로 나간다 — 명목가치 미만 포지션도 닫힌다. 전략의 Action은 그대로.
+    ex, _, _, _ = await make_live_executor(client=FakeAsyncClient(positions={SYM: (0.005, 3000.0, 0.0)}))
+    ex.begin_event(1, {SYM: Candle(3000, 3000, 3000, 3000, 1, 0, MIN)})
+    close = Action(SYM, -0.005)
+    ex.submit(close, event_time=1)
+    ex.submit(Action(SYM2, 0.01), event_time=1)  # 진입은 reduce_only가 붙지 않는다 (기준가 없음)
+    sent = ex._orders.calls
+    check("executor: 순수 청산 시장가는 reduce_only로 보낸다",
+          len(sent) == 2 and sent[0].reduce_only and not close.reduce_only
+          and not sent[1].reduce_only, str([(a, a.reduce_only) for a in sent]))
 
     # ACCOUNT_UPDATE는 **변경된 항목만** 싣는다. 없는 항목을 0으로 덮으면 마진이 0이 되어
     # 모든 사이징이 붕괴하거나, 포지션이 0으로 보여 재진입해 실제 포지션이 2배가 된다.

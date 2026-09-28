@@ -7,7 +7,6 @@ from core.account.status import Status
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.indicator.moving_average import MovingAverage
 from core.streamer.indicator.rolling_std import RollingStd
-from core.utils import trunc_by_sign
 
 
 class MeanReversionZScoreStreamer(BaseStreamer):
@@ -91,7 +90,7 @@ class MeanReversionZScoreStreamer(BaseStreamer):
         sign = -1 if z > 0 else 1  # 이탈의 역방향 (fade)
         stop_frac = self.entry_z * std / price
         lev = min(6.0, self.max_loss / stop_frac)
-        qty = trunc_by_sign(sign * status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
+        qty = status.rules_for(symbol).floor_qty(sign * status.total_margin() / (price * (1 / lev + status.fee_ratio)))
 
         self._timeout_remaining = self.timeout_candles
         self._stop_price = price * (1 - sign * stop_frac)

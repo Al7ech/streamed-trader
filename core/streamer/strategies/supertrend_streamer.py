@@ -6,7 +6,6 @@ from core.candle.candle import Candle
 from core.account.status import Status
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.indicator.supertrend import SupertrendIndicator
-from core.utils import trunc_by_sign
 
 
 class SupertrendStreamer(BaseStreamer):
@@ -59,6 +58,8 @@ class SupertrendStreamer(BaseStreamer):
             return []
 
         lev = min(6.0, self.max_loss * price / dist)
-        target_qty = trunc_by_sign(
-            direction * status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
-        return [Action(symbol, target_qty - position)]
+        rules = status.rules_for(symbol)
+        target_qty = rules.floor_qty(
+            direction * status.total_margin() / (price * (1 / lev + status.fee_ratio)))
+        # 두 격자 값의 차도 float 뺄셈 잔여가 남을 수 있어 다시 격자에 맞춘다.
+        return [Action(symbol, rules.floor_qty(target_qty - position))]

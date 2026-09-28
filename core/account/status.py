@@ -1,7 +1,9 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional
 
-if TYPE_CHECKING:  # 런타임 임포트는 순환을 만든다 (order_book이 Status를 쓴다)
+from core.order.symbol_rules import DEFAULT_RULES, SymbolRules
+
+if TYPE_CHECKING:  # 타입 힌트에만 쓴다
     from core.order.order_book import OpenOrder
 
 #: 계좌 수수료율의 **유일한 기본값 정의**. 실제로는 거래소가 VIP/커미션 티어로 정하는 계좌
@@ -25,7 +27,8 @@ class Status:
                  margin: float = 0.0,
                  positions: Optional[Dict[str, PositionState]] = None,
                  open_orders: Optional[Dict[str, List["OpenOrder"]]] = None,
-                 fee_ratio: Optional[float] = None):
+                 fee_ratio: Optional[float] = None,
+                 symbol_rules: Optional[Mapping[str, SymbolRules]] = None):
         self.margin = margin
         self.positions: Dict[str, PositionState] = positions if positions is not None else {}
         #: 명목가치에 곱할 수수료율. 계좌 속성이라 여기 둔다 — 실행기가 값(또는 None)을 넘기고
@@ -38,6 +41,15 @@ class Status:
         #: 미체결 주문을 읽고 취소할 수 있다. 리스트 순서 = 제출 순서.
         self.open_orders: Dict[str, List["OpenOrder"]] = \
             open_orders if open_orders is not None else {}
+        #: 심볼별 거래 규칙 (수량/가격 단위, 최소 수량, 최소 명목가치). 전략은 사이징할 때
+        #: ``rules_for``로 읽어 양자화하고, 실행기는 같은 규칙으로 주문을 검증하고 체결 후
+        #: 포지션을 정규화한다. 기본은 하드코딩된 Binance USD-M 전 심볼 규칙이다
+        #: (:mod:`core.order.symbol_rules`). ``fee_ratio``처럼 직렬화하지 않는다.
+        self.symbol_rules: Mapping[str, SymbolRules] = \
+            symbol_rules if symbol_rules is not None else DEFAULT_RULES
+        #: ``rules_for`` 캐시. 기본 규칙표는 지연 생성 Mapping이라 조회가 파이썬 호출이다 —
+        #: 매 봉 주문을 다시 거는 전략에서는 봉마다 여러 번 불리므로 평범한 dict로 받친다.
+        self._rules_cache: Dict[str, SymbolRules] = {}
 
     def position_for(self, symbol: str) -> PositionState:
         """해당 심볼의 PositionState. 처음 보는 심볼이면 flat 상태로 만들어 등록한다.
@@ -46,6 +58,21 @@ class Status:
         if p is None:
             p = self.positions[symbol] = PositionState()
         return p
+
+    def rules_for(self, symbol: str) -> SymbolRules:
+        """해당 심볼의 거래 규칙. 모르는 심볼이면 ``KeyError`` — 규칙 없이 사이징·검증하느니
+        멈춘다."""
+        rules = self._rules_cache.get(symbol)
+        if rules is not None:
+            return rules
+        try:
+            rules = self._rules_cache[symbol] = self.symbol_rules[symbol]
+            return rules
+        except KeyError:
+            raise KeyError(
+                f"{symbol}의 거래 규칙이 없다 — `uv run python -m core.fetcher.binance.exchange_info`로 "
+                f"core/order/symbol_rules_data.py를 재생성하거나, 실행기에 symbol_rules를 "
+                f"직접 넘겨라") from None
 
     def open_orders_for(self, symbol: str) -> List["OpenOrder"]:
         """해당 심볼의 미체결 주문 리스트. 처음 보는 심볼이면 빈 리스트를 만들어 등록한다.

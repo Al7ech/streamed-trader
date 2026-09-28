@@ -7,7 +7,6 @@ from core.account.status import Status
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.indicator.atr import ATRIndicator
 from core.streamer.indicator.pivot_trendline import PivotTrendlineIndicator
-from core.utils import trunc_by_sign
 
 
 class _TouchTracker:
@@ -141,7 +140,7 @@ class TrendlineBounceStreamer(BaseStreamer):
         price = candle.close
         stop_frac = self.stop_atr_mult * atr / price
         lev = min(6.0, self.max_loss / stop_frac)
-        qty = trunc_by_sign(sign * status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
+        qty = status.rules_for(symbol).floor_qty(sign * status.total_margin() / (price * (1 / lev + status.fee_ratio)))
 
         self._hold_remaining = self.hold_candles
         self._stop_price = price * (1 - sign * stop_frac)

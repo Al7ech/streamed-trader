@@ -5,7 +5,7 @@ from core.candle.candle import Candle
 from core.account.status import Status
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.indicator.moving_average import MovingAverage
-from core.utils import trunc_by_sign
+from core.order.symbol_rules import SymbolRules
 
 
 class CrossMovingAverageStreamer(BaseStreamer):
@@ -46,27 +46,31 @@ class CrossMovingAverageStreamer(BaseStreamer):
             return []
 
         position = status.position_for(symbol).position
+        rules = status.rules_for(symbol)
 
-        # 크로스가 발생할 때만 매수/매도
+        # 크로스가 발생할 때만 매수/매도. 증감분(target - position)도 float 뺄셈 잔여가 남을 수
+        # 있어 다시 수량 격자에 맞춘다.
         if prev_ma10 <= prev_ma25 and ma10 > ma25:  # 골든크로스
-            target_qty = long_safe_qty(status.total_margin(), position, candle.close, 3,
+            target_qty = long_safe_qty(status.total_margin(), position, candle.close, rules,
                                        status.fee_ratio)
-            return [Action(symbol, target_qty - position)]
+            return [Action(symbol, rules.floor_qty(target_qty - position))]
         if prev_ma10 >= prev_ma25 and ma10 < ma25:  # 데드크로스
-            target_qty = short_safe_qty(status.total_margin(), position, candle.close, 3,
+            target_qty = short_safe_qty(status.total_margin(), position, candle.close, rules,
                                         status.fee_ratio)
-            return [Action(symbol, target_qty - position)]
+            return [Action(symbol, rules.floor_qty(target_qty - position))]
 
         return []
 
 
-def long_safe_qty(margin: float, position: float, price: float, ndigits: int, fee_ratio: float) -> float:
-    ideal_target_qty = trunc_by_sign(margin / price, ndigits)
+def long_safe_qty(margin: float, position: float, price: float, rules: SymbolRules,
+                  fee_ratio: float) -> float:
+    ideal_target_qty = rules.floor_qty(margin / price)
     expected_fee = abs(ideal_target_qty - position) * price * fee_ratio
-    return trunc_by_sign((margin - expected_fee) / price, ndigits)
+    return rules.floor_qty((margin - expected_fee) / price)
 
 
-def short_safe_qty(margin: float, position: float, price: float, ndigits: int, fee_ratio: float) -> float:
-    ideal_target_qty = trunc_by_sign(-margin / price, ndigits)
+def short_safe_qty(margin: float, position: float, price: float, rules: SymbolRules,
+                   fee_ratio: float) -> float:
+    ideal_target_qty = rules.floor_qty(-margin / price)
     expected_fee = abs(ideal_target_qty - position) * price * fee_ratio
-    return trunc_by_sign(-(margin - expected_fee) / price, ndigits)
+    return rules.floor_qty(-(margin - expected_fee) / price)

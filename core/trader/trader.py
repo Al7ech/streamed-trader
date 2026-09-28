@@ -23,6 +23,7 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from binance import AsyncClient, BinanceSocketManager
 
+from core.fetcher.binance.exchange_info import diff_rules, parse_exchange_info
 from core.fetcher.binance.rest_fetcher import BinanceCandleFetcher
 from core.history.fetcher import FetcherCandleHistory
 from core.executor.simulated import SimulatedExecutor
@@ -175,6 +176,7 @@ class BinanceTrader:
                 # 결과를 같은 구간의 백테스트와 그대로 대조할 수 있다.
                 self.executor = SimulatedExecutor(DRY_RUN_MARGIN, self._fee_ratio,
                                                   self.slippage_ratio, log_label="dry-run")
+                await self._warn_symbol_rules_drift()
             else:
                 self.executor = await LiveExecutor.create(
                     self.symbols, margin_asset=self._margin_asset, client=self.client,
@@ -344,6 +346,23 @@ class BinanceTrader:
         except Exception as e:
             self.recorder = None
             self.logger.error(f"결과 기록을 비활성화한다 (레코더 생성 실패): {e}", exc_info=True)
+
+    async def _warn_symbol_rules_drift(self):
+        """드라이런: 하드코딩 심볼 규칙이 거래소 값과 다르면 **경고만** 한다.
+
+        라이브는 같은 비교가 치명적이다 (:meth:`LiveExecutor._verify_symbol_rules`) — 틀린
+        규칙으로 실제 주문을 내면 안 되기 때문이다. 드라이런은 주문을 내지 않고, 백테스트와
+        같은 규칙으로 도는 것이 오히려 대조의 전제라 멈출 이유가 없다.
+        """
+        try:
+            fetched = parse_exchange_info(await self.client.futures_exchange_info())
+        except Exception as e:
+            self.logger.warning("[dry-run] exchangeInfo 조회 실패 — 심볼 규칙 비교를 건너뛴다: %s", e)
+            return
+        problems = diff_rules(self.executor.status.symbol_rules, fetched, self.symbols)
+        if problems:
+            self.logger.warning("[dry-run] 하드코딩 심볼 규칙이 거래소와 다르다 (라이브라면 기동 "
+                                "실패): %s", "; ".join(problems))
 
     def _restore_dry_run_status(self):
         """재개한 런의 계좌 상태를 되살린다 — **드라이런 전용**.

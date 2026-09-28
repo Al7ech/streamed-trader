@@ -43,7 +43,9 @@ There is no automated test suite (no `pytest`/`unittest` files in `core/`, only 
   indicator across window/length edge cases and then replays the values through
   `precomputed_sink()`, comparing `read(idx)` at every negative index; sections 2-3 compare whole
   `Report`s from `vectorize=True` vs `False` over real candles (including a ragged two-symbol run,
-  the only multi-symbol backtest coverage in the repo); section 4 covers degenerate inputs.
+  the only multi-symbol backtest coverage in the repo); section 4 covers degenerate inputs;
+  section 5 covers symbol rules (quantization helpers, rule-violating orders rejected, post-fill
+  position normalization — see "Symbol rules" below).
   Run it offline (`--offline`) to skip the sections that need the candle cache.
 
 ## Commands
@@ -64,6 +66,7 @@ uv run python core/examples/backtest.py --no-series   # run JSON only, skips the
 uv run python core/checks/live_check.py                      # live path: producer, executor, dry-run == backtest
 uv run python core/checks/backtest_check.py                  # backtest engine: vectorized indicators == loop
 uv run python core/checks/fetch_stock_check.py               # US equity fetcher smoke test (needs MASSIVE_API_KEY)
+uv run python -m core.fetcher.binance.exchange_info          # regenerate core/order/symbol_rules_data.py
 uv run streamed-trader                                # live/dry-run trader using .env configuration
 ```
 
@@ -133,6 +136,7 @@ engine (and the backtest entry point) calls — see "Warm-up and gap backfill ar
 core/
   candle/     Candle (candle.py) + merge.py (merge_by_end_time — the event timeline)
   order/      Action/ActionType (action.py) + order_book.py (resting book + fill rules)
+              + symbol_rules.py (SymbolRules) + symbol_rules_data.py (generated, all symbols)
   account/    Status/PositionState (status.py), Trade (trade.py), Report (report.py)
   streamer/   BaseStreamer + indicator/ (+ vector_ops.py) + strategies/ (the example strategies)
   fetcher/    BaseCandleFetcher + pickle cache; binance/ and stock/ under it
@@ -171,9 +175,12 @@ Rules that hold this together — a change that breaks one is a design change, n
   `Status` is state plus read-only derived helpers (`total_margin`, `leverage`,
   `update_unrealised_pnl`); the fill-accounting model (`apply_fill`) is a mode-specific behaviour
   and lives with its only caller in `executor/simulated.py`, not on `Status`.
-  `order/order_book.py` uses `core.account.status.Status` at runtime and `account/status.py`
-  type-hints `OpenOrder` under `TYPE_CHECKING` only — both always reference the **submodule path**,
-  never the package attribute, or the partially-initialised-package cycle resurfaces.
+  `account/status.py` imports `core.order.symbol_rules` at runtime (`Status` carries the symbol
+  rules), so the direction is `order ← account`: `order/order_book.py` references `Status` under
+  `TYPE_CHECKING` only, as does `account/status.py` for `OpenOrder`. Both always reference the
+  **submodule path**, never the package attribute — `core/order/__init__.py` eagerly imports
+  `order_book`, and a runtime `order_book → account.status` import resurfaces the
+  partially-initialised-package cycle.
 - **`engine/` holds only engines** — the order-of-operations, now in two loops (`engine.py` for
   dry run/live, `backtest.py` for backtest). The port ABCs live in
   `producer/base.py` / `executor/base.py` / `recorder/base.py` / `history/base.py` next to their
@@ -211,7 +218,9 @@ imports it (the engine, recorders and `indicator_columns` reach indicators only 
 
    `fetcher/binance/` also has `funding_fetcher.py` (funding rates) and `metrics_fetcher.py`
    (open interest, long/short account ratios) for strategies that want non-price inputs; both cache
-   the same way but return dicts, not `Candle`s.
+   the same way but return dicts, not `Candle`s. `exchange_info.py` is not a candle source: it
+   parses `exchangeInfo` into symbol rules and, run as a script, regenerates the hardcoded rules
+   file (see "Symbol rules" below).
 
 2. **Cache.** `get_candles_with_cache` caches per **month chunk** under
    `asset/candle/<symbol>_<interval>/<YYYY-MM>.pkl` (`fetcher/pickle_storage.py`): only
@@ -705,10 +714,11 @@ existing ragged-series contract with no changes needed there.
   candle that triggered it in a backtest, so the two can sit up to one bar apart; a backtest infers
   intrabar fills from the bar's OHLC under the fixed assumptions listed in "Resting orders" above,
   while the exchange matched against the real tick path, so a bar that touched both a stop and a
-  limit can resolve differently; `BinanceOrderClient.execute_action` does not quantize to step size,
-  so the filled quantity can differ from the requested action (`LiveExecutor._emit_fill` warns past
-  `_QUANTITY_DIVERGENCE_TOLERANCE`, 1%, so the size of that drift is visible rather than
-  merely expected); prefeed candles are not recorded, so live indicator columns have no
+  limit can resolve differently; the filled quantity can still differ from the requested action
+  after a partial fill that was then cancelled/expired, or a `reduce_only` clamp against a position
+  that moved (orders themselves are rule-checked, see "Symbol rules"; `LiveExecutor._emit_fill`
+  warns past `_QUANTITY_DIVERGENCE_TOLERANCE`, 1%); the symbol rules are today's for every
+  backtest range (the exchange publishes no history of them); prefeed candles are not recorded, so live indicator columns have no
   NaN warm-up prefix; the live equity curve only moves on `ACCOUNT_UPDATE` (exchange truth, mark
   price) so it is step-shaped between account events, whereas a backtest re-marks every open
   position to the bar close every candle; live sizing uses `status.fee_ratio` from the account's real taker commission tier
@@ -872,6 +882,45 @@ those check scripts default to WARNING.
   runs** (multiple price panes, per-symbol trade markers, `summary.by_symbol`) — that's unbuilt
   follow-up work; only the core engine and output schema support multiple symbols today.
 
+### Symbol rules (`core/order/symbol_rules.py`)
+
+Every symbol has exchange trading rules — quantity step (`LOT_SIZE`/`MARKET_LOT_SIZE`), minimum
+quantity, minimum notional (`MIN_NOTIONAL`) and price tick (`PRICE_FILTER`). `SymbolRules` holds
+one symbol's, and `Status.rules_for(symbol)` returns them (cached; `KeyError` with a
+"regenerate" hint for an unknown symbol).
+
+- **Hardcoded, generated.** `core/order/symbol_rules_data.py` holds every Binance USD-M symbol's
+  rules as the exchange's own decimal strings, generated from the public `exchangeInfo` by
+  `uv run python -m core.fetcher.binance.exchange_info` (no key needed) and committed. It is the
+  default for every `Status`; other markets pass `symbol_rules=` to `SimulatedExecutor` (the stock
+  check does). The exchange publishes no history of rules, so a backtest over 2020 uses today's.
+- **Quantization is the strategy's job.** Strategies size with
+  `rules.floor_qty(q)` (toward zero; also for deltas like `target - position`, which subtraction
+  can push off-grid) and price with `rules.round_price(p)`; `rules.meets_min` is there for a
+  strategy that wants to skip an entry too small to place. `trunc_by_sign(x, 3)` is no longer used
+  for order sizing — the step is per symbol (DOGE's is `1`).
+- **Executors validate, never correct.** `SymbolRules.check(action, position, ref_price)` returns a
+  reason or `None`; `SimulatedExecutor.submit` and `LiveExecutor.submit` both call it and **drop**
+  a violating order with a WARNING, as the exchange would reject it. Silently fixing it would hide a
+  strategy bug until live, and one shared check means backtest, dry run and live drop the same
+  orders. Minimum notional applies only to exposure-increasing orders: `reduce_only` and pure
+  reductions (`is_pure_reduction`: opposite sign, no flip) are exempt, and live sends a pure
+  reduction MARKET with `reduceOnly` (on a copy of the action) since the exchange exempts only
+  reduce-only orders — otherwise a sub-minimum position could never be closed. The notional
+  reference is the last close for MARKET (`LiveExecutor._last_close` exists only for this), the
+  order price for LIMIT and the trigger for STOP_MARKET. `_liquidate` is not checked.
+- **Normalization is accounting's job** — `apply_fill`, see "Position & PnL accounting".
+- **Live verifies the file at startup.** `LiveExecutor.create` compares the traded symbols' rules
+  with `futures_exchange_info()` (`diff_rules`, by value, so `"0.001"` equals `"0.00100000"`) and
+  fails startup on any difference; `BinanceTrader` does the same compare in dry run and only warns.
+- **Cost.** Checks run per submitted order and normalization per fill, never per event, so a
+  strategy that trades occasionally is unaffected (Keltner: bit-identical trades, same runtime). The
+  worst case is a stop re-armed every bar (`KeltnerStopStreamer`): ~0.6µs per bar for its own
+  `round_price` plus the executor's check, measured +7-10% on a 6.5-year 1m run. That is why
+  `_Unit`/`check` special-case power-of-ten units with `round(x * 10**nd) / 10**nd` (correctly
+  rounded division gives the canonical float) instead of `round(x, nd)`, which goes through a
+  decimal-string conversion and was ~2x slower.
+
 ### Resting orders (`core/order/order_book.py`)
 
 `Action` can request an order that is **not** filled on the decision candle: a `LIMIT` at a price,
@@ -992,7 +1041,10 @@ close, full close, and direction-flip on that symbol's `PositionState`, creditin
 shared `margin`. It lives in the simulated-executor module because that is its only caller: live
 never does fill accounting — the exchange's `ACCOUNT_UPDATE` is the truth there — so `Status` keeps
 only state plus read-only derived helpers (`total_margin`, `leverage`, `update_unrealised_pnl`),
-not this mode-specific behaviour.
+not this mode-specific behaviour. Every new position `apply_fill` computes (partial close, add,
+flip remainder) is passed through `status.rules_for(symbol).normalize_qty` — float addition of
+on-grid quantities still leaves residue (`0.1 + 0.1 - 0.3 == -0.09999999999999998`), which
+breaks `position == 0` and makes `-position` an off-grid order; see "Symbol rules".
 A `Trade` is an immutable record of one fill (with its
 `symbol`) plus `pre_position`/`pre_margin` — two scalars read off the pre-trade `Status`: the
 signed position for this symbol and the account-wide `total_margin()` at decision time. They used
@@ -1113,7 +1165,9 @@ straight to `executor.on_user_data(...)`.
     `_fetch_taker_commission` failure is fatal (`create` cleans up any resource it owns and
     re-raises — sizing on a wrong fee rate is worse than a failed startup); a
     `futures_get_open_orders()` failure is not (the book looks empty and `ORDER_TRADE_UPDATE`
-    refills it). After startup the state is kept in sync by `ACCOUNT_UPDATE`/`ORDER_TRADE_UPDATE`.
+    refills it). A hardcoded symbol-rules mismatch against `futures_exchange_info()` for a traded
+    symbol is fatal too (`_verify_symbol_rules`; dry run only warns — see "Symbol rules").
+    After startup the state is kept in sync by `ACCOUNT_UPDATE`/`ORDER_TRADE_UPDATE`.
   - **Clients are self-created unless injected**, and `close()` only tears down what it created.
     `BinanceTrader` passes its own `AsyncClient` (the socket manager shares it) but not the
     `BinanceOrderClient`, so that thread pool now exists only in live mode — it used to be built

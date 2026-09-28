@@ -9,10 +9,11 @@
 것이 의도다.
 """
 
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Mapping, Optional, Tuple
 
 from core.order import order_book
 from core.order.action import Action, ActionType
+from core.order.symbol_rules import SymbolRules
 from core.candle.candle import Candle
 from core.account.status import Status
 from core.account.trade import Trade
@@ -41,12 +42,18 @@ def apply_fill(status: Status, symbol: str, quantity: float,
     청산 손익을 ``unrealised_pnl`` 안분으로 구하므로, 호출 전에 그 값이 **체결가 기준**으로
     마킹돼 있어야 실현손익이 맞는다 (:meth:`SimulatedExecutor._fill` 참고).
 
+    새 포지션은 심볼 규칙의 수량 자릿수로 **정규화**한다 (``normalize_qty``). 입력 수량이 전부
+    단위 배수여도 float 덧셈은 0.1 + 0.1 - 0.3 = -0.09999999999999998 같은 잔여를 남기고, 그러면
+    ``position == 0`` 판정과 ``-position`` 청산이 어긋난다. 정규화하면 십진수로 같은 포지션은
+    항상 같은 float다.
+
     :param status: 체결을 반영할 계좌 상태.
     :param symbol: 체결이 일어난 심볼.
     :param quantity: 현재 포지션에 더할 부호 있는 수량 (양수=매수, 음수=매도)
     :param price: 체결가
     """
     p = status.position_for(symbol)
+    normalize = status.rules_for(symbol).normalize_qty
     qty = quantity
     wnl = 0.0
     fee = price * abs(qty) * status.fee_ratio
@@ -59,7 +66,7 @@ def apply_fill(status: Status, symbol: str, quantity: float,
     # 같은 방향 추가 진입 (롱/숏)
     elif (p.position > 0 and qty > 0) or (p.position < 0 and qty < 0):
         total_cost = abs(p.avg_price * p.position) + abs(price * qty)
-        total_pos = p.position + qty
+        total_pos = normalize(p.position + qty)
         p.avg_price = total_cost / abs(total_pos)
         p.position = total_pos
         # margin, unrealised_pnl는 변동 없음
@@ -68,7 +75,7 @@ def apply_fill(status: Status, symbol: str, quantity: float,
     else:
         if abs(qty) > abs(p.position):
             # 방향 전환: 기존 포지션 청산 후 신규 진입
-            open_qty = qty + p.position
+            open_qty = normalize(qty + p.position)
 
             wnl = p.unrealised_pnl
             # PNL/margin 계산 (전부 청산)
@@ -85,7 +92,7 @@ def apply_fill(status: Status, symbol: str, quantity: float,
             # avg_price는 변동 없음
             status.margin += realised_pnl
             p.unrealised_pnl -= realised_pnl
-            p.position += closed_qty
+            p.position = normalize(p.position + closed_qty)
 
     if p.position == 0.0:
         p.avg_price = 0.0
@@ -107,12 +114,16 @@ class SimulatedExecutor(Executor):
         백테스트 모델링 값이라 ``Status``에 얹지 않고 여기서만 들고 있다 — 전략은 읽지 않는다.
     :param log_label: 체결 로그에 붙일 접두사. 드라이런은 ``"dry-run"``을 넘겨 실제 돈이 걸린
         체결과 구분되게 한다 (백테스트는 접두사가 없다).
+    :param symbol_rules: 심볼별 거래 규칙. ``None``이면 ``Status``가 하드코딩된 Binance USD-M
+        규칙을 쓴다. 그 밖의 시장(주식 등)은 직접 넘긴다.
     """
 
     def __init__(self, init_margin: float, fee_ratio: Optional[float] = None,
                  slippage_ratio: float = 0.0,
-                 on_trade: Optional[Callable[[Trade], None]] = None, log_label: str = ""):
-        super().__init__(Status(margin=init_margin, fee_ratio=fee_ratio), on_trade)
+                 on_trade: Optional[Callable[[Trade], None]] = None, log_label: str = "",
+                 symbol_rules: Optional[Mapping[str, SymbolRules]] = None):
+        super().__init__(Status(margin=init_margin, fee_ratio=fee_ratio,
+                                symbol_rules=symbol_rules), on_trade)
         self.slippage_ratio = slippage_ratio
         #: 심볼별 최근 알려진 종가. :meth:`begin_event`가 이벤트 캔들로 갱신하고 이벤트를
         #: 넘어 유지된다 — 캔들이 없는 이벤트에서도 심볼이 직전 값을 들고 있다. 계좌 상태가
@@ -201,6 +212,10 @@ class SimulatedExecutor(Executor):
 
         장부 조작(취소/등록)이 수량 검사보다 **먼저**다: CANCEL은 quantity가 0이라 뒤에 두면
         조용히 사라진다.
+
+        등록·체결 전에 심볼 규칙(:meth:`SymbolRules.check`)으로 검증하고, 위반이면 경고만 남기고
+        버린다 — 거래소가 거부하는 것과 같다. 고쳐서 내보내지 않는다: 양자화는 전략 몫이고,
+        라이브 실행기도 같은 검사로 같은 주문을 버리므로 드라이런·백테스트와 갈라지지 않는다.
         """
         if self._bankrupt:
             return None
@@ -213,6 +228,10 @@ class SimulatedExecutor(Executor):
             return None
 
         if action.is_resting:
+            ref_price = action.price if action.order_type is ActionType.LIMIT \
+                else action.trigger_price
+            if self._violates_rules(action, ref_price):
+                return None
             self._order_seq += 1
             if order_book.register_order(self.status, action, event_time, self._order_seq):
                 self.logger.debug("%s미체결 주문 등록: %s", self._prefix, action)
@@ -228,10 +247,23 @@ class SimulatedExecutor(Executor):
             self.logger.warning("%s가격을 알 수 없는 심볼 %s 에 대한 액션을 건너뛴다: %s",
                                 self._prefix, action.symbol, action)
             return None
+        if self._violates_rules(action, price):
+            return None
 
         self._fill(action.symbol, action.quantity, price, event_time,
                    ActionType.MARKET.value, event_time)
         return None
+
+    def _violates_rules(self, action: Action, ref_price: Optional[float]) -> bool:
+        st = self.status
+        pos_state = st.positions.get(action.symbol)
+        position = pos_state.position if pos_state is not None else 0.0
+        reason = st.rules_for(action.symbol).check(action, position, ref_price)
+        if reason is None:
+            return False
+        self.logger.warning("%s심볼 규칙 위반 — 주문을 버린다 (%s): %s",
+                            self._prefix, reason, action)
+        return True
 
     def _fill(self, symbol: str, quantity: float, price: float, event_time: int,
               order_type: str, submitted_at: int) -> Trade:

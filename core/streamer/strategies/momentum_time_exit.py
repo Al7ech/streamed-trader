@@ -6,7 +6,6 @@ from core.candle.candle import Candle
 from core.account.status import Status
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.indicator.moving_average import MovingAverage
-from core.utils import trunc_by_sign
 
 
 class MomentumTimeExitStreamer(BaseStreamer):
@@ -88,7 +87,7 @@ class MomentumTimeExitStreamer(BaseStreamer):
         sign = 1 if momentum_pct > 0 else -1
         stop_frac = self.entry_threshold_pct / 100
         lev = min(6.0, self.max_loss / stop_frac)
-        qty = trunc_by_sign(sign * status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
+        qty = status.rules_for(symbol).floor_qty(sign * status.total_margin() / (price * (1 / lev + status.fee_ratio)))
 
         self._hold_remaining = self.hold_candles
         self._stop_price = price * (1 - sign * stop_frac)

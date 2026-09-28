@@ -15,6 +15,7 @@ import numpy as np
 from dotenv import load_dotenv
 
 from core.executor.simulated import DEFAULT_INIT_MARGIN
+from core.order.symbol_rules import SymbolRules
 from core.recorder.backtest import BacktestRecorder
 from core.executor.simulated import SimulatedExecutor
 from core.engine.backtest import BacktestEngine
@@ -121,7 +122,10 @@ def main():
     # 이미 손에 든 캔들을 그대로 넘긴다 — 심볼별 dict가 백테스트 엔진의 입력이다.
     # 봉 간격은 캔들에서 재지 않고 interval 문자열에서 온다. 주식 캔들은 장 시간 그리드
     # 위에 있어서 (야간/주말 건너뜀) 앞의 두 캔들 간격을 재는 방식이 맞지 않는다.
-    executor = SimulatedExecutor(init_margin, 0.0005)
+    # 주식 심볼은 하드코딩된 Binance 규칙에 없으므로 직접 넘긴다: 1주 단위, 1센트 tick,
+    # 최소 명목가치 없음.
+    rules = {symbol: SymbolRules("1", "1", "1", "1", "0", "0.01")}
+    executor = SimulatedExecutor(init_margin, 0.0005, symbol_rules=rules)
     recorder = BacktestRecorder(streamer, executor.status,
                                 interval_ms=interval_to_minutes(interval) * 60_000)
     report = BacktestEngine(streamer, {symbol: candles}, executor, recorder).run()

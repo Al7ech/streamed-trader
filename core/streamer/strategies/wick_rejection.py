@@ -6,7 +6,6 @@ from core.candle.candle import Candle
 from core.account.status import Status
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.indicator.atr import ATRIndicator
-from core.utils import trunc_by_sign
 
 
 class WickRejectionStreamer(BaseStreamer):
@@ -90,7 +89,7 @@ class WickRejectionStreamer(BaseStreamer):
         price = candle.close
         stop_frac = self.stop_atr_mult * atr / price
         lev = min(6.0, self.max_loss / stop_frac)
-        qty = trunc_by_sign(self.side * status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
+        qty = status.rules_for(symbol).floor_qty(self.side * status.total_margin() / (price * (1 / lev + status.fee_ratio)))
 
         self._hold_remaining = self.hold_candles
         self._stop_price = price * (1 - self.side * stop_frac)

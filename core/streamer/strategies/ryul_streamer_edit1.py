@@ -7,7 +7,6 @@ from core.order.action import Action
 from core.streamer.base_streamer import BaseStreamer
 from core.streamer.indicator.atr import ATRIndicator
 from core.streamer.indicator.donchian_channel import MinDonchianIndicator, MaxDonchianIndicator
-from core.utils import trunc_by_sign
 
 
 class RyulStreamer_edit1(BaseStreamer):
@@ -101,13 +100,13 @@ class RyulStreamer_edit1(BaseStreamer):
                 # 체결은 BV/SV가 아니라 종가에 일어나므로(백테스터도, 실거래도 봉이 닫힐 때
                 # 시장가) 사이징 기준가도 종가여야 실효 레버리지가 lev와 일치한다. 레벨을
                 # 기준으로 재면 돌파 오버슈트만큼 롱은 과대·숏은 과소 사이징된다.
-                qty = trunc_by_sign(status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
+                qty = status.rules_for(symbol).floor_qty(status.total_margin() / (price * (1 / lev + status.fee_ratio)))
                 return [Action(symbol, qty)]
 
             if price <= SV and self._is_safe_price(symbol, price, SV):
                 delta = BV - SV
                 lev = min(6.0, self.max_loss * price / delta)
-                qty = trunc_by_sign(-status.total_margin() / (price * (1 / lev + status.fee_ratio)), 3)
+                qty = status.rules_for(symbol).floor_qty(-status.total_margin() / (price * (1 / lev + status.fee_ratio)))
                 return [Action(symbol, qty)]
 
         if position.position > 0:

@@ -16,13 +16,17 @@
   채워질 수 없다. 다음 이벤트부터 매칭 대상이다.
 """
 
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Tuple
 
 from core.order.action import Action, ActionType
 from core.candle.candle import Candle
-from core.account.status import Status
+
+if TYPE_CHECKING:  # 타입 힌트 전용. account가 order를 import하므로 런타임 import는 순환이다.
+    from core.account.status import Status
 
 
 logger = logging.getLogger(__name__)

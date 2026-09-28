@@ -102,13 +102,19 @@ Order execution and account state, against the real exchange:
 - **`LiveExecutor.create()` is the only constructor path**, and it reads the exchange: the executor
   comes back with a `Status` already built from `futures_account()`, `futures_get_open_orders()`
   and `futures_commission_rate()` — the last supplies `status.fee_ratio` (the account's real taker
-  rate) so live position sizing uses the actual tier; a failed commission fetch is non-fatal and
-  falls back to `DEFAULT_FEE_RATIO`. The parsing itself is in `build_status` / `order_from_exchange`,
+  rate) so live position sizing uses the actual tier; a failed commission fetch is fatal (sizing on
+  a wrong rate is worse than a failed startup). It also compares the hardcoded symbol rules
+  (`core/order/symbol_rules_data.py`) for the traded symbols against `futures_exchange_info()` and
+  fails startup on any difference — regenerate with `uv run python -m
+  core.fetcher.binance.exchange_info` (dry run only warns). The parsing itself is in `build_status` / `order_from_exchange`,
   pure functions taking those payloads. There is no window in which an unhydrated `Status` can be
   read — which is what the live recorder's `init_margin` depends on. It creates its own `BinanceOrderClient` and
   `AsyncClient` unless they are passed in, and `close()` tears down only what it created; the
   trader passes its own `AsyncClient` because the socket manager shares it.
-- `submit(action)` fires the order and returns `None`; a detached task (`_await_order_result`)
+- `submit(action)` first runs the same `SymbolRules.check` the simulated executor runs and drops a
+  violating order with a warning (see "Symbol rules" in `CLAUDE.md`); a pure-reduction MARKET goes
+  out with `reduceOnly`, since the exchange exempts only reduce-only orders from the minimum
+  notional. It then fires the order and returns `None`; a detached task (`_await_order_result`)
   awaits the submission result and routes a failure to `on_error`. The **fill arrives later** on
   the user-data stream. The pre-trade `Status` snapshot is deep-copied before the order is sent and
   keyed by client order id, so a resting order that fills hours later is still paired with the

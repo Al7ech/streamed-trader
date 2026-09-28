@@ -11,11 +11,18 @@ def generate_dict_string(d: dict) -> str:
 
 
 def trunc_by_sign(x: float, n: int) -> float:
+    """소수 ``n``자리에서 0 방향으로 자른다.
+
+    곱셈 결과를 먼저 소수 6자리로 반올림한 뒤 자른다 — ``4.35 * 100``이
+    ``434.99999999999994``라 그대로 내리면 한 단위가 통째로 깎인다. 주문 수량은 이 함수가
+    아니라 ``status.rules_for(symbol).floor_qty``로 맞춘다 (심볼마다 단위가 다르다).
+    """
     factor = 10 ** n
+    scaled = round(x * factor, 6)
     if x >= 0:
-        return math.floor(x * factor) / factor  # 양수 → 내림
+        return math.floor(scaled) / factor  # 양수 → 내림
     else:
-        return math.ceil(x * factor) / factor  # 음수 → 올림
+        return math.ceil(scaled) / factor  # 음수 → 올림
 
 
 _suffix_map = {
