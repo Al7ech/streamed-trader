@@ -39,6 +39,19 @@ class OrderType(Enum):
     TRAILING_STOP_MARKET = "TRAILING_STOP_MARKET"
 
 
+#: 2025-12-09 이후 거래소가 algo 주문 서비스로 옮긴 조건부 타입. python-binance(1.0.37)의
+#: ``futures_create_order``는 이 타입을 스스로 ``algoOrder`` 엔드포인트로 보내면서
+#: ``newClientOrderId``를 **버리고** 자기 ``clientAlgoId``를 지어 붙인다 — 그러면 전략이 그 주문을
+#: 자기 id로 취소할 수도, 체결을 결정과 짝지을 수도 없다. 그래서 이 타입에는 id를
+#: ``clientAlgoId``로 실어 보낸다 (거래소가 그대로 돌려주고, 발동된 시장가 주문의 ``c``도 이 값이다).
+_CONDITIONAL_TYPES = frozenset({"STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET",
+                                "TRAILING_STOP_MARKET"})
+
+#: 거래소의 "그런 주문 없음" 오류 코드. id로 취소할 때 일반/algo 장부 중 어디에 있는지 모르면
+#: 일반 쪽을 먼저 시도하고 이 코드면 algo 쪽으로 넘어간다.
+_UNKNOWN_ORDER = -2011
+
+
 class OrderSide(Enum):
     """Order side (buy/sell)."""
     BUY = "BUY"
@@ -151,7 +164,8 @@ class BinanceOrderClient:
     }
 
     def execute_action(self, action: Action,
-                       client_order_id: Optional[str] = None) -> Future[OrderResult]:
+                       client_order_id: Optional[str] = None,
+                       conditional: Optional[bool] = None) -> Future[OrderResult]:
         """
         Execute a trading action. ``action.symbol``이 대상 심볼이다 — Action이 자기 심볼을
         들고 다니므로 별도 symbol 인자를 받지 않는다.
@@ -160,12 +174,15 @@ class BinanceOrderClient:
             action: Trading action from streamer
             client_order_id: 이 주문에 붙일 newClientOrderId. 호출자가 체결 이벤트를 자기
                 결정과 짝짓고 나중에 취소하는 데 쓴다.
+            conditional: CANCEL에만 쓰인다 — 취소할 주문이 조건부(algo) 장부에 있는지에 대한
+                호출자의 힌트. None이면 모른다는 뜻이다 (:meth:`cancel_order` 참고).
 
         Returns:
             Future object that will contain the OrderResult
         """
         if action.order_type is ActionType.CANCEL:
-            return self.cancel_order(action.symbol, orig_client_order_id=action.client_id)
+            return self.cancel_order(action.symbol, orig_client_order_id=action.client_id,
+                                     conditional=conditional)
 
         if action.quantity == 0:
             # No action needed
@@ -322,7 +339,10 @@ class BinanceOrderClient:
                 order_params['closePosition'] = True
 
             if order_request.client_order_id:
-                order_params['newClientOrderId'] = order_request.client_order_id
+                if order_request.order_type.value in _CONDITIONAL_TYPES:
+                    order_params['clientAlgoId'] = order_request.client_order_id
+                else:
+                    order_params['newClientOrderId'] = order_request.client_order_id
 
             # Execute futures order
             self.logger.info(f"sending futures order with {order_params}")
@@ -330,7 +350,8 @@ class BinanceOrderClient:
 
             return OrderResult(
                 success=True,
-                order_id=str(response.get('orderId', '')),
+                # 조건부 주문은 algo 엔드포인트라 orderId 대신 algoId가 온다.
+                order_id=str(response.get('orderId') or response.get('algoId') or ''),
                 error=None
             )
 
@@ -342,7 +363,8 @@ class BinanceOrderClient:
             return OrderResult(success=False, error=f"Unexpected error: {e}")
 
     def cancel_order(self, symbol: str, order_id: Optional[Union[str, int]] = None,
-                     orig_client_order_id: Optional[str] = None) -> Future[OrderResult]:
+                     orig_client_order_id: Optional[str] = None,
+                     conditional: Optional[bool] = None) -> Future[OrderResult]:
         """
         Cancel an existing order.
 
@@ -352,26 +374,53 @@ class BinanceOrderClient:
             orig_client_order_id: 주문을 낼 때 붙인 newClientOrderId. 전략은 이쪽으로
                 취소한다 — 거래소 ID는 주문을 낸 뒤에야 알 수 있어서 전략이 들고 있을 수 없다.
 
-        둘 다 None이면 그 심볼의 **미체결 주문을 전부** 취소한다
-        (``Action.cancel(symbol)``의 라이브 대응).
+            conditional: 주문이 조건부(algo) 장부에 있으면 True, 일반 장부면 False, 모르면
+                None. 거래소는 두 장부를 다른 엔드포인트로 다루고, 엉뚱한 쪽에 취소를 보내면
+                -2011(Unknown order)로 거부한다. None이면 일반 쪽을 먼저 시도하고 -2011이면
+                algo 쪽으로 넘어간다.
+
+        둘 다 None이면 그 심볼의 **미체결 주문을 전부** 취소한다 — 일반과 algo 장부 **둘 다**
+        (``Action.cancel(symbol)``의 라이브 대응). 일반 쪽만 비우면 손절이 거래소에 남는다.
 
         Returns:
             Future object that will contain the OrderResult
         """
         future = self.executor.submit(self._cancel_single_order, symbol, order_id,
-                                      orig_client_order_id)
+                                      orig_client_order_id, conditional)
         return future
 
     def _cancel_single_order(self, symbol: str, order_id: Optional[Union[str, int]] = None,
-                             orig_client_order_id: Optional[str] = None) -> OrderResult:
-        """Cancel a single order, or every open order on the symbol."""
+                             orig_client_order_id: Optional[str] = None,
+                             conditional: Optional[bool] = None) -> OrderResult:
+        """Cancel a single order, or every open order on the symbol (regular + algo)."""
         try:
             if order_id is None and orig_client_order_id is None:
-                self.client.futures_cancel_all_open_orders(symbol=symbol)
+                # 한쪽이 실패해도 다른 쪽은 시도한다 — 손절만 남는 게 가장 나쁜 결과다.
+                errors = []
+                for kw in ({}, {'conditional': True}):
+                    try:
+                        self.client.futures_cancel_all_open_orders(symbol=symbol, **kw)
+                    except Exception as e:
+                        errors.append(f"{'algo' if kw else 'regular'}: {e}")
+                if errors:
+                    return OrderResult(success=False, error=f"Cancel-all error: {errors}")
                 return OrderResult(success=True, order_id=None, error=None)
             if orig_client_order_id is not None:
-                self.client.futures_cancel_order(symbol=symbol,
-                                                 origClientOrderId=orig_client_order_id)
+                if conditional is None:
+                    try:
+                        self.client.futures_cancel_order(symbol=symbol,
+                                                         origClientOrderId=orig_client_order_id)
+                        return OrderResult(success=True, order_id=orig_client_order_id)
+                    except BinanceAPIException as e:
+                        if e.code != _UNKNOWN_ORDER:
+                            raise
+                    conditional = True
+                if conditional:
+                    self.client.futures_cancel_order(symbol=symbol,
+                                                     clientAlgoId=orig_client_order_id)
+                else:
+                    self.client.futures_cancel_order(symbol=symbol,
+                                                     origClientOrderId=orig_client_order_id)
                 return OrderResult(success=True, order_id=orig_client_order_id, error=None)
             self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
             return OrderResult(

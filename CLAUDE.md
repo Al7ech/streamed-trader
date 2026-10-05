@@ -22,7 +22,7 @@ An algorithmic trading system for Binance USD-M Futures with two independent hal
   render multi-symbol runs** — see "Backtest output format" below.
 
 There is no automated test suite (no `pytest`/`unittest` files in `core/`, only the default CRA
-`react-scripts test` in `visualise/`). The de-facto correctness checks are two scripts:
+`react-scripts test` in `visualise/`). The de-facto correctness checks are these scripts:
 
 - `core/checks/live_check.py` — covers the live path (it needs a socket and an exchange, so it fakes
   both) and asserts the engine's continuity/backfill rules over a faked live producer (duplicate
@@ -49,6 +49,14 @@ There is no automated test suite (no `pytest`/`unittest` files in `core/`, only 
   section 5 covers symbol rules (quantization helpers, rule-violating orders rejected, post-fill
   position normalization — see "Symbol rules" below).
   Run it offline (`--offline`) to skip the sections that need the candle cache.
+- `core/checks/testnet_check.py` — the real exchange round-trip that `live_check.py` section 2
+  fakes: `LiveExecutor.create` hydration (wallet, taker commission, symbol-rule verification —
+  `BTCUSDT` is expected to be rejected because testnet's step differs), then MARKET / marketable
+  LIMIT / resting STOP_MARKET + TAKE_PROFIT_MARKET / LIMIT cancel / cancel-all / reduce-only close /
+  exchange rejection → `on_error`, all through the real `BinanceOrderClient` and the real user-data
+  stream on `ETHUSDT`. Needs `TESTNET_API_KEY`/`TESTNET_API_SECRET` (never reads `API_KEY`), refuses
+  to run unless the client builds testnet URIs or if the account is in hedge mode, and cancels all
+  `ETHUSDT` orders (regular + algo) and flattens the position before and after.
 
 ## Commands
 
@@ -68,6 +76,7 @@ uv run python core/examples/backtest.py --no-series   # run JSON only, skips the
 uv run python core/checks/live_check.py                      # live path: producer, executor, dry-run == backtest
 uv run python core/checks/backtest_check.py                  # backtest engine: vectorized indicators == loop
 uv run python core/checks/fetch_stock_check.py               # US equity fetcher smoke test (needs MASSIVE_API_KEY)
+uv run python core/checks/testnet_check.py                   # live executor vs Binance futures testnet (needs TESTNET_API_KEY; places testnet orders)
 uv run python -m core.fetcher.binance.exchange_info          # regenerate core/order/symbol_rules_data.py
 uv run streamed-trader                                # live/dry-run trader using .env configuration
 ```
@@ -157,7 +166,7 @@ core/
   trader/     BinanceTrader (trader.py) — live/dry-run assembly + lifecycle; ServerClock
               (server_clock.py) — exchange time for warm-up end + decision deadline; README.md here
   checks/     live_check.py, backtest_check.py, compare.py (shared Report comparator),
-              fetch_stock_check.py
+              fetch_stock_check.py, testnet_check.py
   examples/   backtest.py, trader.py
   utils/      timestamp/rounding helpers, logging_config.py alongside
 ```
@@ -1291,6 +1300,22 @@ straight to `executor.on_user_data(...)`.
   `trigger_above` the same way in reverse, from the payload's `type` + `side`. A `CANCEL`
   action routes to `cancel_order`, which also accepts `origClientOrderId` (how a strategy addresses
   its own order) and cancels every open order on the symbol when given neither id.
+
+  **Conditional orders live in a separate book (Algo Order API, since 2025-12-09).**
+  python-binance 1.0.37 routes STOP/STOP_MARKET/TAKE_PROFIT(_MARKET)/TRAILING_STOP_MARKET to
+  `algoOrder` on its own and *drops* `newClientOrderId` there, inventing its own `clientAlgoId` —
+  so `_execute_single_order` sends the strategy's id as `clientAlgoId` for those types. The
+  exchange then reports them via `ALGO_UPDATE` (`LiveExecutor._process_algo_update`: `NEW` adds to
+  the book, `TRIGGERED`/`FINISHED`/`CANCELED`/`EXPIRED`/`REJECTED` remove), not
+  `ORDER_TRADE_UPDATE`. A triggered stop places a MARKET order whose `c` *is* the `clientAlgoId`,
+  so its fill pairs with the decision through the ordinary `ORDER_TRADE_UPDATE` path unchanged.
+  `futures_get_open_orders()` does not list them, so `_fetch_open_orders` also queries
+  `conditional=True`, and `order_from_exchange` reads the algo field names (`orderType`,
+  `triggerPrice`/`tp`, `quantity`, `clientAlgoId`/`caid`, `algoId`/`aid`). Cancels need the right
+  endpoint: cancel-all hits both books; cancel-by-id takes a `conditional` hint from
+  `LiveExecutor.submit` (the type of the order it just removed locally), and with no hint tries the
+  regular book then falls back to the algo book on -2011. `core/checks/testnet_check.py` asserts
+  all of this against the real testnet, including a stop that actually triggers.
 
 There is no `add_action_callback` any more — the `Executor` is the action seam. To observe or alter
 what gets executed, wrap `trader.executor`. `add_error_callback` remains.

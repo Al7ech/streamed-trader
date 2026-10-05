@@ -56,6 +56,13 @@ _TERMINAL_ORDER_STATES = ("FILLED", "CANCELED", "EXPIRED", "REJECTED")
 _TRACKED_ORDER_STATES = _TERMINAL_ORDER_STATES + ("PARTIALLY_FILLED",)
 _ACK_ORDER_STATE = "NEW"
 
+#: 조건부(algo) 주문이 더 이상 걸려 있지 않은 ALGO_UPDATE 상태들. TRIGGERED/FINISHED는 발동돼
+#: 시장가 주문이 나간 것이고(그 체결은 같은 client id의 ORDER_TRADE_UPDATE로 온다), 나머지는
+#: 발동 없이 끝난 것이다.
+_ALGO_GONE_STATES = ("TRIGGERED", "FINISHED", "CANCELED", "EXPIRED", "REJECTED")
+#: 발동 없이 끝나 체결이 영영 오지 않는 상태 — 짝지을 결정을 붙들 이유가 없다.
+_ALGO_UNFILLED_STATES = ("CANCELED", "EXPIRED", "REJECTED")
+
 #: 결정 수량과 실제 체결 수량의 허용 괴리. 주문 수량은 심볼 규칙(step)으로 검증되므로
 #: 넘는다면 부분 체결 후 취소·만료이거나, 체결 시점에 포지션이 달라 reduce_only가 깎은 경우다.
 _QUANTITY_DIVERGENCE_TOLERANCE = 0.01
@@ -103,16 +110,19 @@ def resolve_margin_asset(symbols: List[str]) -> str:
 
 
 def order_from_exchange(o: Dict) -> Optional[OpenOrder]:
-    """거래소 주문 표현(REST의 open order, 또는 ``ORDER_TRADE_UPDATE``의 ``o``)을 OpenOrder로.
+    """거래소 주문 표현을 OpenOrder로. 네 가지 모양을 받는다: 일반 주문의 REST open order와
+    ``ORDER_TRADE_UPDATE``의 ``o``, 그리고 조건부(algo) 주문의 REST open algo order와
+    ``ALGO_UPDATE``의 ``o``.
 
-    REST와 스트림이 필드 이름을 다르게 쓰므로 (``origQty``/``q``, ``type``/``o`` …) 둘 다
-    받는다. 이 엔진이 모르는 주문 타입(트레일링 스탑 등, 사람이 앱에서 낸 것)은 None을
+    2025-12-09 이후 STOP_MARKET/TAKE_PROFIT_MARKET은 거래소의 algo 주문 서비스에 걸리고
+    필드 이름이 또 다르다 (``orderType``, ``triggerPrice``/``tp``, ``quantity``,
+    ``clientAlgoId``/``caid``, ``algoId``/``aid``). 모양마다 필드 이름이 달라 전부 받는다. 이 엔진이 모르는 주문 타입(트레일링 스탑 등, 사람이 앱에서 낸 것)은 None을
     돌려 장부에 넣지 않는다 — 체결 판정 규칙이 없는 주문을 들고 있어봐야 오해만 낳는다.
 
     트리거 방향은 거래소가 준 ``type``+``side``로 그대로 복원한다 (STOP_MARKET+BUY 또는
     TAKE_PROFIT_MARKET+SELL이면 위로 관통 시 발동) — 기준가 추측이 필요 없다.
     """
-    raw_type = o.get("type") or o.get("o") or ""
+    raw_type = o.get("type") or o.get("orderType") or o.get("o") or ""
     if raw_type in ("LIMIT", "STOP", "TAKE_PROFIT"):
         order_type = ActionType.LIMIT
     elif raw_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
@@ -122,9 +132,9 @@ def order_from_exchange(o: Dict) -> Optional[OpenOrder]:
 
     side = o.get("side") or o.get("S") or ""
     try:
-        qty = float(o.get("origQty", o.get("q", 0.0)) or 0.0)
-        price = float(o.get("price", o.get("p", 0.0)) or 0.0)
-        trigger = float(o.get("stopPrice", o.get("sp", 0.0)) or 0.0)
+        qty = float(_first(o, "origQty", "quantity", "q") or 0.0)
+        price = float(_first(o, "price", "p") or 0.0)
+        trigger = float(_first(o, "stopPrice", "triggerPrice", "sp", "tp") or 0.0)
     except (TypeError, ValueError):
         return None
     if qty <= 0:
@@ -140,10 +150,25 @@ def order_from_exchange(o: Dict) -> Optional[OpenOrder]:
         trigger_price=trigger or None,
         trigger_above=bool(trigger_above),
         reduce_only=bool(o.get("reduceOnly", o.get("R", False))),
-        client_id=o.get("clientOrderId") or o.get("c") or None,
-        created_at=int(o.get("time", o.get("T", 0)) or 0),
-        exchange_order_id=str(o.get("orderId", o.get("i", "")) or ""),
+        client_id=_first(o, "clientOrderId", "clientAlgoId", "c", "caid") or None,
+        created_at=int(_first(o, "time", "createTime", "T") or 0),
+        exchange_order_id=str(_first(o, "orderId", "algoId", "i", "aid") or ""),
     )
+
+
+def _first(o: Dict, *keys):
+    """``keys`` 중 처음으로 비어 있지 않은 값. 일반 REST의 ``stopPrice: "0"``처럼 0 문자열도
+    "없음"으로 본다 — 그래야 algo 페이로드의 ``triggerPrice``로 넘어간다."""
+    for key in keys:
+        value = o.get(key)
+        if value not in (None, "", "0", 0):
+            try:
+                if float(value) == 0:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            return value
+    return None
 
 
 def build_status(account_info: Dict, raw_open_orders: List[Dict], symbols: List[str],
@@ -329,15 +354,22 @@ class LiveExecutor(Executor):
 
     @staticmethod
     async def _fetch_open_orders(client: AsyncClient) -> List[Dict]:
-        """거래소의 미체결 주문. 실패는 **치명적이지 않다** — 장부가 비어 보일 뿐이고 이후
-        ``ORDER_TRADE_UPDATE``로 채워진다. 다만 그 사이 전략이 손절을 중복으로 걸 수 있으므로
-        조용히 넘기지 않는다.
+        """거래소의 미체결 주문 — 일반 장부와 조건부(algo) 장부 **둘 다**.
+
+        손절/익절은 algo 장부에 있어 ``futures_get_open_orders()``에 보이지 않는다. 그쪽을
+        빼먹으면 재기동한 전략이 "손절이 없다"고 보고 하나 더 건다.
+
+        실패는 **치명적이지 않다** — 장부가 비어 보일 뿐이고 이후 ``ORDER_TRADE_UPDATE``/
+        ``ALGO_UPDATE``로 채워진다. 다만 그 사이 전략이 손절을 중복으로 걸 수 있으므로 조용히
+        넘기지 않는다. 한쪽이 실패해도 다른 쪽은 쓴다.
         """
-        try:
-            return await client.futures_get_open_orders()
-        except Exception as e:
-            _logger.error("미체결 주문을 불러오지 못했다: %s", e, exc_info=True)
-            return []
+        orders: List[Dict] = []
+        for label, kw in (("일반", {}), ("조건부(algo)", {"conditional": True})):
+            try:
+                orders.extend(await client.futures_get_open_orders(**kw))
+            except Exception as e:
+                _logger.error("%s 미체결 주문을 불러오지 못했다: %s", label, e, exc_info=True)
+        return orders
 
     @staticmethod
     async def _fetch_taker_commission(client: AsyncClient, symbols: List[str]) -> float:
@@ -424,7 +456,12 @@ class LiveExecutor(Executor):
             if cancelled:
                 self.logger.info("주문 취소: symbol=%s client_id=%s (%d건)",
                                  action.symbol, action.client_id or "*", len(cancelled))
-            self._dispatch(action)
+            # 조건부 주문은 거래소의 algo 장부에 있어 취소 엔드포인트가 다르다. 장부에서 지운
+            # 주문으로 어느 쪽인지 알려 준다 — 모르면(아직 NEW가 안 온 주문) None이고 주문
+            # 클라이언트가 일반 → algo 순으로 시도한다.
+            conditional = (any(o.order_type is ActionType.STOP_MARKET for o in cancelled)
+                           if cancelled else None)
+            self._dispatch(action, conditional=conditional)
             return
 
         if action.quantity == 0:
@@ -472,8 +509,11 @@ class LiveExecutor(Executor):
 
         self._dispatch(action)
 
-    def _dispatch(self, action: Action) -> None:
-        future = self._orders.execute_action(action)
+    def _dispatch(self, action: Action, conditional: Optional[bool] = None) -> None:
+        if conditional is None:
+            future = self._orders.execute_action(action)
+        else:
+            future = self._orders.execute_action(action, conditional=conditional)
         # submit은 run_async가 도는 이벤트 루프 스레드에서 불리므로 create_task가 가능하다.
         task = asyncio.create_task(self._await_order_result(future, action))
         self._pending_order_tasks.add(task)
@@ -577,6 +617,8 @@ class LiveExecutor(Executor):
             await self._process_account_update(data)
         elif event_type == "ORDER_TRADE_UPDATE":
             await self._process_order_trade_update(data)
+        elif event_type == "ALGO_UPDATE":
+            self._process_algo_update(data)
 
     async def _process_account_update(self, data: dict) -> None:
         """ACCOUNT_UPDATE로 margin/포지션을 갱신한다.
@@ -705,6 +747,44 @@ class LiveExecutor(Executor):
         except Exception as e:
             self.logger.error("Error processing order trade update: %s", e)
             raise
+
+    def _process_algo_update(self, data: dict) -> None:
+        """조건부(algo) 주문의 수명주기를 ``status.open_orders``에 반영한다.
+
+        손절/익절은 algo 장부에 걸리므로 접수(NEW)와 취소가 ``ORDER_TRADE_UPDATE``가 아니라
+        이 이벤트로 온다. **체결은 여기서 다루지 않는다** — 발동되면 거래소가 같은 client id
+        (``c`` = ``caid``)를 단 시장가 주문을 내고, 그 체결이 평소의 ``ORDER_TRADE_UPDATE``로
+        와서 결정과 짝지어진다 (그 종결 이벤트도 같은 id로 장부에서 지운다 — 어느 쪽이 먼저
+        오든 결과가 같다).
+        """
+        algo = data.get("o") or {}
+        symbol = algo.get("s", "")
+        if symbol not in self._symbol_set:
+            return
+        status = algo.get("X", "")
+        client_id = algo.get("caid") or None
+        book = self.status.open_orders_for(symbol)
+
+        if status == _ACK_ORDER_STATE:
+            if any(o.client_id == client_id for o in book):
+                return
+            order = order_from_exchange(algo)
+            if order is not None:
+                book.append(order)
+                self.logger.info("미체결 조건부 주문 등록: %s", order)
+            return
+
+        if status in _ALGO_GONE_STATES:
+            if any(o.client_id == client_id for o in book):
+                self.status.open_orders[symbol] = [o for o in book if o.client_id != client_id]
+                self.logger.info("미체결 조건부 주문 해제 (%s): client_id=%s", status.lower(),
+                                 client_id)
+            if status in _ALGO_UNFILLED_STATES:
+                # 발동 없이 끝났다 — 이 결정에 체결이 올 일이 없다.
+                self._pending_decision.pop((symbol, client_id or ""), None)
+                if status == "REJECTED":
+                    self.logger.warning("조건부 주문 거부: client_id=%s (%s)", client_id,
+                                        algo.get("rm") or "사유 없음")
 
     def _sync_open_order(self, order_data: Dict, order_status: str) -> None:
         """ORDER_TRADE_UPDATE를 ``status.open_orders``에 반영한다.

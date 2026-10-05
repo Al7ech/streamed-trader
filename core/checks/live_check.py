@@ -834,10 +834,12 @@ async def check_warmup():
 class FakeOrderClient:
     def __init__(self, success=True):
         self.calls = []
+        self.conditional_hints = []
         self.success = success
 
-    def execute_action(self, action, client_order_id=None):
+    def execute_action(self, action, client_order_id=None, conditional=None):
         self.calls.append(action)
+        self.conditional_hints.append(conditional)
         f = Future()
         f.set_result(OrderResult(success=self.success, order_id="1",
                                  error=None if self.success else "rejected"))
@@ -852,10 +854,11 @@ class FakeAsyncClient:
     """
 
     def __init__(self, margin=10_000.0, positions=None, open_orders=None, error=None,
-                 orders_boom=False, taker_rate="0.0004", rules_drift=False):
+                 orders_boom=False, taker_rate="0.0004", rules_drift=False, algo_orders=None):
         self.margin = margin
         self.positions = positions or {}
         self.open_orders = open_orders or []
+        self.algo_orders = algo_orders or []
         self.error = error
         self.orders_boom = orders_boom
         self.taker_rate = taker_rate
@@ -872,10 +875,10 @@ class FakeAsyncClient:
                           for s, (pa, ep, up) in self.positions.items()],
         }
 
-    async def futures_get_open_orders(self):
+    async def futures_get_open_orders(self, conditional=False):
         if self.orders_boom:
             raise RuntimeError("REST 실패")
-        return self.open_orders
+        return self.algo_orders if conditional else self.open_orders
 
     async def futures_commission_rate(self, symbol=None):
         return {"symbol": symbol, "makerCommissionRate": "0.0002",
@@ -920,6 +923,15 @@ def acct_msg(margin=None, positions=None, m="ORDER"):
     for sym, (pa, ep, up) in (positions or {}).items():
         a["P"].append({"s": sym, "pa": str(pa), "ep": str(ep), "up": str(up)})
     return {"e": "ACCOUNT_UPDATE", "a": a}
+
+
+def algo_msg(symbol=SYM, status="NEW", caid="stop-a", otype="STOP_MARKET", side="SELL",
+             q=1.0, tp=95.0, R=True):
+    """``ALGO_UPDATE`` — 손절/익절(조건부) 주문의 수명주기. 테스트넷에서 받은 실제 모양 그대로다."""
+    return {"e": "ALGO_UPDATE", "T": 1000, "o": {
+        "caid": caid, "aid": 1000000229620019, "at": "CONDITIONAL", "o": otype, "s": symbol,
+        "S": side, "ps": "BOTH", "f": "GTC", "q": str(q), "X": status, "ai": "",
+        "tp": str(tp), "p": "0", "R": R, "tt": 0}}
 
 
 def order_msg(symbol=SYM, status="FILLED", x="TRADE", side="BUY", z=1.0, ap=100.0,
@@ -1106,6 +1118,65 @@ async def check_live_executor():
     ex.submit(Action(SYM, 1.0), event_time=1)
     await ex.drain_pending_orders()
     check("executor: 주문 실패는 on_error로", len(errors) == 1, f"{errors}")
+
+    # 손절/익절은 거래소의 algo 장부에 걸린다 (2025-12-09~). 그 장부는 일반 미체결 조회에
+    # 보이지 않으므로 기동 시 따로 읽어야 한다 — 안 그러면 재기동한 전략이 손절을 하나 더 건다.
+    ex, _, _, _ = await make_live_executor(client=FakeAsyncClient(algo_orders=[{
+        "algoId": 1000000229620020, "clientAlgoId": "tp-r", "algoType": "CONDITIONAL",
+        "orderType": "TAKE_PROFIT_MARKET", "symbol": SYM, "side": "SELL", "quantity": "0.011",
+        "algoStatus": "NEW", "triggerPrice": "2722.85", "price": "0.0", "reduceOnly": True,
+        "createTime": 1791184920257}]))
+    book = ex.status.open_orders_for(SYM)
+    check("executor: 기동 시 algo 장부(익절)도 읽는다",
+          len(book) == 1 and book[0].client_id == "tp-r"
+          and book[0].order_type is ActionType.STOP_MARKET and book[0].quantity == -0.011
+          and book[0].trigger_price == 2722.85 and book[0].trigger_above is True
+          and book[0].price is None and book[0].reduce_only
+          and book[0].exchange_order_id == "1000000229620020", f"{book}")
+
+    # 조건부 주문의 접수/취소는 ALGO_UPDATE로 온다. 발동 뒤 체결은 같은 client id(c=caid)를 단
+    # 시장가 주문의 ORDER_TRADE_UPDATE로 와서 결정과 짝지어진다.
+    ex, trades, _, _ = await make_live_executor()
+    ex.submit(Action(SYM, -1.0, order_type=ActionType.STOP_MARKET, trigger_price=95.0,
+                     trigger_above=False, reduce_only=True, client_id="stop-a"), event_time=10)
+    await ex.on_user_data(algo_msg(status="NEW"))
+    book = ex.status.open_orders_for(SYM)
+    check("executor: ALGO_UPDATE NEW로 장부 등록",
+          len(book) == 1 and book[0].client_id == "stop-a" and book[0].trigger_price == 95.0
+          and book[0].trigger_above is False and book[0].reduce_only, f"{book}")
+    await ex.on_user_data(algo_msg(status="NEW"))
+    check("executor: 중복 ALGO_UPDATE NEW는 무해", len(ex.status.open_orders_for(SYM)) == 1)
+    await ex.on_user_data(order_msg(status="NEW", x="NEW", z=0.0, side="SELL", c="stop-a"))
+    await ex.on_user_data(order_msg(status="FILLED", z=1.0, ap=94.9, side="SELL", c="stop-a",
+                                    T=2000))
+    check("executor: 발동된 손절 체결이 결정과 짝지어진다",
+          len(trades) == 1 and trades[0].order_type == ActionType.STOP_MARKET.value
+          and trades[0].timestamp == 2000 and trades[0].submitted_at == 10
+          and trades[0].quantity == -1.0 and ex.status.total_open_orders() == 0
+          and not ex._pending_decision, f"{trades} pending={ex._pending_decision}")
+    for state in ("TRIGGERING", "TRIGGERED", "FINISHED"):
+        await ex.on_user_data(algo_msg(status=state))
+    check("executor: 발동 뒤 ALGO_UPDATE는 무해", len(trades) == 1
+          and ex.status.total_open_orders() == 0)
+
+    ex, trades, _, _ = await make_live_executor()
+    ex.submit(Action(SYM, -1.0, order_type=ActionType.STOP_MARKET, trigger_price=95.0,
+                     trigger_above=False, reduce_only=True, client_id="stop-a"), event_time=10)
+    await ex.on_user_data(algo_msg(status="NEW"))
+    await ex.on_user_data(algo_msg(status="CANCELED"))
+    check("executor: ALGO_UPDATE CANCELED는 장부와 pending을 비운다",
+          ex.status.total_open_orders() == 0 and not ex._pending_decision and not trades)
+
+    # 취소 엔드포인트가 장부마다 다르다 — 장부에서 지운 주문의 타입이 힌트가 된다.
+    ex, _, _, _ = await make_live_executor()
+    await ex.on_user_data(algo_msg(status="NEW", caid="stop-h"))
+    await ex.on_user_data(order_msg(status="NEW", x="NEW", z=0.0, otype="LIMIT", c="lim-h"))
+    ex.submit(Action.cancel(SYM, "stop-h"), event_time=1)
+    ex.submit(Action.cancel(SYM, "lim-h"), event_time=1)
+    ex.submit(Action.cancel(SYM, "nobody"), event_time=1)
+    check("executor: 취소에 algo 장부 힌트 (손절 True / 지정가 False / 모름 None)",
+          ex._orders.conditional_hints[-3:] == [True, False, None],
+          f"{ex._orders.conditional_hints}")
 
 
 # ============================================================ 3. 드라이런 == 백테스트
