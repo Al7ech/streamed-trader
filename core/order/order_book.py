@@ -204,15 +204,27 @@ def _fill_price(order: OpenOrder, candle: Candle) -> Optional[float]:
     raise ValueError(f"장부에 있을 수 없는 주문 타입이다: {order.order_type}")
 
 
-def _apply_slippage(order: OpenOrder, price: float, slippage_ratio: float) -> float:
-    """조건부 시장가에만 불리한 방향으로 슬리피지를 얹는다.
+def slip_price(price: float, quantity: float, slippage_ratio: float) -> float:
+    """체결가에 불리한 방향으로 슬리피지를 얹는다 — 매수는 위로, 매도는 아래로.
 
-    LIMIT은 정의상 지정가이거나 그보다 유리한 가격에만 체결되므로 대상이 아니고, MARKET은
-    이 함수를 타지 않는다 (기존 백테스트 결과를 바꾸지 않기 위해).
+    시장가(``SimulatedExecutor.submit``)와 조건부 시장가(:func:`_apply_slippage`)가 같은
+    공식을 쓰도록 한 곳에 둔다.
     """
-    if slippage_ratio <= 0.0 or order.order_type is not ActionType.STOP_MARKET:
+    if slippage_ratio <= 0.0:
         return price
-    return price * (1.0 + slippage_ratio) if order.quantity > 0 else price * (1.0 - slippage_ratio)
+    return price * (1.0 + slippage_ratio) if quantity > 0 else price * (1.0 - slippage_ratio)
+
+
+def _apply_slippage(order: OpenOrder, price: float, slippage_ratio: float) -> float:
+    """장부 주문 중 조건부 시장가에만 불리한 방향으로 슬리피지를 얹는다.
+
+    LIMIT은 정의상 지정가이거나 그보다 유리한 가격에만 체결되므로 대상이 아니다. MARKET은
+    장부를 거치지 않으므로 이 함수가 아니라 ``SimulatedExecutor.submit``이 :func:`slip_price`로
+    직접 얹는다.
+    """
+    if order.order_type is not ActionType.STOP_MARKET:
+        return price
+    return slip_price(price, order.quantity, slippage_ratio)
 
 
 def _sort_key(order: OpenOrder) -> Tuple[int, int]:

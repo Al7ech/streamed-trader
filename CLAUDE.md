@@ -285,7 +285,8 @@ imports it (the engine, recorders and `indicator_columns` reach indicators only 
    construction — the old `resolve_fee_ratio`/`resolve_slippage_ratio` reconciliation is gone.
    `core/examples/backtest.py` writes `metadata["fee_ratio"] = executor.status.fee_ratio` (read
    back off the Status, never a separate literal). `slippage_ratio` stays a `SimulatedExecutor`
-   argument only (a simulation modelling knob, not account state; no strategy sizes with it).
+   argument only (a simulation modelling knob, not account state; no strategy sizes with it),
+   applied adversely to MARKET and STOP_MARKET fills — see "Resting orders" below.
 
    It is multi-symbol. The candle source is a plain `Dict[str, List[Candle]]` — one ragged list per
    symbol (symbols don't need to start or end at the same time), which `BacktestEngine` merges with
@@ -983,9 +984,14 @@ diverge. That matters because dry run exists to be comparable to a backtest.
 
 `slippage_ratio` (a `SimulatedExecutor` constructor argument, default `0.0` — a simulation
 modelling knob only this executor and `order_book` see, never on `Status`, never read by a
-strategy) is applied **only to STOP_MARKET**, in the adverse
-direction. LIMIT fills at your price or better by definition, and MARKET is left alone so existing
-backtests are bit-identical.
+strategy) is applied to **MARKET and STOP_MARKET** fills, in the adverse direction (buy
+`price * (1 + r)`, sell `price * (1 - r)`, one formula: `order_book.slip_price`). STOP_MARKET gets it
+inside `match_symbol`; MARKET gets it in `SimulatedExecutor.submit`, after the symbol-rule check
+(which still uses the unslipped last close as its notional reference, as live does). LIMIT fills at
+your price or better by definition and is never slipped, and neither is the bankruptcy flatten
+(`_liquidate`). The default `0.0` leaves every fill bit-identical to the close/trigger.
+`core/examples/backtest.py` records it as `metadata["slippage_ratio"]`, and `ParameterSweep` takes
+it as a constructor argument.
 
 Assumptions that a candle cannot verify, all deliberate:
 

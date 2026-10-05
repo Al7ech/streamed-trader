@@ -370,6 +370,27 @@ def check_symbol_rules():
           ex.status.position_for(SYM).position == 0.004 and ex.status.total_open_orders() == 1,
           repr(ex.status))
 
+    # 시장가 슬리피지: 매수는 종가 위, 매도는 종가 아래에서 체결되고 실현손익도 그 가격 기준.
+    def market_trades(slippage_ratio):
+        ex = SimulatedExecutor(100_000.0, slippage_ratio=slippage_ratio)
+        trades = []
+        ex.on_trade = trades.append
+        ex.begin_event(MIN, {SYM: Candle(1000, 1000, 1000, 1000, 1, 0, MIN)})
+        ex.submit(Action(SYM, 1.0), MIN)
+        ex.submit(Action(SYM, -1.0), MIN)
+        return ex, trades
+
+    ex, trades = market_trades(0.001)
+    check("시장가 슬리피지: 매수 close*(1+r), 매도 close*(1-r)",
+          [t.price for t in trades] == [1000 * 1.001, 1000 * 0.999],
+          repr([t.price for t in trades]))
+    check("시장가 슬리피지: 실현손익이 체결가 기준",
+          trades[1].wnl == (1000 * 0.999 - 1000 * 1.001)
+          and ex.status.position_for(SYM).position == 0.0, repr(trades[1]))
+    _, trades = market_trades(0.0)
+    check("시장가 슬리피지: r=0이면 종가 그대로", [t.price for t in trades] == [1000, 1000],
+          repr([t.price for t in trades]))
+
     # 모르는 심볼은 조용히 넘어가지 않는다.
     try:
         SimulatedExecutor(1.0).status.rules_for("NOSUCHUSDT")

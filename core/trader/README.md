@@ -236,7 +236,7 @@ to place orders outside the trader's loop.
 from `streamer.symbols` — there is no separate `symbol`/`symbols` argument),
 `dry_run` (default `False`), `testnet` (default `True`), `fee_ratio` (dry-run sizing/accounting
 rate; default `DEFAULT_FEE_RATIO` — live ignores it and uses the exchange's taker rate),
-`slippage_ratio` (dry-run STOP_MARKET slippage; default `0.0`),
+`slippage_ratio` (dry-run MARKET/STOP_MARKET slippage; default `0.0`),
 `record` (default `False`), `result_path` (`"asset/"`), `run_id` (default: derived and stable
 across restarts), `run_metadata` (extra keys for the run JSON, e.g. `{"params": {...}}`),
 `shard_flush_every` (`60`), `decide_deadline_s` (live-only decision deadline in seconds,

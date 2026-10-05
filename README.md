@@ -192,7 +192,8 @@ report = BacktestEngine(streamer, candles_by_symbol, executor, recorder).run()
 The executor writes `fee_ratio` into the `Status` it builds, so the fee accounting
 (`apply_fill`, a module-level function in `core/executor/simulated.py`) and the strategy's own
 position sizing (`status.fee_ratio`) always read one value. `slippage_ratio` is a `SimulatedExecutor` argument only — it is a simulation modelling knob,
-not account state, and no strategy sizes with it.
+not account state, and no strategy sizes with it. It is applied in the adverse direction to MARKET
+and STOP_MARKET fills (never LIMIT).
 
 The candle source is a plain `Dict[str, List[Candle]]` — one ragged list per symbol, which the
 engine merges into a single chronological event stream. The shipped entry point gets it from the

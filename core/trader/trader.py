@@ -73,7 +73,7 @@ class BinanceTrader:
         :param fee_ratio: 드라이런 회계/사이징에 적용할 수수료율 (``Status.fee_ratio``로 실린다).
             None이면 그대로 넘겨 ``Status``가 기본값을 박는다. 라이브에서는
             ``LiveExecutor.create``가 거래소 커미션 티어에서 직접 채우므로 이 값은 쓰이지 않는다.
-        :param slippage_ratio: 드라이런에서 조건부 시장가 체결에 얹을 슬리피지. 백테스트와
+        :param slippage_ratio: 드라이런에서 시장가·조건부 시장가 체결에 얹을 슬리피지. 백테스트와
             대조할 때 그쪽 설정과 맞춘다.
         :param record: True면 실행 결과를 ``<result_path>/live/`` 에 **백테스트와 같은
             포맷**으로 기록한다.

@@ -60,8 +60,10 @@ if __name__ == "__main__":
     # 계좌 상태는 실행기가 만들어 소유한다 — 레코더에는 그 참조(executor.status)를 넘긴다.
     # fee_ratio를 안 넘기면 Status가 DEFAULT_FEE_RATIO를 박는다. 회계와 전략 사이징이 같은
     # 값을 보고, 런 JSON metadata의 fee_ratio도 그 하나에서 읽는다. 라이브는 거래소 티어를 쓴다.
-    executor = SimulatedExecutor(init_margin)
+    # slippage_ratio는 시장가·조건부 시장가 체결에 불리하게 얹는 비율이다 (지정가 제외).
+    executor = SimulatedExecutor(init_margin, slippage_ratio=0.0)
     metadata["fee_ratio"] = executor.status.fee_ratio
+    metadata["slippage_ratio"] = executor.slippage_ratio
     # metadata를 주면 런 JSON을, save_series까지 주면 시계열 샤드도 asset/backtest/ 에 쓴다.
     # 샤드 기록은 멀티심볼·긴 구간일수록 엔진 루프의 절반 이상을 먹는다(docs/2609-backtest-
     # profiling.md) — 승률/수익만 빠르게 볼 때는 --no-series로 끈다 (시각화 도구에는 가격

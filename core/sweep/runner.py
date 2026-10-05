@@ -96,6 +96,7 @@ class _SweepState:
     cache: Optional[Dict[Hashable, np.ndarray]]
     init_margin: float
     fee_ratio: Optional[float]
+    slippage_ratio: float
     summarise: Callable[[Report, BaseStreamer], Dict[str, Any]]
     jobs: List[SweepJob]
 
@@ -110,7 +111,7 @@ class ParameterSweep:
     :param candles_by_symbol: 심볼별 캔들. ``ColumnarCandles``가 아니면 여기서 열로 옮긴다 —
         그래도 호출자가 원본 리스트를 들고 있으면 메모리는 줄지 않는다
         (:func:`load_columnar`를 쓸 것).
-    :param init_margin: / :param fee_ratio: ``SimulatedExecutor``에 넘긴다.
+    :param init_margin: / :param fee_ratio: / :param slippage_ratio: ``SimulatedExecutor``에 넘긴다.
     :param summarise: ``(Report, 스트리머) -> dict``. **워커에서** 불리고, 그 dict만 부모로
         돌아온다. 스트리머를 받는 것은 전략이 들고 있는 진단 카운터(예: 서킷브레이커 발동 수)를
         요약에 싣기 위해서다. 기본은 :func:`~core.result.metrics.summarise_report`.
@@ -125,6 +126,7 @@ class ParameterSweep:
 
     def __init__(self, factory: StreamerFactory, candles_by_symbol: Mapping[str, Sequence],
                  *, init_margin: float, fee_ratio: Optional[float] = None,
+                 slippage_ratio: float = 0.0,
                  summarise: Optional[Callable[[Report, BaseStreamer], Dict[str, Any]]] = None,
                  workers: Optional[int] = None, worker_mem_gb: float = 0.6,
                  precompute: bool = True, maxtasksperchild: Optional[int] = None):
@@ -134,6 +136,7 @@ class ParameterSweep:
             for s, c in candles_by_symbol.items()}
         self.init_margin = init_margin
         self.fee_ratio = fee_ratio
+        self.slippage_ratio = slippage_ratio
         self.summarise = summarise or (lambda report, _: summarise_report(report, init_margin))
         self.workers = workers
         self.worker_mem_gb = worker_mem_gb
@@ -163,7 +166,7 @@ class ParameterSweep:
         workers = self.resolve_workers(len(jobs))
 
         _STATE = _SweepState(self.factory, self.candles, cache, self.init_margin,
-                             self.fee_ratio, self.summarise, jobs)
+                             self.fee_ratio, self.slippage_ratio, self.summarise, jobs)
         results: List[Optional[Dict[str, Any]]] = [None] * len(jobs)
         # 부모의 객체를 영구 세대로 옮긴다 — 워커의 GC가 그것을 훑으며 페이지를 복사하지
         # 않게 하려는 것이고, workers=1에서도 GC 비용(~1초/칸)을 덜어 준다.
@@ -247,7 +250,8 @@ def _run_job(i: int) -> Tuple[int, Dict[str, Any]]:
     try:
         t0 = time.time()
         streamer = state.factory(list(job.symbols), job.params)
-        executor = SimulatedExecutor(state.init_margin, fee_ratio=state.fee_ratio)
+        executor = SimulatedExecutor(state.init_margin, fee_ratio=state.fee_ratio,
+                                     slippage_ratio=state.slippage_ratio)
         recorder = SimpleRecorder(executor.status)
         report = BacktestEngine(streamer, {s: state.candles[s] for s in job.symbols}, executor,
                                 recorder, progress=False, precomputed=state.cache).run()

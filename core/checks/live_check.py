@@ -1071,3 +1071,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+        ("dry-run: Keltner (시장가 + 슬리피지)",
+         lambda: KeltnerStreamer(symbols=[SYM], **kp), 0.0005),

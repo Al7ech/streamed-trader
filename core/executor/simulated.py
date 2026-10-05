@@ -110,7 +110,8 @@ class SimulatedExecutor(Executor):
     :param fee_ratio: 명목가치에 곱할 수수료율. 이 값이 ``Status.fee_ratio``에 실려 회계
         (``apply_fill``)와 전략 사이징(``status.fee_ratio``)이 같은 값을 본다. ``None``이면
         ``Status``가 ``DEFAULT_FEE_RATIO``를 박는다.
-    :param slippage_ratio: 조건부 시장가(STOP_MARKET) 체결에 불리하게 얹을 비율. 순전히
+    :param slippage_ratio: 시장가(MARKET)와 조건부 시장가(STOP_MARKET) 체결에 불리하게 얹을
+        비율. 지정가와 파산 강제청산에는 얹지 않는다. 순전히
         백테스트 모델링 값이라 ``Status``에 얹지 않고 여기서만 들고 있다 — 전략은 읽지 않는다.
     :param log_label: 체결 로그에 붙일 접두사. 드라이런은 ``"dry-run"``을 넘겨 실제 돈이 걸린
         체결과 구분되게 한다 (백테스트는 접두사가 없다).
@@ -250,7 +251,9 @@ class SimulatedExecutor(Executor):
         if self._violates_rules(action, price):
             return None
 
-        self._fill(action.symbol, action.quantity, price, event_time,
+        # 규칙 검사(명목가 기준)는 종가로, 체결은 슬리피지를 불리하게 얹은 가격으로 한다.
+        fill_price = order_book.slip_price(price, action.quantity, self.slippage_ratio)
+        self._fill(action.symbol, action.quantity, fill_price, event_time,
                    ActionType.MARKET.value, event_time)
         return None
 
@@ -274,9 +277,10 @@ class SimulatedExecutor(Executor):
         포지션 부호를 본다.
 
         모듈 함수 ``apply_fill``의 청산 손익은 ``unrealised_pnl``을 안분해서 구하므로, 그 값이
-        **체결가 기준**이어야 실현손익이 맞는다. 시장가는 체결가가 곧 이벤트 종가라 직전
-        시가평가가 이미 그 값이지만, 지정가/조건부는 봉 중간 가격에 체결되므로 여기서 다시
-        매긴다 (시장가에는 같은 값을 다시 계산하는 무해한 no-op이다).
+        **체결가 기준**이어야 실현손익이 맞는다. 슬리피지 없는 시장가는 체결가가 곧 이벤트
+        종가라 직전 시가평가가 이미 그 값이지만(같은 값을 다시 계산하는 무해한 no-op),
+        지정가/조건부는 봉 중간 가격에, 슬리피지가 있는 시장가는 종가에서 밀린 가격에
+        체결되므로 여기서 다시 매긴다. 다음 ``begin_event``의 시가평가가 봉 종가로 되돌린다.
         """
         self.status.update_unrealised_pnl(symbol, price)
         pre_position = self.status.position_for(symbol).position
