@@ -11,7 +11,15 @@
 아예 안 오면 아무도 모른다 — 연결은 살아 있는데 거래소가 푸시를 멈추거나, 멀티플렉스 중 한
 심볼만 끊기면 python-binance는 그걸 끊김으로 보지 않는다(수신 타임아웃에서 그냥 다시 기다린다).
 그래서 심볼별로 마지막 마감 캔들 이후 ``stall_timeout_s``가 지나면 치명적으로 끊는다.
-재기동이 워밍업으로 지표를 다시 세운다.
+재기동이 워밍업으로 지표를 다시 세운다 — 최후의 복구 수단이다. 끊김 자체는 먼저
+:class:`~core.producer.reliable_websocket.ReliableWebsocket`(또는 python-binance 내부 재연결)이
+프로세스 안에서 되살리고, 놓친 봉은 엔진의 구멍 백필이 REST로 메운다.
+
+**재연결이 확인되면 멈춤 기한을 그 시점부터 다시 잰다 (마감 캔들 사이 한 번만).** 1m에서 봉
+하나를 놓치면 ``인터벌 + 60초`` 기한이 정확히 다음 봉의 마감 시각에 걸려, 재연결에 성공했어도
+다음 마감봉과 멈춤 가드가 같은 순간에 경주한다 (2026-10-01 사고: 마지막 봉 20:12:00, CRITICAL
+정확히 20:14:00). 재연결 확인은 실제 메시지가 다시 흐를 때만 세므로 죽은 스트림은 연장되지
+않고, 마감 캔들이 오기 전까지 한 번만 연장하므로 출렁이는 스트림도 기한의 두 배 안에 잡힌다.
 
 **소켓은 전용 reader 태스크가 쉬지 않고 비운다.** 소비자(엔진)가 이벤트를 붙잡고 있는 동안
 — 구멍 백필이 REST를 기다리는 동안 — 소켓을 읽지 않으면, 심볼당 250ms마다 오는 kline
@@ -37,7 +45,8 @@ from core.producer.reliable_websocket import ReliableWebsocket
 from core.utils import interval_to_minutes
 
 #: 멈춘 스트림 판정의 기본 여유(초). 한 인터벌에 이만큼 더 기다려도 마감 캔들이 없으면 멈춘
-#: 것으로 본다. python-binance의 내부 재연결(최대 5회, 백오프)이 끝날 시간을 준다.
+#: 것으로 본다. python-binance의 내부 재연결(최대 5회, 백오프)이 끝날 시간을 준다. 재연결이
+#: 확인되면 기한을 그 시점부터 한 번 다시 잰다 (모듈 docstring 참고).
 DEFAULT_STALL_GRACE_S = 60.0
 
 #: reader 태스크가 끝났음을 소비자에게 알리는 내부 큐 표지.
@@ -79,6 +88,9 @@ class LiveCandleProducer(CandleProducer):
         self._events: asyncio.Queue = asyncio.Queue()
         #: reader의 수신 실패 사유. 소비자가 큐를 다 비운 뒤 치명 처리한다.
         self._reader_failure: Optional[str] = None
+        #: 마지막으로 본 소켓의 회복 횟수와, 마지막 마감 캔들 뒤 기한을 이미 연장했는지.
+        self._seen_recoveries = 0
+        self._stall_extended = False
 
     # ------------------------------------------------------------- 수명주기
 
@@ -124,6 +136,8 @@ class LiveCandleProducer(CandleProducer):
         self._last_close_at = {symbol: started for symbol in self.symbols}
         self._events = asyncio.Queue()
         self._reader_failure = None
+        self._seen_recoveries = self._socket_recoveries()
+        self._stall_extended = False
         self._reader = asyncio.create_task(self._read_socket())
         try:
             while self._running:
@@ -151,7 +165,8 @@ class LiveCandleProducer(CandleProducer):
     async def _read_socket(self) -> None:
         """소켓을 쉬지 않고 비워 마감 캔들 이벤트만 내부 큐로 넘긴다 (모듈 docstring 참고).
 
-        수신 실패는 치명적이다(``ReliableWebsocket``이 재연결까지 해 보고 포기한 것이다). 다만
+        수신 실패는 치명적이다(``ReliableWebsocket``이 백오프를 두고 정해진 횟수만큼 재연결해
+        보고 포기한 것이다). 다만
         여기서 바로 ``_running``을 내리지 않고 사유만 남긴다 — 실패 전에 받아 큐에 넣어 둔
         이벤트는 소비자가 다 내준 뒤 :data:`_STREAM_END`에서 치명 처리한다. 파싱 실패와 에러
         프레임은 그 메시지만 버리고 ``on_error``로 넘긴다. 어떻게 끝나든 표지를 넣어 소비자를
@@ -164,6 +179,7 @@ class LiveCandleProducer(CandleProducer):
                 except Exception as e:
                     self._reader_failure = f"kline 메시지를 받지 못했다: {e}"
                     break
+                self._note_recovery()
                 try:
                     event = await self._event_from(data)
                 except Exception as e:
@@ -213,6 +229,7 @@ class LiveCandleProducer(CandleProducer):
             trade_count=int(kline["n"]) if "n" in kline else None,
         )
         self._last_close_at[symbol] = time.monotonic()
+        self._stall_extended = False
         return Event(candle.end_time, {symbol: candle})
 
     # ------------------------------------------------------------- 내부
@@ -229,6 +246,25 @@ class LiveCandleProducer(CandleProducer):
         message = data.get("m") or data.get("type") or str(data)
         await self._on_error(RuntimeError(f"kline stream error: {message}"))
         return True
+
+    def _socket_recoveries(self) -> int:
+        # 검사용 가짜 소켓에는 없다 — 그러면 연장도 없다.
+        return getattr(self.socket, "recoveries", 0)
+
+    def _note_recovery(self) -> None:
+        """소켓이 끊김에서 되살아났으면 멈춤 기한을 지금부터 다시 잰다 (마감 캔들 사이 한 번)."""
+        recoveries = self._socket_recoveries()
+        if recoveries == self._seen_recoveries:
+            return
+        self._seen_recoveries = recoveries
+        if self._stall_extended:
+            return
+        self._stall_extended = True
+        now = time.monotonic()
+        for symbol in self._last_close_at:
+            self._last_close_at[symbol] = max(self._last_close_at[symbol], now)
+        self.logger.info("kline 스트림 재연결 확인 — 멈춤 기한을 지금부터 다시 잰다 (%gs)",
+                         self.stall_timeout_s)
 
     def _stall_reason(self) -> str:
         now = time.monotonic()

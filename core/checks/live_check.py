@@ -45,6 +45,8 @@ from core.producer.base import CandleProducer, Event
 from core.engine.trading import TradingEngine
 from core.fetcher.binance.vision_fetcher import BinanceVisionFetcher
 from core.producer import live as lcp
+from core.producer.reliable_websocket import ReliableWebsocket, WebsocketReconnectFailed
+from binance.exceptions import ReadLoopClosed
 from core.executor.binance_order_client import OrderResult
 from core.executor.live import LiveExecutor, resolve_margin_asset
 from core.order.symbol_rules import DEFAULT_RULES
@@ -199,6 +201,62 @@ class TimedKlineSocket:
 
     async def close(self):
         pass
+
+
+def err_frame(kind, m="boom"):
+    """python-binance가 끊김을 예외 대신 큐에 올리는 에러 프레임."""
+    return {"e": "error", "type": kind, "m": m}
+
+
+class _LoopEnd:
+    def __init__(self, frame):
+        self.frame = frame
+
+
+def loop_end(kind):
+    """read loop를 끝내는 부류의 에러 프레임 (``BinanceWebsocketUnableToConnect`` 등)."""
+    return _LoopEnd(err_frame(kind))
+
+
+class ScriptedDelegate:
+    """``ReconnectingWebsocket`` 대역. ``script``의 ``(지연초, 항목)``을 차례로 내준다 — dict는
+    메시지로 돌려주고, 예외 인스턴스는 던지고, 다 떨어지면 영원히 조용하다.
+    :func:`loop_end` 프레임을 내면 라이브러리처럼 read loop가 죽어 다음 ``recv()``가
+    ``ReadLoopClosed``를 던지고, 성공한 ``connect()``가 되살린다.
+    ``connect()``는 ``connect_failures``번(음수면 항상) 실패한다."""
+
+    def __init__(self, script, connect_failures=0):
+        self._script = list(script)
+        self.connect_failures = connect_failures
+        self.connects = self.closes = 0
+        self.loop_alive = True
+
+    async def recv(self):
+        if not self.loop_alive:
+            raise ReadLoopClosed("Read loop has been closed")
+        if not self._script:
+            await asyncio.Event().wait()
+        delay, item = self._script.pop(0)
+        await asyncio.sleep(delay)
+        if isinstance(item, BaseException):
+            raise item
+        if isinstance(item, _LoopEnd):
+            self.loop_alive = False
+            return item.frame
+        return item
+
+    async def connect(self):
+        self.connects += 1
+        if self.connect_failures < 0 or self.connects <= self.connect_failures:
+            raise OSError("connect refused")
+        self.loop_alive = True
+
+    async def close(self):
+        self.closes += 1
+
+
+def reliable(delegate, **kw):
+    return ReliableWebsocket(delegate, **{"backoff_s": 0.01, "backoff_max_s": 0.02, **kw})
 
 
 def make_timed_producer(messages, *, symbols=(SYM,), delay=0.0, stall_timeout_s=0.1):
@@ -435,6 +493,101 @@ async def check_candle_producer():
     check("producer: 수신 실패 전 이벤트는 다 내준 뒤 치명적",
           len(evs) == 2 and "받지 못했다" in (p.fatal_reason or ""),
           f"evs={len(evs)} fatal={p.fatal_reason}")
+
+    # --- 끊긴 소켓은 프로세스 안에서 되살린다 (ReliableWebsocket) ---
+    # 2026-10-01 사고: python-binance는 끊김을 예외가 아니라 에러 프레임으로 내서 우리 재연결이
+    # 한 번도 돌지 않았다. 라이브러리가 스스로 재연결 중이면 손대지 않고(이중 재연결 금지),
+    # read loop가 끝났으면 우리가 다시 연다.
+    d = ScriptedDelegate([(0, err_frame("ConnectionClosedError")),
+                          (0, err_frame("BinanceWebsocketClosed")), (0, kline_msg(T0))])
+    w = reliable(d)
+    got = [await w.recv() for _ in range(3)]
+    check("ws: 라이브러리 재연결 중 프레임 → 우리 재연결 0회, 프레임은 호출자에게",
+          w.reconnects == 0 and d.connects == 0 and d.closes == 0
+          and [g.get("e") for g in got] == ["error", "error", None],
+          f"reconnects={w.reconnects} connects={d.connects}")
+    check("ws: 라이브러리 재연결 성공을 센다", w.library_reconnects == 1 and w.recoveries == 1,
+          f"library={w.library_reconnects}")
+
+    d = ScriptedDelegate([(0, loop_end("BinanceWebsocketUnableToConnect")), (0, kline_msg(T0))])
+    w = reliable(d)
+    first, second = await w.recv(), await w.recv()
+    check("ws: read loop 종료 프레임 + ReadLoopClosed → 재연결 1회 후 정상 수신",
+          first.get("e") == "error" and second.get("data") and w.reconnects == 1
+          and d.connects == 1 and w.library_reconnects == 0,
+          f"reconnects={w.reconnects} connects={d.connects}")
+
+    d = ScriptedDelegate([(0, ReadLoopClosed("closed")), (0, kline_msg(T0))])
+    w = reliable(d)
+    check("ws: ReadLoopClosed만 와도 재연결", (await w.recv()).get("data") and w.reconnects == 1)
+
+    # 재연결이 계속 실패하면 유한 횟수 뒤 포기하고, 공급자가 치명 처리한다 (재기동이 최후 수단).
+    d = ScriptedDelegate([(0, kline_msg(T0)), (0, loop_end("BinanceWebsocketQueueOverflow"))],
+                         connect_failures=-1)
+    p = make_timed_producer([], stall_timeout_s=5)
+    p.socket = reliable(d, max_attempts=3)
+    evs = await asyncio.wait_for(collect(p), timeout=5)
+    check("ws: 재연결이 계속 실패하면 유한 횟수 뒤 공급자 치명적",
+          len(evs) == 1 and d.connects == 3 and "받지 못했다" in (p.fatal_reason or "")
+          and "포기" in p.fatal_reason, f"connects={d.connects} fatal={p.fatal_reason}")
+    try:
+        d = ScriptedDelegate([(0, ReadLoopClosed("x"))], connect_failures=-1)
+        await reliable(d, max_attempts=2).recv()
+        raised = False
+    except WebsocketReconnectFailed:
+        raised = True
+    check("ws: 포기는 WebsocketReconnectFailed", raised and d.connects == 2)
+
+    # 연결은 되는데 read loop가 곧바로 죽는 경우도 무한히 돌지 않는다.
+    d = ScriptedDelegate([(0, ReadLoopClosed("x"))] * 10)
+    try:
+        await reliable(d, max_attempts=3).recv()
+        raised = False
+    except WebsocketReconnectFailed:
+        raised = True
+    check("ws: 연결 직후 계속 죽어도 유한 횟수", raised and d.connects == 3, f"{d.connects}")
+
+    # 정상 종료(close) 뒤의 CancelledError 프레임/ReadLoopClosed는 재연결 사유가 아니다.
+    d = ScriptedDelegate([(0, err_frame("CancelledError", "")), (0, ReadLoopClosed("closed"))])
+    w = reliable(d)
+    await w.close()
+    frame = await w.recv()
+    try:
+        await w.recv()
+        raised = False
+    except ReadLoopClosed:
+        raised = True
+    check("ws: close 뒤 종료 프레임/ReadLoopClosed는 재연결하지 않는다",
+          frame.get("type") == "CancelledError" and raised and d.connects == 0
+          and w.reconnects == 0, f"connects={d.connects}")
+
+    # 봉 하나를 놓친 뒤 재연결되면, 다음 마감봉이 원래 기한(인터벌 + 유예)을 넘겨 와도 멈춤
+    # 가드가 죽이지 않는다 — 1m에서는 그 기한이 정확히 다음 봉의 마감 시각에 걸린다.
+    def recovering_script(recover):
+        script = [(0, kline_msg(T0))]
+        if recover:
+            script.append((0.05, err_frame("ConnectionClosedError")))
+        script += [(0.2 if recover else 0.25, kline_msg(T0 + MIN, closed=False)),
+                   (0.15, kline_msg(T0 + 2 * MIN))]
+        return script
+
+    async def run_recovery(recover):
+        p = make_timed_producer([], stall_timeout_s=0.3)
+        p.socket = reliable(ScriptedDelegate(recovering_script(recover)))
+        got = []
+        async for ev in p:
+            got.append(ev)
+            if len(got) == 2:
+                p.request_stop()
+        return got, p
+
+    got, p = await asyncio.wait_for(run_recovery(True), timeout=5)
+    check("producer: 재연결 확인 뒤 경계에 걸린 마감봉은 멈춤으로 죽이지 않는다",
+          len(got) == 2 and p.fatal_reason is None, f"got={len(got)} fatal={p.fatal_reason}")
+    got, p = await asyncio.wait_for(run_recovery(False), timeout=5)
+    check("producer: 재연결이 없으면 같은 지연은 여전히 멈춤",
+          len(got) == 1 and "마감 캔들" in (p.fatal_reason or ""),
+          f"got={len(got)} fatal={p.fatal_reason}")
 
     # --- 연속성은 엔진이 판정한다 ---
     engine, p, spy, rec, errs = make_engine(
@@ -1011,6 +1164,8 @@ async def check_dry_run_parity():
 
     cases = [
         ("dry-run: Keltner (시장가)", lambda: KeltnerStreamer(symbols=[SYM], **kp), None),
+        ("dry-run: Keltner (시장가 + 슬리피지)",
+         lambda: KeltnerStreamer(symbols=[SYM], **kp), 0.0005),
         ("dry-run: MeanReversionZScore (상태 있는 전략)",
          lambda: MeanReversionZScoreStreamer(symbol=SYM, window=60, entry_z=2.0,
                                              timeout_candles=60, max_loss=0.02), None),
@@ -1071,5 +1226,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-        ("dry-run: Keltner (시장가 + 슬리피지)",
-         lambda: KeltnerStreamer(symbols=[SYM], **kp), 0.0005),

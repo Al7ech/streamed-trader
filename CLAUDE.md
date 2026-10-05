@@ -28,7 +28,9 @@ There is no automated test suite (no `pytest`/`unittest` files in `core/`, only 
   both) and asserts the engine's continuity/backfill rules over a faked live producer (duplicate
   skip, gap backfill via the `history` query, cap/boundary/fetch fatals, no re-feed of a candle whose
   processing raised, the decision deadline dropping only exposure-increasing market orders on a late
-  candle), the indicator warm-up
+  candle), `ReliableWebsocket`'s disconnect recovery over a faked python-binance delegate (no
+  double reconnect while the library reconnects, bounded retries, a reconnect restarting the stall
+  clock), the indicator warm-up
   handoff (`warmup()` derives its own range, seeds the engine's `_last_start` anchor, and the gap
   between the warm-up range and the first live candle is backfilled from that **same** source, and a
   warm-up with a hole or an out-of-range/still-open candle fails startup), the
@@ -1115,10 +1117,27 @@ straight to `executor.on_user_data(...)`.
 - **`producer/live.py` — where candles come from.** One futures kline websocket, a
   `futures_multiplex_socket` carrying every symbol's `continuousKline` stream (built as
   `<symbol>_<contract_type>@continuousKline_<interval>` per symbol), via `ReliableWebsocket` (a
-  thin wrapper around python-binance's `ReconnectingWebsocket` that recovers from a dropped
-  `recv()` by closing/reconnecting the delegate, logging both the failure and the recovery with a
-  running `reconnects` count — a reconnect an hour and a reconnect a minute are very different
-  operationally, and only logging the failures made that impossible to read off the log).
+  wrapper around python-binance's `ReconnectingWebsocket`, also used for the user-data socket).
+  python-binance (1.0.37) does **not** raise on a disconnect: its read loop queues an
+  `{"e": "error", "type": <exception class name>, "m": ...}` frame that `recv()` returns like a
+  message, so a wrapper that only caught exceptions never ran (the 2026-10-01 dry-run outage).
+  `ReliableWebsocket` classifies frames by `type` — a set copied from the library's `_read_loop`
+  except-tuples, to re-check on upgrade: `ConnectionClosedError`/`ConnectionClosedOK`/
+  `BinanceWebsocketClosed`/`IncompleteReadError`/`gaierror` mean the library is reconnecting
+  itself, so it does **not** reconnect too (no double reconnect); `CancelledError` is shutdown;
+  anything else (`BinanceWebsocketUnableToConnect`, `QueueOverflow`, unknown) means the read loop
+  ended, so it closes/reconnects the delegate on the next `recv()` — as it does on `ReadLoopClosed`
+  or any other `recv()` exception, the backstop if a classification is ever wrong. Every frame is
+  still passed through to the caller, because the error path (`on_error`, `add_error_callback`)
+  is where a disconnect becomes visible. Its own reconnects retry with exponential backoff
+  (`max_attempts=5`, 1s doubling to 16s, first attempt immediate); the streak resets only on a
+  normal message (or 60s after a successful reconnect), so "connects, then dies at once" cannot
+  loop forever, and an exhausted streak raises `WebsocketReconnectFailed` — the reader records it
+  and the producer goes fatal, leaving a process restart as the last resort. After an explicit
+  `close()` nothing is treated as a disconnect. Both kinds of recovery are logged with running
+  counts — `reconnected <id> (누적 N회)` for its own, `reconnected <id> by python-binance (라이브러리
+  누적 N회)` when a normal message follows a library-reconnect frame — since a reconnect an hour
+  and a reconnect a minute are very different operationally.
   Multiplexed messages arrive wrapped as `{"stream": ..., "data": <rawPayload>}`; since the
   continuousKline payload carries no top-level `s`/`k.s`, the symbol is read from `data["ps"]`.
   The socket is drained by a **dedicated reader task** (`_read_socket`), not by the consumer: it
@@ -1161,7 +1180,13 @@ straight to `executor.on_user_data(...)`.
     symbol goes `stall_timeout_s` (default one interval + `DEFAULT_STALL_GRACE_S`, 60s — room for
     python-binance's own reconnect backoff) without one, sets `fatal_reason` and ends the stream
     so a restart recovers. The arrival times are stamped by the reader task, which keeps reading
-    while the consumer holds an event, so a slow backfill never counts as a stall.
+    while the consumer holds an event, so a slow backfill never counts as a stall. **A confirmed
+    reconnect restarts that clock, once per closed candle**: when `socket.recoveries` grows (real
+    data flowed again after our or the library's reconnect), every symbol's deadline is measured
+    from now. Without it a 1m run that lost one candle had its deadline (interval + 60s) land
+    exactly on the next candle's close, so even a successful reconnect raced the stall guard; the
+    missed candle itself is the engine's gap backfill. A dead stream never extends (no data, no
+    recovery), and the once-per-candle cap bounds a flapping one at 2x `stall_timeout_s`.
   - **Indicator history is not fetched here, and the trader no longer computes the range.** It
     hands the engine one `FetcherCandleHistory(BinanceCandleFetcher(), interval)` as `history`
     (REST, `use_cache=False`; the synchronous-HTTP-in-a-thread detail lives inside that query) and
