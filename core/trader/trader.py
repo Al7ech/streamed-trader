@@ -123,8 +123,8 @@ class BinanceTrader:
         # 참조로만 잡아서, 놔두면 중간에 GC될 수 있다.
         self._tasks: set = set()
 
-        # 결과 기록. recorder는 start()에서 만들어진다 — 라이브 init_margin이 지갑 조회 뒤에
-        # 정해지기 때문이다.
+        # 결과 기록. recorder는 start()에서 만들어진다 — 실행기가 가진 Status를 참조로 들어야
+        # 하기 때문이다.
         self.record = record
         self.result_path = result_path
         self.run_id = run_id
@@ -183,8 +183,8 @@ class BinanceTrader:
                     api_key=self.api_key, api_secret=self.api_secret, testnet=self.testnet,
                     on_error=self._handle_error)
 
-            # 3. 결과 레코더. 실행기(2) 뒤여야 라이브 init_margin이 실제 잔고다 — 이제 그건
-            #    순서에 기대는 규약이 아니라, 실행기가 존재하면 이미 참인 사실이다.
+            # 3. 결과 레코더. 실행기(2) 뒤여야 한다 — 실행기의 Status를 참조로 들고, 드라이런은
+            #    재개한 계좌 상태를 그 Status에 되돌린다.
             self._setup_recorder()
             if not self.dry_run:
                 self.executor.on_metadata = (
@@ -332,7 +332,6 @@ class BinanceTrader:
                 streamer=self.streamer,
                 status=self.status,
                 interval_ms=self._interval_ms,
-                init_margin=self.status.total_margin(),
                 metadata={
                     **self.run_metadata,
                     "symbols": self.symbols,
@@ -373,7 +372,7 @@ class BinanceTrader:
 
         ``Status``는 실행기가 소유하고 레코더도 같은 객체를 참조로 들고 있으므로 **제자리에서**
         갱신한다. 저장된 상태는 레코더가 읽어오는데 레코더는 실행기보다 뒤에 만들어지므로
-        (라이브 ``init_margin``이 계좌 적재 뒤에야 정해진다), 생성자에 넘겨 끝낼 수는 없다.
+        (실행기의 ``Status``를 참조로 받아야 한다), 생성자에 넘겨 끝낼 수는 없다.
         """
         if not self.dry_run or not self.recorder or not self.recorder.resumed_status:
             return

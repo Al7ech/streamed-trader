@@ -678,12 +678,25 @@ ending in `.json`, because the frontend's directory scanner collects every `*.js
 
 ### Live run output (`core/recorder/live.py`)
 
-`LiveRecorder` writes live and dry-run sessions to `asset/live/` in **exactly** the format above,
-so the visualiser loads both from one directory list (`filterRunFiles` accepts `backtest/` and
-`live/`) and `metadata.mode` (`"live"`/`"dry"`) drives a LIVE/DRY badge. It reuses `ShardWriter`,
-`write_run_json`, `build_summary` and `metrics.py` unchanged; the only backtester-side change was
-splitting `ShardWriter._flush` into `checkpoint()` (write the current month, keep the buffer) and
-buffer reset, since a live process rewrites one month's shard for weeks.
+`LiveRecorder` writes live and dry-run sessions to `asset/live/` in its **own slim format**, built
+so per-candle cost and run-JSON size stay O(1) however long the process lives:
+
+- `<run_id>.json` — `live_schema_version` (1), `metadata` (run config, `run_at`/`resumed_at`/
+  `restart_count`, `end`, `last_status`, executor `set_metadata` keys) and `series` (`symbols`,
+  `columns`, `has_ohlc`, `interval_ms`, `shards[]`). Nothing else — that is exactly what resume needs.
+- `<run_id>.trades.jsonl` — append-only fill log, one `trade_to_dict` row per fill (same fields as the
+  backtest's `trades[]`), fsynced per fill. Never read back by the recorder; a crash-truncated last
+  line is newline-terminated on the next start so later rows don't glue onto it.
+- `<run_id>.<YYYY-MM>.series.json` — the same v4 month shards as a backtest, via `ShardWriter`
+  (whose `_flush` is split into `checkpoint()` — write the current month, keep the buffer — and
+  buffer reset, since a live process rewrites one month's shard for weeks).
+
+It deliberately has **no `summary`/`equity`/`benchmark`/inline `trades`**: those were recomputed over
+the whole history every candle (≈150 ms/candle after a year, blocking the asyncio loop), kept the
+whole equity/close history in memory, and made a restart read every shard. Under the sub-account
+split strategy they were also wrong — rebalancer transfers move the wallet balance and showed up as
+PnL. Derive any metric offline from the shards' `balance` column and the fill log. Consequently
+**the visualiser does not render live runs**.
 
 **`LiveRecorder`/`BinanceTrader` are multi-symbol**, trading every symbol in `streamer.symbols`
 concurrently over one multiplexed kline socket (see "Live trading" below) and writing the same
@@ -696,19 +709,15 @@ existing ragged-series contract with no changes needed there.
   (symbols sorted and hyphen-joined so config order doesn't fork the run; override with
   `LIVE_RUN_ID`). Docker's `restart: always` means the process dies often, and a fresh file per
   start would fragment the equity curve into unusable pieces. On startup the recorder reloads its
-  own run JSON and shards and continues appending — `equity_curve` is replayed from the shards'
-  top-level `balance` column, and the per-symbol benchmark curve from each symbol's
-  `ohlc.close` column (a symbol's `None` at a row is the normal ragged-series gap, not a
-  warm-up/bankruptcy signal — only a `None` `balance` skips the row), never from the run JSON's
-  `equity` block (that one is downsampled to ≤2000 points and would decay a little more on every
-  restart). `init_margin` also comes from the saved metadata, not the current wallet, or
-  `profit_pct` would reset each restart.
-- **Config changes fork a new run.** If `schema_version`, `series.columns`, `params`, `symbols`,
+  own run JSON and **only the last month shard** (as `ShardWriter.resume`'s buffer; earlier months
+  are just carried in the index) and continues appending.
+- **Config changes fork a new run.** If the format, `series.columns`, `params`, `symbols`,
   `interval` or `streamer` differ from the saved run, the recorder logs an ERROR and starts
-  `<run_id>_<timestamp>` rather than appending mismatched data into the old shards. The
-  `schema_version` check specifically exists so a v1-v3 run (flat shard shape) is never resumed by
-  v4 code — it always forks a fresh run instead, deliberately, rather than special-casing the old
-  shape in the resume path.
+  `<run_id>_<timestamp>` rather than appending mismatched data into the old shards. The format
+  check accepts `live_schema_version` 1 and the pre-slim live format (backtest `schema_version` 5,
+  same v4 shard shape): such a run is resumed in place, its inline `trades` copied once into the
+  `.trades.jsonl` (only if that file does not exist yet) and its obsolete metadata keys dropped.
+  Older (v1-v3, flat shard) runs always fork.
 - **`metadata.last_status`** carries the account state at the last flush, and on resume
   `BinanceTrader._restore_dry_run_status` applies it **in dry-run only**. Dry-run margin is
   synthetic (`1e6`) and would otherwise reset on every process start while the equity curve
@@ -753,8 +762,8 @@ existing ragged-series contract with no changes needed there.
   dropped on the next candle; a resting entry lives until its order leaves the book, since a fill
   bars later is the whole point.
 - **Flush policy**: run JSON every candle (small), month shard every `LIVE_SHARD_FLUSH_EVERY`
-  candles (default 60) and on every trade and on `stop()`. A crash loses at most that many candles
-  of series data; the next startup replays from the shards and rewrites a self-consistent run JSON.
+  candles (default 60) and on every trade and on `stop()`; the fill log is appended and fsynced per
+  fill. A crash loses at most that many candles of series data.
 - **Why live numbers will not match a backtest exactly** (all expected, none are bugs): live equity
   is exchange truth, so funding fees, other symbols' PnL and deposits/withdrawals move the curve
   with no corresponding `Trade` and `Σ(wnl - fee)` will not reconcile with the equity delta;
@@ -1283,7 +1292,7 @@ straight to `executor.on_user_data(...)`.
   nowhere else in the log, so without it a strategy that goes days without trading gives no way to
   tell whether real money is at stake.
 - With `record=True` (the `RECORD` env var, default on) the trader owns a `LiveRecorder` and
-  persists the session to `asset/live/` in backtest format — see "Live run output" above for the
+  persists the session to `asset/live/` — see "Live run output" above for the
   recording seams, restart-resume behaviour and the live/backtest divergences to expect.
 - `BinanceOrderClient` is the low-level order client: it submits to a `ThreadPoolExecutor` (GIL-free
   from the asyncio loop) with exponential-backoff retries, returning a

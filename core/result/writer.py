@@ -24,6 +24,7 @@ import numpy as np
 from boltons.fileutils import atomic_save
 
 from core.account.report import Report
+from core.account.trade import Trade
 from core.candle.candle import Candle
 from core.result.metrics import compute_max_drawdown, compute_sharpe
 from core.streamer.indicator.base_indicator import BaseIndicator
@@ -402,6 +403,26 @@ def build_summary(report: Report, init_margin: float, interval_ms: int = 0) -> D
     }
 
 
+def trade_to_dict(t: Trade) -> Dict:
+    """체결 하나를 런 JSON ``trades[]`` 항목(라이브는 ``.trades.jsonl`` 한 줄)으로 만든다."""
+    return {
+        "timestamp": t.timestamp,
+        "symbol": t.symbol,
+        "quantity": t.quantity,
+        "price": t.price,
+        "wnl": t.wnl,
+        "fee": t.fee,
+        "margin": t.pre_margin,
+        # 거래 **전** 포지션. build_summary의 승패 판정이 이 부호를 본다.
+        "position": t.pre_position,
+        "leverage": t.leverage,
+        # 이 체결을 낳은 주문 종류와 그 주문이 제출된 시각. 지정가/조건부 주문은 둘이
+        # 갈라진다 — "이 청산은 손절 체결이었다"를 사후에 구분하려면 필요하다.
+        "order_type": t.order_type,
+        "submitted_at": t.submitted_at,
+    }
+
+
 def write_run_json(dir_path: str, run_id: str, report: Report, metadata: Dict,
                    shards: List[Dict], symbols: List[str], columns: List[str],
                    column_groups: Dict[str, str], has_ohlc: bool, interval_ms: int,
@@ -412,26 +433,7 @@ def write_run_json(dir_path: str, run_id: str, report: Report, metadata: Dict,
     타임스탬프)는 프론트가 시리즈 샤드를 불러오지 않고도 자본 곡선에 겹쳐 그릴 수 있도록
     별도 ``benchmark`` 블록으로 쓴다.
     """
-    trades = [
-        {
-            "timestamp": t.timestamp,
-            "symbol": t.symbol,
-            "quantity": t.quantity,
-            "price": t.price,
-            "wnl": t.wnl,
-            "fee": t.fee,
-            "margin": t.pre_margin,
-            # 거래 **전** 포지션. build_summary의 승패 판정이 이 부호를 보므로, 라이브 런이
-            # 재기동 후 자기 run JSON에서 Trade를 복원할 때 이게 없으면 집계가 무너진다.
-            "position": t.pre_position,
-            "leverage": t.leverage,
-            # 이 체결을 낳은 주문 종류와 그 주문이 제출된 시각. 지정가/조건부 주문은 둘이
-            # 갈라진다 — "이 청산은 손절 체결이었다"를 사후에 구분하려면 필요하다.
-            "order_type": t.order_type,
-            "submitted_at": t.submitted_at,
-        }
-        for t in report.trades
-    ]
+    trades = [trade_to_dict(t) for t in report.trades]
 
     doc = {
         "schema_version": SCHEMA_VERSION,

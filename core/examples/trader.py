@@ -42,8 +42,8 @@ async def main():
     if not SYMBOLS or not INTERVAL:
         raise ValueError("SYMBOLS and INTERVAL must be set in environment variables or .env file")
 
-    # Result recording. Writes to <RESULT_PATH>/live/ in the same format the backtester
-    # produces, so a live run and a backtest can be compared in the visualiser.
+    # Result recording to <RESULT_PATH>/live/: a small resume-state run JSON, an append-only
+    # fill log (.trades.jsonl) and month shards — see core/recorder/live.py.
     RECORD = os.getenv("RECORD", "true").lower() == "true"
     RESULT_PATH = os.getenv("RESULT_PATH", "asset/")
     RUN_ID = os.getenv("LIVE_RUN_ID") or None
